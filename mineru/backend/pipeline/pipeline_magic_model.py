@@ -269,6 +269,9 @@ class MagicModel:
                 if span_type == ContentType.TABLE:
                     span["html"] = block.get("html", "")
                     block.pop("html", None)
+                    if block.get("table_cells"):
+                        span["table_cells"] = block["table_cells"]
+                    block.pop("table_cells", None)
                 if span_type == ContentType.INTERLINE_EQUATION:
                     span["content"] = block.get("latex", "")
                     block.pop("latex", None)
@@ -304,6 +307,13 @@ class MagicModel:
                 int(y1 / self.__scale),
             ]
             layout_det["bbox"] = bbox
+            for table_cell in layout_det.get("table_cells", []):
+                cell_bbox = table_cell.get("bbox")
+                if not cell_bbox or len(cell_bbox) != 4:
+                    continue
+                table_cell["bbox"] = [
+                    int(float(value) / self.__scale) for value in cell_bbox
+                ]
             # 删除高度或者宽度小于等于2的spans
             if bbox[2] - bbox[0] <= 2 or bbox[3] - bbox[1] <= 2:
                 need_remove_list.append(layout_det)

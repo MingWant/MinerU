@@ -547,6 +547,26 @@ def _get_body_data(para_block):
     return get_data_from_spans(para_block.get('lines', []))
 
 
+def _get_table_cells(para_block, page_size):
+    for block in para_block.get('blocks', []):
+        if block.get('type') != BlockType.TABLE_BODY:
+            continue
+        for line in block.get('lines', []):
+            for span in line.get('spans', []):
+                if span.get('type') != ContentType.TABLE:
+                    continue
+                output_cells = []
+                for table_cell in span.get('table_cells', []):
+                    bbox = _build_bbox(table_cell.get('bbox'), page_size)
+                    if bbox is None:
+                        continue
+                    output_cell = dict(table_cell)
+                    output_cell['bbox'] = bbox
+                    output_cells.append(output_cell)
+                return output_cells
+    return []
+
+
 def merge_para_with_text_v2(para_block):
     block_lang = detect_lang(_collect_text_for_lang_detection(para_block))
     para_content = []
@@ -697,6 +717,9 @@ def make_blocks_to_content_list(para_block, img_buket_path, page_idx, page_size)
                 para_content[BlockType.TABLE_CAPTION].append(merge_para_with_text(block))
             if block['type'] == BlockType.TABLE_FOOTNOTE:
                 para_content[BlockType.TABLE_FOOTNOTE].append(merge_para_with_text(block))
+        table_cells = _get_table_cells(para_block, page_size)
+        if table_cells:
+            para_content['table_cells'] = table_cells
     elif para_type == BlockType.CHART:
         para_content = {
             'type': ContentType.CHART,
@@ -854,6 +877,9 @@ def make_blocks_to_content_list_v2(para_block, img_buket_path, page_size):
                 'table_nest_level': table_nest_level,
             },
         }
+        table_cells = _get_table_cells(para_block, page_size)
+        if table_cells:
+            para_content['content']['table_cells'] = table_cells
     elif para_type == BlockType.CHART:
         chart_caption = []
         chart_footnote = []

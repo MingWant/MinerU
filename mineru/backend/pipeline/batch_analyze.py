@@ -26,7 +26,7 @@ from ...utils.ocr_utils import (
     sorted_boxes,
     update_det_boxes,
 )
-from ...utils.pdf_image_tools import get_crop_np_img
+from ...utils.table_cell_utils import build_table_cells, get_table_crop_bbox
 from .model_init import (
     AtomModelSingleton,
     run_layout_inference,
@@ -494,15 +494,23 @@ class BatchAnalyze:
 
             for table_res in table_res_list:
                 def get_crop_table_img(scale):
-                    bbox = normalize_to_int_bbox(
-                        [float(v) / float(scale) for v in table_res["bbox"]]
+                    crop_bbox = get_table_crop_bbox(
+                        table_res["bbox"],
+                        image_size=np_img.shape[:2],
+                        scale=scale,
                     )
-                    if bbox is None:
-                        return np_img[0:0, 0:0]
-                    return get_crop_np_img(bbox, np_img, scale=scale)
+                    if crop_bbox is None:
+                        return np_img[0:0, 0:0], [0, 0, 0, 0]
+                    return (
+                        np_img[
+                            crop_bbox[1] : crop_bbox[3],
+                            crop_bbox[0] : crop_bbox[2],
+                        ],
+                        crop_bbox,
+                    )
 
-                wireless_table_img = get_crop_table_img(scale = 1)
-                wired_table_img = get_crop_table_img(scale = 10/3)
+                wireless_table_img, wireless_crop_bbox = get_crop_table_img(scale=1)
+                wired_table_img, wired_crop_bbox = get_crop_table_img(scale=10 / 3)
                 table_page_bbox = normalize_to_int_bbox(
                     table_res.get("bbox"),
                     image_size=np_img.shape[:2],
@@ -513,6 +521,8 @@ class BatchAnalyze:
                                                 'table_img':wireless_table_img,
                                                 'wired_table_img':wired_table_img,
                                                 'table_page_bbox':table_page_bbox,
+                                                'wireless_crop_bbox':wireless_crop_bbox,
+                                                'wired_crop_bbox':wired_crop_bbox,
                                                 'table_inline_objects':table_inline_objects.get(id(table_res), []),
                                               })
 
@@ -681,11 +691,20 @@ class BatchAnalyze:
                         atom_model_name=AtomicModel.WiredTable,
                         lang=table_res_dict["lang"],
                     )
-                    table_res_dict["table_res"]["html"] = wired_table_model.predict(
+                    wired_result = wired_table_model.predict(
                         table_res_dict["wired_table_img"],
                         table_res_dict["ocr_result"],
-                        table_res_dict["table_res"].get("html", None)
+                        table_res_dict["table_res"].get("html", None),
+                        return_metadata=True,
                     )
+                    table_res_dict["table_res"]["html"] = wired_result["html"]
+                    table_res_dict["selected_model"] = wired_result["selected_model"]
+                    table_res_dict["wired_cell_bboxes"] = wired_result[
+                        "wired_cell_bboxes"
+                    ]
+                    table_res_dict["wired_logic_points"] = wired_result[
+                        "wired_logic_points"
+                    ]
 
             # 表格格式清理
             for table_res_dict in table_res_list_all_page:
@@ -696,7 +715,28 @@ class BatchAnalyze:
                     # 选用<table>到</table>的内容，放入table_res_dict['table_res']['html']
                     start_index = html_code.find("<table>")
                     end_index = html_code.rfind("</table>") + len("</table>")
-                    table_res_dict["table_res"]["html"] = html_code[start_index:end_index]
+                    html_code = html_code[start_index:end_index]
+                    table_res_dict["table_res"]["html"] = html_code
+
+                selected_model = table_res_dict.get("selected_model", "wireless")
+                if selected_model == "wired":
+                    cell_bboxes = table_res_dict.get("wired_cell_bboxes")
+                    logic_points = table_res_dict.get("wired_logic_points")
+                    crop_bbox = table_res_dict.get("wired_crop_bbox")
+                else:
+                    cell_bboxes = table_res_dict.get("wireless_cell_bboxes")
+                    logic_points = table_res_dict.get("wireless_logic_points")
+                    crop_bbox = table_res_dict.get("wireless_crop_bbox")
+
+                table_cells = build_table_cells(
+                    cell_bboxes,
+                    logic_points,
+                    html_code,
+                    crop_bbox,
+                    rotation_label=table_res_dict.get("rotate_label", "0"),
+                )
+                if table_cells:
+                    table_res_dict["table_res"]["table_cells"] = table_cells
 
 
         # OCR det

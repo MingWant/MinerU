@@ -290,11 +290,6 @@ class UnetTableModel:
 
         try:
             wired_table_results = self.wired_table_model(np_img, ocr_result)
-            wired_structure_results = (
-                self.wired_table_model(np_img, need_ocr=False)
-                if return_metadata
-                else None
-            )
 
             # viser = VisTable()
             # save_html_path = f"outputs/output.html"
@@ -364,8 +359,8 @@ class UnetTableModel:
                 return {
                     "html": html_code,
                     "selected_model": selected_model,
-                    "wired_cell_bboxes": None if wired_structure_results is None else wired_structure_results.cell_bboxes,
-                    "wired_logic_points": None if wired_structure_results is None else wired_structure_results.logic_points,
+                    "wired_cell_bboxes": wired_table_results.cell_bboxes,
+                    "wired_logic_points": wired_table_results.logic_points,
                     "wired_html": wired_html_code,
                 }
 

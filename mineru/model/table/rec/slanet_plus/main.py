@@ -66,6 +66,12 @@ class PaddleTable:
         cell_bboxes = cell_bboxes[mask]
 
         logic_points = self.table_matcher.decode_logic_points(pred_structures)
+        if len(logic_points) == len(mask):
+            logic_points = [
+                logic_point
+                for logic_point, keep in zip(logic_points, mask)
+                if keep
+            ]
         elapse = time.perf_counter() - s
         return PaddleTableOutput(pred_html, cell_bboxes, logic_points, elapse)
 
@@ -104,6 +110,12 @@ class PaddleTable:
             cell_bboxes = cell_bboxes[mask]
 
             logic_points = self.table_matcher.decode_logic_points(pred_structures)
+            if len(logic_points) == len(mask):
+                logic_points = [
+                    logic_point
+                    for logic_point, keep in zip(logic_points, mask)
+                    if keep
+                ]
             result = PaddleTableOutput(pred_html, cell_bboxes, logic_points, 0)
             output_results.append(result)
 
