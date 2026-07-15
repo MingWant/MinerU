@@ -176,7 +176,7 @@ class WorkflowTests(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
-            self.assertEqual(marker["bbox_renderer_version"], 2)
+            self.assertEqual(marker["bbox_renderer_version"], 3)
             self.assertFalse(list(parse_dir.glob(".*-span.pdf")))
 
     def test_real_proxy_rewrites_openai_request_and_writes_safe_audit(self):
@@ -517,6 +517,19 @@ class WorkflowTests(unittest.TestCase):
             path = Path(temp_dir) / "invalid-scale.json"
             path.write_text(json.dumps(config), encoding="utf-8")
             with self.assertRaisesRegex(WorkflowConfigError, "table_cell_render_scale"):
+                load_config(path)
+
+    def test_config_validates_page_reconciliation_limits(self):
+        source = Path(__file__).parents[1] / "workflow.example.json"
+        config = json.loads(source.read_text(encoding="utf-8"))
+        config["fusion"]["reconciliation"]["max_candidates_per_page"] = -1
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "invalid-reconciliation.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(
+                WorkflowConfigError,
+                "max_candidates_per_page",
+            ):
                 load_config(path)
 
     def test_mineru_command_uses_proxy_and_hybrid_settings(self):

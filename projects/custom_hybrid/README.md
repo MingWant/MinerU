@@ -110,12 +110,34 @@ text when OCR confidence passes the threshold. Other disagreements are shown as
 page crops to the configured visual verifier. The built-in verifier can only
 select the exact `hybrid` or `ocr` candidate; it cannot transcribe a third value.
 High-confidence OCR lines that have no Hybrid target can be inserted as recovered
-text blocks, but lines inside tables/images/charts/formulas are excluded. Control
-this with `recover_missing_ocr_blocks`, `missing_ocr_min_confidence`, and
-`max_missing_ocr_blocks_per_document`. Equations and table bodies are not
-rewritten by the text correction pass. Empty formulas still use the matched
-Pipeline formula; conflicting non-empty formulas use conservative visual
-candidate selection.
+text blocks. Images, charts, formulas, and geometrically reliable Tables remain
+protected visual containers. An unreliable Table is routed to the coverage-first
+path instead: OCR `content_spans` become bbox-backed `table_ocr` evidence, and
+explicit labels such as `Policy No.` or `日期` can be paired with nearby values as
+`form_field` records. Unscored Table OCR is allowed only through the explicit
+`unreliable_table_allow_unscored_ocr` switch. General missing OCR and unreliable
+Table OCR have separate document budgets, so a large claim form cannot consume
+the ordinary paragraph-recovery allowance.
+
+Before inserting Table OCR as text, the workflow performs count-aware structured
+coverage matching against the final Hybrid Table HTML. OCR occurrences already
+represented by Cell text count as covered and are not duplicated; only remaining
+bbox-backed occurrences are inserted. Repeated values are consumed one occurrence
+at a time instead of being globally suppressed by text equality.
+
+Every fusion report includes per-page `coverage` records, global
+`ocr_spatial_coverage`, Table quality routes, and structured `key_value_pairs`
+with `key_bbox` and `value_bbox`. The fused middle JSON stores the same page-level
+`form_fields` metadata. Bounding-box PDFs use orange for reliable Cell geometry,
+cyan for OCR content boxes, green for paired keys, and blue for paired values.
+When Cell geometry is unreliable, orange is suppressed while the content-tight
+cyan/key/value boxes remain visible.
+
+Important coverage controls are `recover_missing_ocr_blocks`,
+`missing_ocr_min_confidence`, `max_missing_ocr_blocks_per_document`,
+`unreliable_table_recovery_enabled`,
+`unreliable_table_allow_unscored_ocr`, and
+`max_unreliable_table_ocr_blocks_per_document`.
 
 ### Hierarchical table fusion
 
@@ -171,6 +193,35 @@ arbitration, point it at an instruction-following vision model served through an
 OpenAI-compatible endpoint and set `fusion.verifier.model`. The MinerU-specialized
 1.2B extraction model may not consistently follow the custom JSON arbitration
 prompt; failures are recorded and conservatively keep the Hybrid candidate.
+
+The verifier uses JSON mode by default and is constrained to exact existing
+candidate choices. Optional page-level reconciliation is even stricter: it sees
+the full page, Hybrid text, already recovered text, and a bounded manifest of OCR
+candidate IDs. It may return only IDs already present in that manifest; arbitrary
+transcription, new bboxes, and unknown IDs are discarded. Enable it only when a
+separate instruction-following Vision endpoint is configured:
+
+```json
+{
+  "fusion": {
+    "reconciliation": {
+      "enabled": true,
+      "max_pages_per_document": 20,
+      "max_candidates_per_page": 120
+    },
+    "verifier": {
+      "enabled": true,
+      "base_url": "http://vision-verifier.example:8000",
+      "model": "instruction-vision-model",
+      "json_mode": true
+    }
+  }
+}
+```
+
+Keep reconciliation disabled when the only available model is the extraction-
+specialized `mineru-claim-forms`; the deterministic OCR recovery and spatial
+coverage audit do not depend on the verifier.
 
 After changing fusion thresholds, reuse existing Hybrid and OCR results:
 

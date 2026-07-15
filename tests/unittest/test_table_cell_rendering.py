@@ -163,3 +163,41 @@ def test_reliable_non_overlapping_cell_geometry_is_retained():
 
     assert cell_boxes == [[10, 10, 100, 50], [100, 10, 190, 50]]
     assert content_boxes == [[20, 20, 80, 40], [110, 20, 180, 40]]
+
+
+def test_span_bbox_renderer_draws_key_and_value_boxes(monkeypatch, tmp_path):
+    rendered_keys = []
+    rendered_values = []
+
+    def record_bbox(i, bbox_list, page, pdf_canvas, rgb_config, fill_config):
+        if rgb_config == [0, 160, 90]:
+            rendered_keys.extend(bbox_list[i])
+        elif rgb_config == [30, 90, 255]:
+            rendered_values.extend(bbox_list[i])
+        return pdf_canvas
+
+    monkeypatch.setattr(draw_bbox_module, "draw_bbox_without_number", record_bbox)
+    pdf_info = [
+        {
+            "discarded_blocks": [],
+            "preproc_blocks": [],
+            "form_fields": [
+                {
+                    "key": "Policy No.",
+                    "value": "A123",
+                    "key_bbox": [20, 20, 80, 35],
+                    "value_bbox": [100, 20, 150, 35],
+                }
+            ],
+        }
+    ]
+
+    draw_bbox_module.draw_span_bbox(
+        pdf_info,
+        _blank_pdf_bytes(),
+        str(tmp_path),
+        "form-fields.pdf",
+    )
+
+    assert rendered_keys == [[20, 20, 80, 35]]
+    assert rendered_values == [[100, 20, 150, 35]]

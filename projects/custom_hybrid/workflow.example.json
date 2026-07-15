@@ -84,6 +84,14 @@
     "recover_missing_ocr_blocks": true,
     "missing_ocr_min_confidence": 0.9,
     "max_missing_ocr_blocks_per_document": 200,
+    "unreliable_table_recovery_enabled": true,
+    "unreliable_table_allow_unscored_ocr": true,
+    "max_unreliable_table_ocr_blocks_per_document": 1000,
+    "reconciliation": {
+      "enabled": false,
+      "max_pages_per_document": 20,
+      "max_candidates_per_page": 120
+    },
     "verifier": {
       "enabled": true,
       "base_url": null,
@@ -91,6 +99,8 @@
       "api_key_env": "VLLM_API_KEY",
       "temperature": 0.0,
       "top_p": 1.0,
+      "seed": 42,
+      "json_mode": true,
       "max_tokens": 1024,
       "timeout_seconds": 120,
       "render_scale": 2.0,
@@ -99,6 +109,7 @@
       "jpeg_quality": 92,
       "cache_pages": 2,
       "structured_candidate_max_chars": 12000,
+      "page_reconciliation_max_chars": 12000,
       "table_cell_context_max_chars": 4000,
       "table_cell_max_context_cells": 40,
       "table_cell_include_table_image": true,

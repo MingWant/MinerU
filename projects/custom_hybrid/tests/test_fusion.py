@@ -1,9 +1,7 @@
 import sys
 import json
 import tempfile
-import threading
 import unittest
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).parents[3]
@@ -14,8 +12,11 @@ from projects.custom_hybrid.fusion import (
     FusionSettings,
     OpenAIVisionVerifier,
     _parse_verifier_text,
+    _parse_reconciliation_ids,
     assign_ocr_lines,
+    collect_table_geometry_quality,
     collect_text_lines,
+    collect_unreliable_table_ocr_lines,
     fuse_middle_json,
     recover_table_cell_geometry,
 )
@@ -517,54 +518,43 @@ class FusionTests(unittest.TestCase):
     def test_visual_verifier_crops_image_calls_endpoint_and_parses_json(self):
         from PIL import Image
 
-        class Handler(BaseHTTPRequestHandler):
-            protocol_version = "HTTP/1.1"
+        class Response:
+            def __init__(self, payload):
+                self.payload = payload
 
-            def do_GET(self):
-                body = json.dumps({"data": [{"id": "vision-model"}]}).encode()
-                self.send_response(200)
-                self.send_header("content-type", "application/json")
-                self.send_header("content-length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+            def raise_for_status(self):
+                return None
 
-            def do_POST(self):
-                length = int(self.headers.get("content-length", "0"))
-                payload = json.loads(self.rfile.read(length))
-                self.server.received.append(payload)
+            def json(self):
+                return self.payload
+
+        class FakeHttpx:
+            def __init__(self):
+                self.received = []
+
+            def get(self, *_args, **_kwargs):
+                return Response({"data": [{"id": "vision-model"}]})
+
+            def post(self, *_args, json=None, **_kwargs):
+                payload = json
+                self.received.append(payload)
                 prompt = payload["messages"][0]["content"][0]["text"]
-                if '"hybrid" or "ocr"' in prompt:
+                if "insert_candidate_ids" in prompt:
+                    result = '{"insert_candidate_ids":["p0-ocr-0","unknown"]}'
+                elif '"hybrid" or "ocr"' in prompt:
                     result = '{"source":"ocr"}'
                 else:
                     result = '{"source":"pipeline"}'
-                body = json.dumps(
-                    {
-                        "choices": [
-                            {"message": {"content": result}}
-                        ]
-                    }
-                ).encode()
-                self.send_response(200)
-                self.send_header("content-type", "application/json")
-                self.send_header("content-length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                return Response({"choices": [{"message": {"content": result}}]})
 
-            def log_message(self, _format, *_args):
-                return
-
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        server.daemon_threads = True
-        server.received = []
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
+        fake_httpx = FakeHttpx()
         verifier = None
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
                 image_path = Path(temp_dir) / "page.png"
                 Image.new("RGB", (200, 100), "white").save(image_path)
                 verifier = OpenAIVisionVerifier(
-                    f"http://127.0.0.1:{server.server_address[1]}",
+                    "http://vision.test",
                     image_path,
                     {
                         "model": None,
@@ -573,6 +563,7 @@ class FusionTests(unittest.TestCase):
                         "timeout_seconds": 5,
                     },
                 )
+                verifier.httpx = fake_httpx
 
                 result = verifier(
                     0,
@@ -614,28 +605,47 @@ class FusionTests(unittest.TestCase):
                     "1008",
                     "100B",
                 )
+                reconciled = verifier.reconcile_page(
+                    0,
+                    [200, 100],
+                    "existing text",
+                    [
+                        {
+                            "id": "p0-ocr-0",
+                            "bbox": [20, 50, 180, 70],
+                            "text": "missing text",
+                            "confidence": 0.8,
+                            "type": "text",
+                        }
+                    ],
+                    [],
+                )
 
             self.assertEqual(result, "ocr")
             self.assertEqual(selected, "pipeline")
             self.assertEqual(selected_cell, "pipeline")
-            self.assertEqual(server.received[0]["model"], "vision-model")
-            text_content = server.received[0]["messages"][0]["content"]
+            self.assertEqual(reconciled, ["p0-ocr-0"])
+            self.assertEqual(fake_httpx.received[0]["model"], "vision-model")
+            self.assertEqual(
+                fake_httpx.received[0]["response_format"],
+                {"type": "json_object"},
+            )
+            text_content = fake_httpx.received[0]["messages"][0]["content"]
             self.assertIn("untrusted", text_content[0]["text"])
             self.assertTrue(
                 text_content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
             )
-            table_prompt = server.received[1]["messages"][0]["content"][0]["text"]
+            table_prompt = fake_httpx.received[1]["messages"][0]["content"][0]["text"]
             self.assertIn("embedded-data-removed", table_prompt)
             self.assertNotIn("SECRET_TABLE_DATA", table_prompt)
-            cell_content = server.received[2]["messages"][0]["content"]
+            cell_content = fake_httpx.received[2]["messages"][0]["content"]
             self.assertIn("whole_table, target_row, target_column, target_cell", cell_content[0]["text"])
             self.assertEqual(len(cell_content), 5)
+            reconciliation_prompt = fake_httpx.received[3]["messages"][0]["content"][0]["text"]
+            self.assertIn("Every returned ID must occur exactly", reconciliation_prompt)
         finally:
             if verifier is not None:
                 verifier.close()
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=5)
 
     def test_collects_editable_text_lines(self):
         lines = collect_text_lines(middle("hello")["pdf_info"][0], 0)
@@ -746,10 +756,57 @@ class FusionTests(unittest.TestCase):
         self.assertEqual(report["counts"]["missing_ocr_candidates"], 2)
         self.assertEqual(report["counts"]["missing_ocr_blocks_recovered"], 1)
 
+    def test_page_reconciliation_can_only_insert_manifest_candidate(self):
+        hybrid = middle("Anchor", bbox=(10, 10, 190, 30))
+        ocr = middle("Anchor", 0.99, bbox=(10, 10, 190, 30))
+        low = middle("Visibly missing", 0.2, bbox=(10, 50, 190, 70))["pdf_info"][0][
+            "preproc_blocks"
+        ][0]
+        ocr["pdf_info"][0]["preproc_blocks"].append(low)
+        seen = []
+
+        def reconcile(_page, _size, _hybrid, candidates, _recovered):
+            seen.extend(candidates)
+            return [candidates[0]["id"], "invented-id"]
+
+        fused, report = fuse_middle_json(
+            hybrid,
+            ocr,
+            FusionSettings(page_reconciliation_enabled=True),
+            page_reconciler=reconcile,
+        )
+
+        contents = [
+            block["lines"][0]["spans"][0]["content"]
+            for block in fused["pdf_info"][0]["preproc_blocks"]
+        ]
+        self.assertEqual(contents, ["Anchor", "Visibly missing"])
+        self.assertEqual(seen[0]["text"], "Visibly missing")
+        self.assertEqual(report["counts"]["page_reconciliation_requests"], 1)
+        self.assertEqual(report["counts"]["page_reconciliation_insertions"], 1)
+
+    def test_reconciliation_parser_rejects_free_text_and_deduplicates_ids(self):
+        self.assertEqual(
+            _parse_reconciliation_ids(
+                '{"insert_candidate_ids":["p0-ocr-1","p0-ocr-1",7]}'
+            ),
+            ["p0-ocr-1"],
+        )
+        self.assertEqual(_parse_reconciliation_ids('{"text":"invented"}'), [])
+
     def test_missing_ocr_inside_table_is_not_recovered_as_paragraph(self):
         hybrid = structured_middle(
             "table",
             html="<table><tr><td>Value</td></tr></table>",
+            table_cells=[
+                {
+                    "bbox": [10, 10, 190, 80],
+                    "content_spans": [
+                        {"bbox": [20, 20, 180, 60], "text": "Value"}
+                    ],
+                    "text": "Value",
+                }
+            ],
         )
         ocr = middle("Value", 0.99, bbox=(20, 20, 180, 60))
 
@@ -757,6 +814,229 @@ class FusionTests(unittest.TestCase):
 
         self.assertEqual(len(fused["pdf_info"][0]["preproc_blocks"]), 1)
         self.assertEqual(report["counts"]["missing_ocr_candidates"], 0)
+
+    def test_unreliable_table_content_spans_are_recovered_as_form_fields(self):
+        html = "<table><tr><td>Policy No.</td><td>A123</td></tr></table>"
+        cells = [
+            {
+                "bbox": [10, 10, 150, 70],
+                "content_spans": [
+                    {"bbox": [20, 20, 80, 35], "text": "Policy No."}
+                ],
+                "text": "Policy No.",
+            },
+            {
+                "bbox": [50, 10, 190, 70],
+                "content_spans": [
+                    {"bbox": [110, 20, 160, 35], "text": "A123"}
+                ],
+                "text": "A123",
+            },
+            {
+                "bbox": [30, 10, 170, 70],
+                "content_spans": [
+                    {"bbox": [85, 45, 105, 60], "text": "Extra"}
+                ],
+                "text": "Extra",
+            },
+        ]
+        hybrid = structured_middle(
+            "table",
+            html=(
+                "<table><tr><td>Existing A</td><td>Existing B</td>"
+                "<td>Existing C</td></tr></table>"
+            ),
+        )
+        ocr = structured_middle("table", html=html, table_cells=cells)
+
+        fused, report = fuse_middle_json(hybrid, ocr, FusionSettings())
+
+        blocks = fused["pdf_info"][0]["preproc_blocks"]
+        recovered = [
+            block
+            for block in blocks
+            if block.get("fusion_recovery_type") in {"form_field", "table_ocr"}
+        ]
+        self.assertEqual(
+            [block["lines"][0]["spans"][0]["content"] for block in recovered],
+            ["Policy No.", "A123", "Extra"],
+        )
+        self.assertTrue(all(block["type"] == "text" for block in recovered))
+        self.assertEqual(report["counts"]["unreliable_table_targets"], 1)
+        self.assertEqual(report["counts"]["unreliable_table_ocr_lines"], 3)
+        self.assertEqual(report["counts"]["unreliable_table_lines_recovered"], 3)
+        self.assertEqual(report["counts"]["key_value_pairs"], 1)
+        self.assertEqual(report["key_value_pairs"][0]["key"], "Policy No.")
+        self.assertEqual(report["key_value_pairs"][0]["value"], "A123")
+        self.assertEqual(
+            fused["pdf_info"][0]["form_fields"][0]["value_bbox"],
+            [110.0, 20.0, 160.0, 35.0],
+        )
+        self.assertEqual(report["counts"]["ocr_spatial_coverage"], 1.0)
+        self.assertEqual(report["coverage"][0]["uncovered"], 0)
+
+    def test_unscored_unreliable_table_recovery_can_be_disabled(self):
+        html = "<table><tr><td>Value</td></tr></table>"
+        cells = [
+            {
+                "bbox": [10, 10, 100, 70],
+                "content_spans": [{"bbox": [20, 20, 70, 35], "text": "Value"}],
+            },
+            {
+                "bbox": [40, 10, 190, 70],
+                "content_spans": [{"bbox": [120, 20, 170, 35], "text": "Other"}],
+            },
+            {
+                "bbox": [30, 10, 170, 70],
+                "content_spans": [{"bbox": [85, 45, 105, 60], "text": "Extra"}],
+            },
+        ]
+        hybrid = structured_middle("table", html=html)
+        ocr = structured_middle("table", html=html, table_cells=cells)
+
+        fused, report = fuse_middle_json(
+            hybrid,
+            ocr,
+            FusionSettings(unreliable_table_allow_unscored_ocr=False),
+        )
+
+        self.assertEqual(len(fused["pdf_info"][0]["preproc_blocks"]), 1)
+        self.assertEqual(report["counts"]["unreliable_table_ocr_lines"], 3)
+        self.assertEqual(report["counts"]["missing_ocr_candidates"], 0)
+
+    def test_unreliable_table_ocr_already_in_html_is_not_duplicated(self):
+        html = "<table><tr><td>Policy No.</td><td>A123</td><td>Extra</td></tr></table>"
+        cells = [
+            {
+                "bbox": [10, 10, 150, 70],
+                "content_spans": [
+                    {"bbox": [20, 20, 80, 35], "text": "Policy No."}
+                ],
+            },
+            {
+                "bbox": [50, 10, 190, 70],
+                "content_spans": [{"bbox": [110, 20, 160, 35], "text": "A123"}],
+            },
+            {
+                "bbox": [30, 10, 170, 70],
+                "content_spans": [{"bbox": [85, 45, 105, 60], "text": "Extra"}],
+            },
+        ]
+
+        fused, report = fuse_middle_json(
+            structured_middle("table", html=html),
+            structured_middle("table", html=html, table_cells=cells),
+            FusionSettings(),
+        )
+
+        recovered = [
+            block
+            for block in fused["pdf_info"][0]["preproc_blocks"]
+            if block.get("fusion_source") == "ocr_recovered"
+        ]
+        self.assertEqual(recovered, [])
+        self.assertEqual(
+            report["counts"]["unreliable_table_lines_structurally_covered"],
+            3,
+        )
+        self.assertEqual(report["coverage"][0]["structured"], 3)
+        self.assertEqual(report["counts"]["ocr_spatial_coverage"], 1.0)
+
+    def test_unreliable_table_recovery_switch_restores_table_exclusion(self):
+        html = "<table><tr><td>Value</td></tr></table>"
+        cells = [
+            {
+                "bbox": [10, 10, 100, 70],
+                "content_spans": [
+                    {"bbox": [20, 20, 70, 35], "text": "Value", "score": 0.99}
+                ],
+            },
+            {
+                "bbox": [40, 10, 190, 70],
+                "content_spans": [
+                    {"bbox": [120, 20, 170, 35], "text": "Other", "score": 0.99}
+                ],
+            },
+            {
+                "bbox": [30, 10, 170, 70],
+                "content_spans": [
+                    {"bbox": [85, 45, 105, 60], "text": "Extra", "score": 0.99}
+                ],
+            },
+        ]
+        hybrid = structured_middle("table", html=html)
+        ocr = structured_middle("table", html=html, table_cells=cells)
+
+        fused, report = fuse_middle_json(
+            hybrid,
+            ocr,
+            FusionSettings(unreliable_table_recovery_enabled=False),
+        )
+
+        self.assertEqual(len(fused["pdf_info"][0]["preproc_blocks"]), 1)
+        self.assertEqual(report["counts"]["unreliable_table_ocr_lines"], 0)
+        self.assertEqual(report["counts"]["missing_ocr_candidates"], 0)
+
+    def test_existing_hybrid_text_covers_unreliable_table_ocr_without_duplicate(self):
+        html = "<table><tr><td>A123</td></tr></table>"
+        cells = [
+            {
+                "bbox": [10, 10, 100, 70],
+                "content_spans": [{"bbox": [20, 20, 70, 35], "text": "A123"}],
+            },
+            {
+                "bbox": [40, 10, 190, 70],
+                "content_spans": [{"bbox": [120, 20, 170, 35], "text": "Other"}],
+            },
+            {
+                "bbox": [30, 10, 170, 70],
+                "content_spans": [{"bbox": [85, 45, 105, 60], "text": "Extra"}],
+            },
+        ]
+        hybrid = middle("A123", bbox=(20, 20, 70, 35))
+        hybrid["pdf_info"][0]["preproc_blocks"].append(
+            structured_middle("table", html=html)["pdf_info"][0]["preproc_blocks"][0]
+        )
+        ocr = structured_middle("table", html=html, table_cells=cells)
+
+        fused, report = fuse_middle_json(hybrid, ocr, FusionSettings())
+
+        contents = [
+            block["lines"][0]["spans"][0].get("content")
+            for block in fused["pdf_info"][0]["preproc_blocks"]
+            if block.get("type") == "text"
+        ]
+        self.assertEqual(contents.count("A123"), 1)
+        self.assertEqual(report["coverage"][0]["matched"], 1)
+        self.assertEqual(report["coverage"][0]["recovered"], 2)
+
+    def test_table_quality_and_recall_collectors_report_unreliable_geometry(self):
+        cells = [
+            {
+                "bbox": [10, 10, 100, 70],
+                "content_spans": [{"bbox": [20, 20, 70, 35], "text": "One"}],
+            },
+            {
+                "bbox": [40, 10, 190, 70],
+                "content_spans": [{"bbox": [120, 20, 170, 35], "text": "Two"}],
+            },
+            {
+                "bbox": [30, 10, 170, 70],
+                "content_spans": [{"bbox": [85, 45, 105, 60], "text": "Three"}],
+            },
+        ]
+        page = structured_middle(
+            "table",
+            html="<table><tr><td>One</td><td>Two</td></tr></table>",
+            table_cells=cells,
+        )["pdf_info"][0]
+
+        quality = collect_table_geometry_quality(page, 0)
+        lines = collect_unreliable_table_ocr_lines(page, 0)
+
+        self.assertFalse(quality[0].quality.reliable)
+        self.assertIn("excessive_cell_overlap", quality[0].quality.reasons)
+        self.assertEqual([line.text for line in lines], ["One", "Two", "Three"])
 
     def test_unrelated_verifier_output_is_rejected(self):
         hybrid = middle("invoice 1008")

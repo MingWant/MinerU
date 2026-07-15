@@ -218,6 +218,20 @@ def _validate_fusion_config(fusion_config: Any) -> None:
     verifier = fusion_config.get("verifier", {})
     if not isinstance(verifier, dict):
         raise WorkflowConfigError("fusion.verifier must be a JSON object")
+    reconciliation = fusion_config.get("reconciliation", {})
+    if not isinstance(reconciliation, dict):
+        raise WorkflowConfigError("fusion.reconciliation must be a JSON object")
+    if not isinstance(reconciliation.get("enabled", False), bool):
+        raise WorkflowConfigError("fusion.reconciliation.enabled must be a boolean")
+    for key, default in (
+        ("max_pages_per_document", 20),
+        ("max_candidates_per_page", 120),
+    ):
+        value = reconciliation.get(key, default)
+        if not isinstance(value, int) or value < 0:
+            raise WorkflowConfigError(
+                f"fusion.reconciliation.{key} must be a non-negative integer"
+            )
     suspicious_ratio = fusion_config.get("suspicious_length_ratio", 1.8)
     if not isinstance(suspicious_ratio, (int, float)) or suspicious_ratio <= 1:
         raise WorkflowConfigError("fusion.suspicious_length_ratio must be greater than 1")
@@ -236,6 +250,8 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         "table_cell_suspicious_fallback_enabled",
         "table_cell_allow_unscored_ocr",
         "recover_missing_ocr_blocks",
+        "unreliable_table_recovery_enabled",
+        "unreliable_table_allow_unscored_ocr",
     ):
         value = fusion_config.get(key, True)
         if not isinstance(value, bool):
@@ -249,6 +265,7 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         ("max_table_cells_per_table", 500),
         ("max_table_cell_verifications_per_document", 80),
         ("max_missing_ocr_blocks_per_document", 200),
+        ("max_unreliable_table_ocr_blocks_per_document", 1000),
     ):
         value = fusion_config.get(key, default)
         minimum = 1 if key == "max_table_cells_per_table" else 0
@@ -1159,6 +1176,7 @@ def fuse_output_trees(
                 table_cell_candidate_chooser=(
                     verifier.choose_table_cell if verifier else None
                 ),
+                page_reconciler=verifier.reconcile_page if verifier else None,
             )
             fused_path.write_text(
                 json.dumps(fused_middle, ensure_ascii=False, indent=4),

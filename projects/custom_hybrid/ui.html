@@ -105,6 +105,11 @@
     .tab-panel { display: none; flex: 1; min-height: 573px; overflow: auto; padding: 15px; }
     .tab-panel.active { display: block; }
     .output-empty { display: grid; place-items: center; height: 100%; min-height: 480px; color: var(--muted); text-align: center; line-height: 1.6; }
+    .coverage-summary { display: none; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; }
+    .coverage-summary.visible { display: grid; }
+    .coverage-metric { padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: #f8fafc; }
+    .coverage-metric strong { display: block; font-size: 18px; color: var(--ink); }
+    .coverage-metric span { display: block; margin-top: 4px; color: var(--muted); font-size: 10px; line-height: 1.3; text-transform: uppercase; letter-spacing: .04em; }
     pre { margin: 0; min-height: 500px; overflow: auto; padding: 14px; border-radius: 8px; color: #dce8ff; background: #142137; font-size: 11px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
     .download-card { display: none; padding: 18px; border: 1px solid #cfe8df; border-radius: 10px; background: #f1fbf7; }
     .download-card.visible { display: block; }
@@ -131,7 +136,7 @@
     .stage.done::after { background: var(--success); }
     .hidden { display: none !important; }
     @media (max-width: 1120px) { .workspace { grid-template-columns: 280px 1fr; } .results { grid-column: 1 / -1; min-height: 480px; } .tab-panel { min-height: 430px; } }
-    @media (max-width: 720px) { .shell { width: min(100% - 20px, 1500px); padding-top: 10px; } .hero { padding: 27px 18px; } .workspace { grid-template-columns: 1fr; } .panel { min-height: auto; } .preview-body { height: 480px; } .results { grid-column: auto; } .stages { grid-template-columns: repeat(4, 1fr); row-gap: 18px; } .stage::after { display: none; } }
+    @media (max-width: 720px) { .shell { width: min(100% - 20px, 1500px); padding-top: 10px; } .hero { padding: 27px 18px; } .workspace { grid-template-columns: 1fr; } .panel { min-height: auto; } .preview-body { height: 480px; } .results { grid-column: auto; } .coverage-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } .stages { grid-template-columns: repeat(4, 1fr); row-gap: 18px; } .stage::after { display: none; } }
   </style>
 </head>
 <body>
@@ -242,6 +247,13 @@
         <button class="tab-button" data-tab="downloads">Downloads</button>
       </nav>
       <div id="reportPanel" class="tab-panel active">
+        <div id="coverageSummary" class="coverage-summary" aria-label="Coverage summary">
+          <div class="coverage-metric"><strong id="coverageValue">—</strong><span>OCR Spatial Coverage</span></div>
+          <div class="coverage-metric"><strong id="recoveredValue">—</strong><span>Recovered OCR Lines</span></div>
+          <div class="coverage-metric"><strong id="uncoveredValue">—</strong><span>Uncovered OCR Lines</span></div>
+          <div class="coverage-metric"><strong id="unreliableTablesValue">—</strong><span>Unreliable Tables</span></div>
+          <div class="coverage-metric"><strong id="keyValuePairsValue">—</strong><span>Key–Value Pairs</span></div>
+        </div>
         <div id="reportEmpty" class="output-empty">Fusion statistics will appear here after processing completes.</div>
         <pre id="reportOutput" class="hidden"></pre>
       </div>
@@ -298,6 +310,7 @@
   const viewBboxButton = document.querySelector('#viewBboxButton');
   const reportEmpty = document.querySelector('#reportEmpty');
   const reportOutput = document.querySelector('#reportOutput');
+  const coverageSummary = document.querySelector('#coverageSummary');
   const taskEmpty = document.querySelector('#taskEmpty');
   const taskOutput = document.querySelector('#taskOutput');
   const downloadEmpty = document.querySelector('#downloadEmpty');
@@ -423,6 +436,7 @@
   }
 
   function resetResults() {
+    coverageSummary.classList.remove('visible');
     reportEmpty.classList.remove('hidden');
     reportOutput.classList.add('hidden');
     reportOutput.textContent = '';
@@ -514,6 +528,27 @@
     }
   }
 
+  function renderCoverageSummary(report) {
+    const totals = { total: 0, matched: 0, recovered: 0, uncovered: 0, unreliableTables: 0, keyValuePairs: 0 };
+    const documents = report && report.documents ? Object.values(report.documents) : [];
+    for (const documentResult of documents) {
+      const counts = documentResult && documentResult.counts ? documentResult.counts : {};
+      totals.total += Number(counts.ocr_recall_lines_total || 0);
+      totals.matched += Number(counts.ocr_recall_lines_matched || 0);
+      totals.recovered += Number(counts.ocr_recall_lines_recovered || 0);
+      totals.uncovered += Number(counts.ocr_recall_lines_unmatched || 0);
+      totals.unreliableTables += Number(counts.unreliable_table_targets || 0);
+      totals.keyValuePairs += Number(counts.key_value_pairs || 0);
+    }
+    const coverage = totals.total ? ((totals.matched + totals.recovered) / totals.total) * 100 : 100;
+    document.querySelector('#coverageValue').textContent = `${coverage.toFixed(1)}%`;
+    document.querySelector('#recoveredValue').textContent = String(totals.recovered);
+    document.querySelector('#uncoveredValue').textContent = String(totals.uncovered);
+    document.querySelector('#unreliableTablesValue').textContent = String(totals.unreliableTables);
+    document.querySelector('#keyValuePairsValue').textContent = String(totals.keyValuePairs);
+    coverageSummary.classList.add('visible');
+  }
+
   async function pollTask(taskId) {
     try {
       const status = await jsonResponse(await fetch(`/api/tasks/${taskId}`));
@@ -522,6 +557,7 @@
         if (pollTimer) clearInterval(pollTimer);
         setStage('build', ['prepare', 'service', 'upload', 'queue', 'parse']);
         const report = await jsonResponse(await fetch(`/api/tasks/${taskId}/report`));
+        renderCoverageSummary(report);
         reportOutput.textContent = JSON.stringify(report, null, 2);
         reportOutput.classList.remove('hidden');
         reportEmpty.classList.add('hidden');

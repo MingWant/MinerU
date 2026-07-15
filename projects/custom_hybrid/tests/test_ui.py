@@ -93,6 +93,8 @@ class CustomHybridUiTests(unittest.TestCase):
             self.assertIn("Upload & Settings", page.text)
             self.assertIn("Document Preview", page.text)
             self.assertIn("Fusion Report", page.text)
+            self.assertIn("OCR Spatial Coverage", page.text)
+            self.assertIn("Key–Value Pairs", page.text)
             self.assertIn("vLLM Generation", page.text)
             self.assertIn('id="effortInput"', page.text)
             self.assertIn('id="temperatureInput"', page.text)

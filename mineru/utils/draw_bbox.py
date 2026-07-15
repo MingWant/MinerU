@@ -9,6 +9,11 @@ from pypdf import PdfReader, PdfWriter, PageObject
 from reportlab.pdfgen import canvas
 
 from .enum_class import BlockType, ContentType, SplitFlag
+from .table_cell_quality import (
+    assess_table_cell_geometry,
+    cell_content_bboxes,
+    deduplicate_bboxes,
+)
 
 
 # 文本类 block 共用 text bbox 样式，避免新增文本形态时遗漏多个绘制入口。
@@ -17,6 +22,8 @@ TEXT_LIKE_BLOCK_TYPES_FOR_BBOX = {
     BlockType.REF_TEXT,
     BlockType.ABSTRACT,
     BlockType.PHONETIC,
+    "form_field",
+    "table_ocr",
 }
 
 # layout.pdf 中这些 block 直接使用自身 bbox，复合 block 则使用子 block bbox。
@@ -29,10 +36,7 @@ DIRECT_LAYOUT_BBOX_BLOCK_TYPES = TEXT_LIKE_BLOCK_TYPES_FOR_BBOX | {
 
 # span.pdf 从这些结构性 block 中收集内部 span bbox。
 SPAN_SOURCE_BLOCK_TYPES = DIRECT_LAYOUT_BBOX_BLOCK_TYPES
-BBOX_RENDERER_VERSION = 2
-MAX_RENDERED_TABLE_CELLS = 200
-MIN_CELL_CONTENT_CONTAINMENT = 0.7
-MAX_SEVERE_OVERLAPS_PER_CELL = 0.5
+BBOX_RENDERER_VERSION = 3
 
 
 def _get_layout_source_blocks(page):
@@ -102,52 +106,7 @@ def _page_bboxes(bbox_list, page_index):
 
 
 def _deduplicate_bboxes(bboxes):
-    result = []
-    seen = set()
-    for bbox in bboxes:
-        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
-            continue
-        try:
-            key = tuple(float(value) for value in bbox)
-        except (TypeError, ValueError):
-            continue
-        if not all(math.isfinite(value) for value in key) or key in seen:
-            continue
-        seen.add(key)
-        result.append(bbox)
-    return result
-
-
-def _bbox_area(bbox):
-    return max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
-
-
-def _bbox_intersection_area(left, right):
-    return max(0.0, min(left[2], right[2]) - max(left[0], right[0])) * max(
-        0.0,
-        min(left[3], right[3]) - max(left[1], right[1]),
-    )
-
-
-def _bbox_contains(outer, inner, tolerance=2.0):
-    return (
-        outer[0] - tolerance <= inner[0]
-        and outer[1] - tolerance <= inner[1]
-        and outer[2] + tolerance >= inner[2]
-        and outer[3] + tolerance >= inner[3]
-    )
-
-
-def _cell_content_bboxes(cell):
-    content_spans = [
-        span.get("bbox")
-        for span in cell.get("content_spans", [])
-        if isinstance(span, dict) and span.get("bbox")
-    ]
-    if content_spans:
-        return _deduplicate_bboxes(content_spans)
-    content_bbox = cell.get("content_bbox")
-    return _deduplicate_bboxes([content_bbox] if content_bbox else [])
+    return deduplicate_bboxes(bboxes)
 
 
 def _table_cell_render_bboxes(span):
@@ -160,35 +119,11 @@ def _table_cell_render_bboxes(span):
     content_bboxes = _deduplicate_bboxes(
         bbox
         for cell in cells
-        for bbox in _cell_content_bboxes(cell)
+        for bbox in cell_content_bboxes(cell)
     )
     cell_bboxes = _deduplicate_bboxes(cell["bbox"] for cell in cells)
-    if not cell_bboxes or len(cell_bboxes) > MAX_RENDERED_TABLE_CELLS:
-        return [], content_bboxes
-
-    content_total = 0
-    content_inside = 0
-    for cell in cells:
-        cell_bbox = cell.get("bbox")
-        for content_bbox in _cell_content_bboxes(cell):
-            content_total += 1
-            content_inside += int(_bbox_contains(cell_bbox, content_bbox))
-    if (
-        content_total
-        and content_inside / content_total < MIN_CELL_CONTENT_CONTAINMENT
-    ):
-        return [], content_bboxes
-
-    severe_overlaps = 0
-    for index, left in enumerate(cell_bboxes):
-        left_area = _bbox_area(left)
-        for right in cell_bboxes[index + 1 :]:
-            smaller_area = min(left_area, _bbox_area(right))
-            if smaller_area <= 0:
-                continue
-            if _bbox_intersection_area(left, right) / smaller_area > 0.35:
-                severe_overlaps += 1
-    if severe_overlaps > len(cell_bboxes) * MAX_SEVERE_OVERLAPS_PER_CELL:
+    quality = assess_table_cell_geometry(span)
+    if not quality.reliable:
         return [], content_bboxes
     return cell_bboxes, content_bboxes
 
@@ -255,6 +190,8 @@ def draw_layout_bbox(pdf_info, pdf_bytes, out_path, filename):
     tables_body_list, tables_caption_list, tables_footnote_list = [], [], []
     table_cells_list = []
     table_content_list = []
+    form_key_list = []
+    form_value_list = []
     imgs_body_list, imgs_caption_list, imgs_footnote_list = [], [], []
     codes_body_list, codes_caption_list, codes_footnote_list = [], [], []
     titles_list = []
@@ -269,6 +206,8 @@ def draw_layout_bbox(pdf_info, pdf_bytes, out_path, filename):
         tables_body, tables_caption, tables_footnote = [], [], []
         table_cells = []
         table_content = []
+        form_keys = []
+        form_values = []
         imgs_body, imgs_caption, imgs_footnote = [], [], []
         codes_body, codes_caption, codes_footnote = [], [], []
         titles = []
@@ -281,6 +220,11 @@ def draw_layout_bbox(pdf_info, pdf_bytes, out_path, filename):
         for dropped_bbox in page['discarded_blocks']:
             page_dropped_list.append(dropped_bbox['bbox'])
         dropped_bbox_list.append(page_dropped_list)
+        for field in page.get("form_fields", []):
+            if not isinstance(field, dict):
+                continue
+            form_keys.append(field.get("key_bbox"))
+            form_values.append(field.get("value_bbox"))
         for block in _get_layout_source_blocks(page):
             bbox = block["bbox"]
             if block["type"] == BlockType.TABLE:
@@ -350,6 +294,8 @@ def draw_layout_bbox(pdf_info, pdf_bytes, out_path, filename):
         tables_body_list.append(tables_body)
         table_cells_list.append(table_cells)
         table_content_list.append(table_content)
+        form_key_list.append(_deduplicate_bboxes(form_keys))
+        form_value_list.append(_deduplicate_bboxes(form_values))
         tables_caption_list.append(tables_caption)
         tables_footnote_list.append(tables_footnote)
         imgs_body_list.append(imgs_body)
@@ -402,6 +348,8 @@ def draw_layout_bbox(pdf_info, pdf_bytes, out_path, filename):
         c = draw_bbox_without_number(i, tables_body_list, page, c, [204, 204, 0], True)
         c = draw_bbox_without_number(i, table_cells_list, page, c, [255, 128, 0], False)
         c = draw_bbox_without_number(i, table_content_list, page, c, [0, 180, 255], False)
+        c = draw_bbox_without_number(i, form_key_list, page, c, [0, 160, 90], False)
+        c = draw_bbox_without_number(i, form_value_list, page, c, [30, 90, 255], False)
         c = draw_bbox_without_number(i, tables_caption_list, page, c, [255, 255, 102], True)
         c = draw_bbox_without_number(i, tables_footnote_list, page, c, [229, 255, 204], True)
         c = draw_bbox_without_number(i, imgs_body_list, page, c, [153, 255, 51], True)
@@ -445,6 +393,8 @@ def draw_span_bbox(pdf_info, pdf_bytes, out_path, filename):
     table_list = []
     table_cell_list = []
     table_content_list = []
+    form_key_list = []
+    form_value_list = []
     dropped_list = []
 
     def get_span_info(span):
@@ -475,6 +425,8 @@ def draw_span_bbox(pdf_info, pdf_bytes, out_path, filename):
         page_table_list = []
         page_table_cell_list = []
         page_table_content_list = []
+        page_form_key_list = []
+        page_form_value_list = []
         page_dropped_list = []
 
 
@@ -485,6 +437,11 @@ def draw_span_bbox(pdf_info, pdf_bytes, out_path, filename):
                     if span.get('bbox') is not None:
                         page_dropped_list.append(span['bbox'])
         dropped_list.append(page_dropped_list)
+        for field in page.get("form_fields", []):
+            if not isinstance(field, dict):
+                continue
+            page_form_key_list.append(field.get("key_bbox"))
+            page_form_value_list.append(field.get("value_bbox"))
         # staged middle JSON以preproc_blocks为准；finalized JSON也兼容para_blocks。
         for block_key in ('preproc_blocks', 'para_blocks'):
             for block in page.get(block_key, []):
@@ -511,6 +468,8 @@ def draw_span_bbox(pdf_info, pdf_bytes, out_path, filename):
         table_list.append(_deduplicate_bboxes(page_table_list))
         table_cell_list.append(_deduplicate_bboxes(page_table_cell_list))
         table_content_list.append(_deduplicate_bboxes(page_table_content_list))
+        form_key_list.append(_deduplicate_bboxes(page_form_key_list))
+        form_value_list.append(_deduplicate_bboxes(page_form_value_list))
 
     pdf_bytes_io = BytesIO(pdf_bytes)
     pdf_docs = PdfReader(pdf_bytes_io)
@@ -533,6 +492,8 @@ def draw_span_bbox(pdf_info, pdf_bytes, out_path, filename):
         draw_bbox_without_number(i, table_list, page, c, [204, 0, 255], False)
         draw_bbox_without_number(i, table_cell_list, page, c, [255, 128, 0], False)
         draw_bbox_without_number(i, table_content_list, page, c, [0, 180, 255], False)
+        draw_bbox_without_number(i, form_key_list, page, c, [0, 160, 90], False)
+        draw_bbox_without_number(i, form_value_list, page, c, [30, 90, 255], False)
         draw_bbox_without_number(i, dropped_list, page, c, [158, 158, 158], False)
 
         c.save()
