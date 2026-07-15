@@ -1,0 +1,462 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Custom Hybrid MinerU</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --blue: #286ee8;
+      --blue-dark: #1f58bf;
+      --ink: #172238;
+      --muted: #6f7c91;
+      --line: #dfe5ee;
+      --soft: #f5f7fa;
+      --success: #17815f;
+      --danger: #c84040;
+      --warning: #ad6a00;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f7f8fb;
+    }
+    button, input { font: inherit; }
+    .shell { width: min(1500px, calc(100% - 36px)); margin: 0 auto; padding: 26px 0 54px; }
+    .hero {
+      position: relative;
+      overflow: hidden;
+      padding: 34px 40px;
+      border-radius: 13px;
+      color: white;
+      text-align: center;
+      background: linear-gradient(120deg, #347df4 0%, #1f58bd 100%);
+      box-shadow: 0 16px 38px rgba(32, 88, 190, 0.2);
+    }
+    .hero::after {
+      content: "";
+      position: absolute;
+      width: 420px;
+      height: 420px;
+      right: -210px;
+      top: -260px;
+      border-radius: 50%;
+      background: rgba(255,255,255,0.1);
+    }
+    .hero h1 { position: relative; margin: 0; font-size: clamp(30px, 4vw, 48px); letter-spacing: -0.035em; }
+    .hero p { position: relative; max-width: 760px; margin: 11px auto 0; color: rgba(255,255,255,0.86); line-height: 1.55; }
+    .hero-badges { position: relative; display: flex; flex-wrap: wrap; justify-content: center; gap: 9px; margin-top: 19px; }
+    .hero-badge { padding: 7px 12px; border-radius: 999px; color: white; background: rgba(13, 33, 72, 0.46); font-size: 12px; font-weight: 700; }
+    .service-pill { display: inline-flex; align-items: center; gap: 8px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #c4ccd8; }
+    .service-pill.online .dot { background: #68e0b2; box-shadow: 0 0 0 4px rgba(104,224,178,0.16); }
+    .service-pill.offline .dot { background: #ff8585; box-shadow: 0 0 0 4px rgba(255,133,133,0.16); }
+    .workspace { display: grid; grid-template-columns: 300px minmax(360px, 1fr) minmax(390px, 1fr); gap: 16px; margin-top: 20px; align-items: stretch; }
+    .panel { min-width: 0; min-height: 620px; overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: white; box-shadow: 0 8px 25px rgba(43, 61, 88, 0.055); }
+    .panel-title { display: flex; align-items: center; gap: 8px; min-height: 47px; padding: 0 16px; border-bottom: 1px solid var(--line); font-size: 13px; font-weight: 750; }
+    .panel-title span { color: var(--blue); }
+    .controls { padding: 14px; }
+    .drop-zone { display: grid; place-items: center; min-height: 220px; padding: 22px 14px; border: 1.5px dashed #c3ccd9; border-radius: 9px; text-align: center; cursor: pointer; transition: 150ms ease; }
+    .drop-zone:hover, .drop-zone.dragging { border-color: var(--blue); background: #f4f8ff; }
+    .upload-icon { display: grid; place-items: center; width: 48px; height: 48px; margin-bottom: 13px; border-radius: 14px; color: var(--blue); background: #eaf2ff; font-size: 25px; font-weight: 700; }
+    .drop-zone strong { font-size: 15px; }
+    .drop-zone small { display: block; margin-top: 7px; color: var(--muted); line-height: 1.5; }
+    input[type=file] { display: none; }
+    .file-list { display: grid; gap: 7px; margin-top: 11px; }
+    .file-item { display: flex; justify-content: space-between; gap: 10px; padding: 9px 10px; border-radius: 7px; background: var(--soft); font-size: 12px; }
+    .file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .file-size { flex: none; color: var(--muted); }
+    .setting-card { margin-top: 12px; padding: 13px; border: 1px solid var(--line); border-radius: 9px; }
+    .setting-label { margin-bottom: 5px; font-size: 12px; font-weight: 750; }
+    .setting-help { color: var(--muted); font-size: 11px; line-height: 1.5; }
+    .fixed-value { margin-top: 9px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--soft); font-size: 12px; font-weight: 650; }
+    .actions { display: grid; grid-template-columns: 1fr 0.65fr; gap: 8px; margin-top: 12px; }
+    button, .download-button { appearance: none; border: 0; border-radius: 8px; padding: 10px 12px; cursor: pointer; text-decoration: none; font-size: 13px; font-weight: 720; transition: 140ms ease; }
+    button:hover, .download-button:hover { transform: translateY(-1px); }
+    button:disabled { cursor: not-allowed; opacity: 0.48; transform: none; }
+    .primary { color: white; background: var(--blue); }
+    .primary:hover { background: var(--blue-dark); }
+    .secondary { color: var(--ink); background: #edf1f6; }
+    .preview-body { display: grid; place-items: center; height: 572px; padding: 12px; background: #fafbfc; }
+    .empty-preview { max-width: 270px; color: var(--muted); text-align: center; line-height: 1.6; }
+    .preview-frame, .preview-image { width: 100%; height: 100%; border: 0; border-radius: 7px; background: white; object-fit: contain; }
+    .results { display: flex; flex-direction: column; }
+    .tabs { display: grid; grid-template-columns: repeat(3, 1fr); min-height: 47px; border-bottom: 1px solid var(--line); }
+    .tab-button { position: relative; border-radius: 0; color: #3b4658; background: white; font-size: 12px; }
+    .tab-button:hover { transform: none; background: #fafbfc; }
+    .tab-button.active { color: var(--blue); }
+    .tab-button.active::after { content: ""; position: absolute; left: 18px; right: 18px; bottom: -1px; height: 2px; background: var(--blue); }
+    .tab-panel { display: none; flex: 1; min-height: 573px; overflow: auto; padding: 15px; }
+    .tab-panel.active { display: block; }
+    .output-empty { display: grid; place-items: center; height: 100%; min-height: 480px; color: var(--muted); text-align: center; line-height: 1.6; }
+    pre { margin: 0; min-height: 500px; overflow: auto; padding: 14px; border-radius: 8px; color: #dce8ff; background: #142137; font-size: 11px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+    .download-card { display: none; padding: 18px; border: 1px solid #cfe8df; border-radius: 10px; background: #f1fbf7; }
+    .download-card.visible { display: block; }
+    .download-card h3 { margin: 0 0 8px; font-size: 16px; }
+    .download-card p { margin: 0 0 15px; color: var(--muted); font-size: 12px; line-height: 1.55; }
+    .download-button { display: inline-block; color: white; background: var(--success); }
+    .message { margin-top: 14px; min-height: 21px; color: var(--muted); font-size: 12px; line-height: 1.55; }
+    .message.error { color: var(--danger); }
+    .task-state { display: inline-flex; margin-top: 10px; padding: 5px 9px; border-radius: 999px; color: var(--muted); background: #edf1f6; font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.05em; }
+    .task-state.queued, .task-state.processing, .task-state.uploading { color: var(--warning); background: #fff3da; }
+    .task-state.completed { color: var(--success); background: #e1f5ed; }
+    .task-state.failed { color: var(--danger); background: #fde7e7; }
+    .pipeline { margin-top: 16px; padding: 17px 18px; border: 1px solid var(--line); border-radius: 12px; background: white; box-shadow: 0 8px 25px rgba(43, 61, 88, 0.045); }
+    .pipeline h2 { margin: 0 0 15px; font-size: 14px; }
+    .stages { display: grid; grid-template-columns: repeat(7, 1fr); gap: 8px; }
+    .stage { position: relative; min-width: 0; padding-top: 20px; color: #929dad; text-align: center; font-size: 10px; font-weight: 700; }
+    .stage::before { content: ""; position: absolute; top: 2px; left: 50%; width: 11px; height: 11px; transform: translateX(-50%); border: 2px solid #c8d0db; border-radius: 50%; background: white; z-index: 2; }
+    .stage::after { content: ""; position: absolute; top: 8px; left: calc(-50% + 5px); width: calc(100% - 10px); height: 2px; background: #dfe4eb; }
+    .stage:first-child::after { display: none; }
+    .stage.active { color: var(--blue); }
+    .stage.active::before { border-color: var(--blue); box-shadow: 0 0 0 4px rgba(40,110,232,0.13); }
+    .stage.done { color: var(--success); }
+    .stage.done::before { border-color: var(--success); background: var(--success); }
+    .stage.done::after { background: var(--success); }
+    .hidden { display: none !important; }
+    @media (max-width: 1120px) { .workspace { grid-template-columns: 280px 1fr; } .results { grid-column: 1 / -1; min-height: 480px; } .tab-panel { min-height: 430px; } }
+    @media (max-width: 720px) { .shell { width: min(100% - 20px, 1500px); padding-top: 10px; } .hero { padding: 27px 18px; } .workspace { grid-template-columns: 1fr; } .panel { min-height: auto; } .preview-body { height: 480px; } .results { grid-column: auto; } .stages { grid-template-columns: repeat(4, 1fr); row-gap: 18px; } .stage::after { display: none; } }
+  </style>
+</head>
+<body>
+<main class="shell">
+  <header class="hero">
+    <h1>Custom Hybrid MinerU</h1>
+    <p>Remote document extraction with Pipeline OCR, controlled vLLM generation, hierarchical Table Cell fusion, and content-level bounding boxes.</p>
+    <div class="hero-badges">
+      <span class="hero-badge">OCR + Hybrid Fusion</span>
+      <span class="hero-badge">Table Cell Bounding Boxes</span>
+      <span id="serverStatus" class="hero-badge service-pill"><span class="dot"></span><span>Checking service</span></span>
+    </div>
+  </header>
+
+  <section class="workspace">
+    <aside class="panel">
+      <div class="panel-title"><span>01</span> Upload & Settings</div>
+      <div class="controls">
+        <label id="dropZone" class="drop-zone" for="fileInput">
+          <span class="upload-icon">↑</span>
+          <strong>Drop files here</strong>
+          <small>or click to upload PDF and image files</small>
+        </label>
+        <input id="fileInput" type="file" multiple accept=".pdf,.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff">
+        <div id="fileList" class="file-list"></div>
+
+        <div class="setting-card">
+          <div class="setting-label">Workflow</div>
+          <div class="setting-help">Server-controlled extraction settings for consistent output.</div>
+          <div class="fixed-value">Custom Hybrid · High Effort</div>
+        </div>
+        <div class="setting-card">
+          <div class="setting-label">Output</div>
+          <div class="setting-help">Fused Markdown, JSON, Cell metadata, bounding boxes, and audit report.</div>
+        </div>
+
+        <div class="actions">
+          <button id="submitButton" class="primary" disabled>Convert</button>
+          <button id="clearButton" class="secondary" disabled>Clear</button>
+        </div>
+        <span id="taskState" class="task-state">waiting</span>
+        <div id="message" class="message">Select one or more files to begin.</div>
+      </div>
+    </aside>
+
+    <section class="panel">
+      <div class="panel-title"><span>02</span> Document Preview</div>
+      <div id="previewBody" class="preview-body">
+        <div id="emptyPreview" class="empty-preview">The selected PDF or image will be previewed here before it is sent to the remote MinerU service.</div>
+        <iframe id="previewFrame" class="preview-frame hidden" title="PDF preview"></iframe>
+        <img id="previewImage" class="preview-image hidden" alt="Selected document preview">
+      </div>
+    </section>
+
+    <section class="panel results">
+      <nav class="tabs" aria-label="Result views">
+        <button class="tab-button active" data-tab="report">Fusion Report</button>
+        <button class="tab-button" data-tab="task">Task Details</button>
+        <button class="tab-button" data-tab="downloads">Downloads</button>
+      </nav>
+      <div id="reportPanel" class="tab-panel active">
+        <div id="reportEmpty" class="output-empty">Fusion statistics will appear here after processing completes.</div>
+        <pre id="reportOutput" class="hidden"></pre>
+      </div>
+      <div id="taskPanel" class="tab-panel">
+        <div id="taskEmpty" class="output-empty">Task status and server timestamps will appear after submission.</div>
+        <pre id="taskOutput" class="hidden"></pre>
+      </div>
+      <div id="downloadsPanel" class="tab-panel">
+        <div id="downloadEmpty" class="output-empty">The fused result package will be available when the task is complete.</div>
+        <div id="downloadCard" class="download-card">
+          <h3>Fused result package</h3>
+          <p>Includes fused outputs, Table Cell metadata, OCR content boxes, fusion summary, and the vLLM request audit.</p>
+          <a id="downloadButton" class="download-button">Download Fused ZIP</a>
+        </div>
+      </div>
+    </section>
+  </section>
+
+  <section class="pipeline">
+    <h2>Conversion progress</h2>
+    <div class="stages">
+      <div class="stage" data-stage="prepare">Prepare</div>
+      <div class="stage" data-stage="service">Check Service</div>
+      <div class="stage" data-stage="upload">Upload</div>
+      <div class="stage" data-stage="queue">Queue</div>
+      <div class="stage" data-stage="parse">Parse & OCR</div>
+      <div class="stage" data-stage="build">Build Outputs</div>
+      <div class="stage" data-stage="done">Done</div>
+    </div>
+  </section>
+</main>
+
+<script>
+  const fileInput = document.querySelector('#fileInput');
+  const dropZone = document.querySelector('#dropZone');
+  const fileList = document.querySelector('#fileList');
+  const submitButton = document.querySelector('#submitButton');
+  const clearButton = document.querySelector('#clearButton');
+  const taskState = document.querySelector('#taskState');
+  const message = document.querySelector('#message');
+  const serverStatus = document.querySelector('#serverStatus');
+  const emptyPreview = document.querySelector('#emptyPreview');
+  const previewFrame = document.querySelector('#previewFrame');
+  const previewImage = document.querySelector('#previewImage');
+  const reportEmpty = document.querySelector('#reportEmpty');
+  const reportOutput = document.querySelector('#reportOutput');
+  const taskEmpty = document.querySelector('#taskEmpty');
+  const taskOutput = document.querySelector('#taskOutput');
+  const downloadEmpty = document.querySelector('#downloadEmpty');
+  const downloadCard = document.querySelector('#downloadCard');
+  const downloadButton = document.querySelector('#downloadButton');
+  let selectedFiles = [];
+  let previewUrl = null;
+  let pollTimer = null;
+  let serviceOnline = false;
+
+  const stageOrder = ['prepare', 'service', 'upload', 'queue', 'parse', 'build', 'done'];
+
+  function setStage(activeName, completedNames = []) {
+    document.querySelectorAll('.stage').forEach(stage => {
+      const name = stage.dataset.stage;
+      stage.className = 'stage';
+      if (completedNames.includes(name)) stage.classList.add('done');
+      if (name === activeName) stage.classList.add('active');
+    });
+  }
+
+  function completeThrough(name) {
+    const index = stageOrder.indexOf(name);
+    setStage(null, stageOrder.slice(0, index + 1));
+  }
+
+  const formatBytes = value => value < 1024 * 1024
+    ? `${(value / 1024).toFixed(1)} KB`
+    : `${(value / 1024 / 1024).toFixed(2)} MB`;
+
+  function escapeHtml(value) {
+    const node = document.createElement('div');
+    node.textContent = value;
+    return node.innerHTML;
+  }
+
+  function renderFiles() {
+    fileList.innerHTML = selectedFiles.map(file => `
+      <div class="file-item"><span class="file-name">${escapeHtml(file.name)}</span><span class="file-size">${formatBytes(file.size)}</span></div>
+    `).join('');
+    submitButton.disabled = selectedFiles.length === 0 || !serviceOnline;
+    clearButton.disabled = selectedFiles.length === 0;
+  }
+
+  function renderPreview() {
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    previewFrame.classList.add('hidden');
+    previewImage.classList.add('hidden');
+    previewFrame.removeAttribute('src');
+    previewImage.removeAttribute('src');
+    if (!selectedFiles.length) {
+      emptyPreview.classList.remove('hidden');
+      previewUrl = null;
+      return;
+    }
+    const file = selectedFiles[0];
+    previewUrl = URL.createObjectURL(file);
+    emptyPreview.classList.add('hidden');
+    if (file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')) {
+      previewFrame.src = previewUrl;
+      previewFrame.classList.remove('hidden');
+    } else {
+      previewImage.src = previewUrl;
+      previewImage.classList.remove('hidden');
+    }
+  }
+
+  function selectFiles(files) {
+    selectedFiles = Array.from(files);
+    renderFiles();
+    renderPreview();
+    taskState.textContent = selectedFiles.length ? 'ready' : 'waiting';
+    taskState.className = 'task-state';
+    message.className = 'message';
+    message.textContent = selectedFiles.length
+      ? `${selectedFiles.length} file(s) ready for conversion.`
+      : 'Select one or more files to begin.';
+    if (selectedFiles.length) setStage('service', ['prepare']);
+  }
+
+  function resetResults() {
+    reportEmpty.classList.remove('hidden');
+    reportOutput.classList.add('hidden');
+    reportOutput.textContent = '';
+    taskEmpty.classList.remove('hidden');
+    taskOutput.classList.add('hidden');
+    taskOutput.textContent = '';
+    downloadEmpty.classList.remove('hidden');
+    downloadCard.classList.remove('visible');
+    downloadButton.removeAttribute('href');
+  }
+
+  function clearAll() {
+    if (pollTimer) clearInterval(pollTimer);
+    selectedFiles = [];
+    fileInput.value = '';
+    renderFiles();
+    renderPreview();
+    resetResults();
+    taskState.textContent = 'waiting';
+    taskState.className = 'task-state';
+    message.className = 'message';
+    message.textContent = 'Select one or more files to begin.';
+    setStage(serviceOnline ? 'prepare' : 'service', serviceOnline ? ['service'] : []);
+  }
+
+  fileInput.addEventListener('change', event => selectFiles(event.target.files));
+  ['dragenter', 'dragover'].forEach(name => dropZone.addEventListener(name, event => {
+    event.preventDefault(); dropZone.classList.add('dragging');
+  }));
+  ['dragleave', 'drop'].forEach(name => dropZone.addEventListener(name, event => {
+    event.preventDefault(); dropZone.classList.remove('dragging');
+  }));
+  dropZone.addEventListener('drop', event => selectFiles(event.dataTransfer.files));
+  clearButton.addEventListener('click', clearAll);
+
+  document.querySelectorAll('.tab-button').forEach(button => {
+    button.addEventListener('click', () => {
+      document.querySelectorAll('.tab-button').forEach(item => item.classList.toggle('active', item === button));
+      document.querySelectorAll('.tab-panel').forEach(panel => panel.classList.toggle('active', panel.id === `${button.dataset.tab}Panel`));
+    });
+  });
+
+  async function jsonResponse(response) {
+    const text = await response.text();
+    let payload;
+    try { payload = JSON.parse(text); } catch { payload = { detail: text || `HTTP ${response.status}` }; }
+    if (!response.ok) throw new Error(payload.detail || payload.error || `HTTP ${response.status}`);
+    return payload;
+  }
+
+  async function checkHealth() {
+    try {
+      await jsonResponse(await fetch('/api/health'));
+      serviceOnline = true;
+      serverStatus.className = 'hero-badge service-pill online';
+      serverStatus.lastElementChild.textContent = 'Remote service online';
+      setStage('prepare', ['service']);
+    } catch (error) {
+      serviceOnline = false;
+      serverStatus.className = 'hero-badge service-pill offline';
+      serverStatus.lastElementChild.textContent = 'Remote service unavailable';
+      setStage('service');
+      message.className = 'message error';
+      message.textContent = error.message;
+    }
+    renderFiles();
+  }
+
+  function updateTask(status) {
+    taskState.textContent = status.status;
+    taskState.className = `task-state ${status.status}`;
+    taskOutput.textContent = JSON.stringify(status, null, 2);
+    taskOutput.classList.remove('hidden');
+    taskEmpty.classList.add('hidden');
+    message.className = status.status === 'failed' ? 'message error' : 'message';
+    if (status.status === 'queued') {
+      message.textContent = 'The task is waiting for remote OCR and vLLM resources.';
+      setStage('queue', ['prepare', 'service', 'upload']);
+    } else if (status.status === 'processing') {
+      message.textContent = 'Running Hybrid extraction, Pipeline OCR, and Table Cell fusion.';
+      setStage('parse', ['prepare', 'service', 'upload', 'queue']);
+    } else if (status.status === 'completed') {
+      message.textContent = 'Conversion completed. The fused result package is ready.';
+      completeThrough('done');
+    } else if (status.status === 'failed') {
+      message.textContent = status.error || 'The remote workflow failed.';
+    }
+  }
+
+  async function pollTask(taskId) {
+    try {
+      const status = await jsonResponse(await fetch(`/api/tasks/${taskId}`));
+      updateTask(status);
+      if (status.status === 'completed') {
+        if (pollTimer) clearInterval(pollTimer);
+        setStage('build', ['prepare', 'service', 'upload', 'queue', 'parse']);
+        const report = await jsonResponse(await fetch(`/api/tasks/${taskId}/report`));
+        reportOutput.textContent = JSON.stringify(report, null, 2);
+        reportOutput.classList.remove('hidden');
+        reportEmpty.classList.add('hidden');
+        downloadButton.href = `/api/tasks/${taskId}/result`;
+        downloadCard.classList.add('visible');
+        downloadEmpty.classList.add('hidden');
+        completeThrough('done');
+      } else if (status.status === 'failed') {
+        if (pollTimer) clearInterval(pollTimer);
+      }
+      return status.status === 'completed' || status.status === 'failed';
+    } catch (error) {
+      if (pollTimer) clearInterval(pollTimer);
+      taskState.textContent = 'error';
+      taskState.className = 'task-state failed';
+      message.className = 'message error';
+      message.textContent = error.message;
+      return true;
+    }
+  }
+
+  submitButton.addEventListener('click', async () => {
+    if (!selectedFiles.length || !serviceOnline) return;
+    submitButton.disabled = true;
+    clearButton.disabled = true;
+    resetResults();
+    taskState.textContent = 'uploading';
+    taskState.className = 'task-state uploading';
+    message.className = 'message';
+    message.textContent = 'Uploading files to the remote Custom Hybrid MinerU service.';
+    setStage('upload', ['prepare', 'service']);
+    const form = new FormData();
+    selectedFiles.forEach(file => form.append('files', file, file.name));
+    try {
+      const task = await jsonResponse(await fetch('/api/tasks', { method: 'POST', body: form }));
+      updateTask(task);
+      const terminal = await pollTask(task.task_id);
+      if (!terminal) pollTimer = setInterval(() => pollTask(task.task_id), 1500);
+    } catch (error) {
+      taskState.textContent = 'failed';
+      taskState.className = 'task-state failed';
+      message.className = 'message error';
+      message.textContent = error.message;
+      setStage('upload', ['prepare', 'service']);
+    } finally {
+      clearButton.disabled = false;
+      if (taskState.textContent === 'failed') submitButton.disabled = false;
+    }
+  });
+
+  resetResults();
+  checkHealth();
+</script>
+</body>
+</html>

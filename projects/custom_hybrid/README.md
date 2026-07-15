@@ -240,7 +240,31 @@ Jupyter access token through `JUPYTER_TOKEN`. The client sends that token as a
 query parameter while retaining the Custom Hybrid bearer token in the
 `Authorization` header.
 
-## 5. Evaluate
+## 5. Run the lightweight local UI
+
+The local UI is a small FastAPI/HTML application. It runs on the Mac, keeps API
+credentials out of browser JavaScript, and proxies uploads, task polling, reports,
+and ZIP downloads to the remote Custom Hybrid service. It does not install or run
+MinerU models locally.
+
+```bash
+python -m pip install fastapi uvicorn httpx python-multipart
+export CUSTOM_HYBRID_API_KEY='the-same-token-used-by-the-server'
+
+python projects/custom_hybrid/ui.py \
+  --remote-url http://10.100.0.30:6108 \
+  --host 127.0.0.1 \
+  --port 7860
+```
+
+Open `http://127.0.0.1:7860`, drag in PDF/images, submit the task, inspect the
+fusion report, and download the fused ZIP. The UI refuses public binding unless
+`--allow-public-bind` is supplied explicitly.
+
+For a Jupyter Server Proxy URL, also export `JUPYTER_TOKEN` and use a remote URL
+such as `http://10.100.0.30:8989/proxy/6108`.
+
+## 6. Evaluate
 
 Create reference Markdown manually or with a strong model, then compare either
 two files or directory trees with matching `.md` filenames:

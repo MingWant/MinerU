@@ -381,6 +381,7 @@ class WorkflowTests(unittest.TestCase):
 
         self.assertIn("ready", report)
         self.assertTrue(report["local_mineru_source"])
+        self.assertIn("six", report["dependencies"])
         self.assertEqual(report["upstream"]["url"], "http://127.0.0.1:1")
         self.assertFalse(report["upstream"]["reachable"])
 

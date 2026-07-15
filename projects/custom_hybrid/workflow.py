@@ -1689,6 +1689,7 @@ def run_doctor(config: Mapping[str, Any]) -> dict[str, Any]:
         "torch",
         "cv2",
         "numpy",
+        "six",
     )
     dependencies = {
         name: importlib.util.find_spec(name) is not None
