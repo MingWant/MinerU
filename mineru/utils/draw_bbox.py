@@ -97,6 +97,23 @@ def _page_bboxes(bbox_list, page_index):
     )
 
 
+def _deduplicate_bboxes(bboxes):
+    result = []
+    seen = set()
+    for bbox in bboxes:
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            continue
+        try:
+            key = tuple(float(value) for value in bbox)
+        except (TypeError, ValueError):
+            continue
+        if not all(math.isfinite(value) for value in key) or key in seen:
+            continue
+        seen.add(key)
+        result.append(bbox)
+    return result
+
+
 def draw_bbox_without_number(i, bbox_list, page, c, rgb_config, fill_config):
     new_rgb = [float(color) / 255 for color in rgb_config]
     for bbox in _page_bboxes(bbox_list, i):
@@ -419,30 +436,32 @@ def draw_span_bbox(pdf_info, pdf_bytes, out_path, filename):
                     if span.get('bbox') is not None:
                         page_dropped_list.append(span['bbox'])
         dropped_list.append(page_dropped_list)
-        # 构造其余useful_list
-        # for block in page['para_blocks']:  # span直接用分段合并前的结果就可以
-        for block in page.get('preproc_blocks', []):
-            if block.get('type') in SPAN_SOURCE_BLOCK_TYPES:
-                for line in block.get('lines', []):
-                    for span in line.get('spans', []):
-                        get_span_info(span)
-            elif block.get('type') in [
-                BlockType.IMAGE,
-                BlockType.TABLE,
-                BlockType.CHART,
-                BlockType.CODE,
-            ]:
-                for sub_block in block.get('blocks', []):
-                    for line in sub_block.get('lines', []):
+        # staged middle JSON以preproc_blocks为准；finalized JSON也兼容para_blocks。
+        for block_key in ('preproc_blocks', 'para_blocks'):
+            for block in page.get(block_key, []):
+                if block.get('type') in SPAN_SOURCE_BLOCK_TYPES:
+                    for line in block.get('lines', []):
                         for span in line.get('spans', []):
                             get_span_info(span)
-        text_list.append(page_text_list)
-        inline_equation_list.append(page_inline_equation_list)
-        interline_equation_list.append(page_interline_equation_list)
-        image_list.append(page_image_list)
-        table_list.append(page_table_list)
-        table_cell_list.append(page_table_cell_list)
-        table_content_list.append(page_table_content_list)
+                elif block.get('type') in [
+                    BlockType.IMAGE,
+                    BlockType.TABLE,
+                    BlockType.CHART,
+                    BlockType.CODE,
+                ]:
+                    for sub_block in block.get('blocks', []):
+                        for line in sub_block.get('lines', []):
+                            for span in line.get('spans', []):
+                                get_span_info(span)
+        text_list.append(_deduplicate_bboxes(page_text_list))
+        inline_equation_list.append(_deduplicate_bboxes(page_inline_equation_list))
+        interline_equation_list.append(
+            _deduplicate_bboxes(page_interline_equation_list)
+        )
+        image_list.append(_deduplicate_bboxes(page_image_list))
+        table_list.append(_deduplicate_bboxes(page_table_list))
+        table_cell_list.append(_deduplicate_bboxes(page_table_cell_list))
+        table_content_list.append(_deduplicate_bboxes(page_table_content_list))
 
     pdf_bytes_io = BytesIO(pdf_bytes)
     pdf_docs = PdfReader(pdf_bytes_io)

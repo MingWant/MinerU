@@ -35,6 +35,7 @@ from projects.custom_hybrid.fusion import (
     FusionSettings,
     OpenAIVisionVerifier,
     fuse_middle_json,
+    recover_table_cell_geometry,
 )
 from projects.custom_hybrid.table_fusion import extract_table_snapshots
 
@@ -955,15 +956,38 @@ def regenerate_fused_visualizations(
 ) -> tuple[Path, ...]:
     root = Path(fused_root).expanduser().resolve()
     documents = _index_input_documents(input_path)
+    ocr_root = root.parent / "ocr"
+    ocr_files = _index_middle_json(ocr_root) if ocr_root.is_dir() else {}
     generated = []
     for stem, middle_path in _index_middle_json(root).items():
-        generated.extend(
-            _generate_fused_visualizations(
-                middle_path.parent,
-                stem,
-                documents.get(stem),
+        metadata_changed = False
+        ocr_path = ocr_files.get(stem)
+        if ocr_path is not None:
+            fused_middle = json.loads(middle_path.read_text(encoding="utf-8"))
+            ocr_middle = json.loads(ocr_path.read_text(encoding="utf-8"))
+            _attached_cells, metadata_changed = recover_table_cell_geometry(
+                fused_middle,
+                ocr_middle,
             )
-        )
+            if metadata_changed:
+                middle_path.write_text(
+                    json.dumps(fused_middle, ensure_ascii=False, indent=4),
+                    encoding="utf-8",
+                )
+        span_path = middle_path.parent / f"{stem}_span.pdf"
+        layout_path = middle_path.parent / f"{stem}_layout.pdf"
+        if metadata_changed or not span_path.is_file():
+            generated.extend(
+                _generate_fused_visualizations(
+                    middle_path.parent,
+                    stem,
+                    documents.get(stem),
+                )
+            )
+        else:
+            if layout_path.is_file():
+                generated.append(layout_path)
+            generated.append(span_path)
     return tuple(generated)
 
 

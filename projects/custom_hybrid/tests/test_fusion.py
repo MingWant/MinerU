@@ -17,6 +17,7 @@ from projects.custom_hybrid.fusion import (
     assign_ocr_lines,
     collect_text_lines,
     fuse_middle_json,
+    recover_table_cell_geometry,
 )
 from projects.custom_hybrid.table_fusion import (
     TableCellContext,
@@ -87,6 +88,51 @@ def structured_middle(
 
 
 class FusionTests(unittest.TestCase):
+    def test_unkeyed_pipeline_cells_are_retained_for_bbox_rendering(self):
+        html = "<table><tr><td>Key</td><td>Value</td></tr></table>"
+        table_cells = [
+            {
+                "bbox": [10, 10, 90, 40],
+                "content_bbox": [18, 18, 72, 32],
+                "text": "Key",
+            },
+            {
+                "bbox": [90, 10, 190, 40],
+                "content_spans": [
+                    {"bbox": [105, 18, 172, 32], "text": "Value"}
+                ],
+                "text": "Value",
+            },
+        ]
+
+        fused, _report = fuse_middle_json(
+            structured_middle("table", html=html),
+            structured_middle("table", html=html, table_cells=table_cells),
+            FusionSettings(),
+        )
+
+        span = fused["pdf_info"][0]["preproc_blocks"][0]["lines"][0]["spans"][0]
+        self.assertEqual(span["table_cells"], table_cells)
+
+    def test_missing_fused_cell_geometry_is_recovered_from_ocr_middle(self):
+        html = "<table><tr><td>Key</td><td>Value</td></tr></table>"
+        cells = [
+            {"bbox": [10, 10, 90, 40], "content_bbox": [18, 18, 72, 32]},
+            {
+                "bbox": [90, 10, 190, 40],
+                "content_spans": [{"bbox": [105, 18, 172, 32]}],
+            },
+        ]
+        fused = structured_middle("table", html=html)
+        ocr = structured_middle("table", html=html, table_cells=cells)
+
+        attached, changed = recover_table_cell_geometry(fused, ocr)
+
+        span = fused["pdf_info"][0]["preproc_blocks"][0]["lines"][0]["spans"][0]
+        self.assertEqual(attached, 2)
+        self.assertTrue(changed)
+        self.assertEqual(span["table_cells"], cells)
+
     def test_invalid_hybrid_table_falls_back_to_valid_pipeline_table(self):
         hybrid = structured_middle("table", html="<table><tr><td>broken")
         valid_html = "<table><tr><th>A</th></tr><tr><td>1</td></tr></table>"

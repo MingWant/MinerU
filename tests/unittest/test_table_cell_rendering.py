@@ -82,3 +82,53 @@ def test_span_bbox_renderer_uses_page_level_table_cell_bboxes(monkeypatch, tmp_p
         [55, 68, 88, 84],
         [108, 68, 142, 84],
     ]
+
+
+def test_span_bbox_renderer_finds_cells_in_finalized_para_blocks(monkeypatch, tmp_path):
+    rendered_table_cells = []
+    rendered_content_spans = []
+
+    def record_bbox(i, bbox_list, page, pdf_canvas, rgb_config, fill_config):
+        if rgb_config == [255, 128, 0]:
+            rendered_table_cells.extend(bbox_list[i])
+        elif rgb_config == [0, 180, 255]:
+            rendered_content_spans.extend(bbox_list[i])
+        return pdf_canvas
+
+    monkeypatch.setattr(draw_bbox_module, "draw_bbox_without_number", record_bbox)
+    table_span = {
+        "type": ContentType.TABLE,
+        "bbox": [40, 50, 160, 150],
+        "table_cells": [
+            {
+                "bbox": [50, 60, 100, 100],
+                "content_bbox": [55, 68, 88, 84],
+            }
+        ],
+    }
+    table_block = {
+        "type": BlockType.TABLE,
+        "blocks": [
+            {
+                "type": BlockType.TABLE_BODY,
+                "lines": [{"spans": [table_span]}],
+            }
+        ],
+    }
+    pdf_info = [
+        {
+            "discarded_blocks": [],
+            "preproc_blocks": [],
+            "para_blocks": [table_block],
+        }
+    ]
+
+    draw_bbox_module.draw_span_bbox(
+        pdf_info,
+        _blank_pdf_bytes(),
+        str(tmp_path),
+        "finalized-table-cells.pdf",
+    )
+
+    assert rendered_table_cells == [[50, 60, 100, 100]]
+    assert rendered_content_spans == [[55, 68, 88, 84]]

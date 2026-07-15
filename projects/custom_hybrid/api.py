@@ -566,20 +566,18 @@ def create_app(
     )
     async def get_task_preview(task_id: str):
         record = require_completed_task(task_id)
+        try:
+            await asyncio.to_thread(
+                regenerate_fused_visualizations,
+                record.output_root / "fused",
+                record.input_root,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Bounding Box PDF generation failed: {exc}",
+            ) from exc
         previews = sorted((record.output_root / "fused").rglob("*_span.pdf"))
-        if not previews:
-            try:
-                await asyncio.to_thread(
-                    regenerate_fused_visualizations,
-                    record.output_root / "fused",
-                    record.input_root,
-                )
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Bounding Box PDF generation failed: {exc}",
-                ) from exc
-            previews = sorted((record.output_root / "fused").rglob("*_span.pdf"))
         if not previews:
             raise HTTPException(
                 status_code=404,

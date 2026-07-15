@@ -664,23 +664,75 @@ def _table_cell_decision(
 def _attach_final_table_cells(
     target: StructuredSpan,
     evidence: StructuredSpan,
-    final_table: ParsedTable,
+    final_table: ParsedTable | None,
 ) -> int:
-    """Copy Pipeline geometry while synchronizing cell text to the fused HTML."""
-    evidence_by_key = collect_table_cell_evidence(evidence.span)
+    """Copy Pipeline geometry and synchronize logical cell text when possible."""
+    raw_cells = evidence.span.get("table_cells", [])
+    if not isinstance(raw_cells, list):
+        target.span.pop("table_cells", None)
+        return 0
+    final_by_key = final_table.cell_map if final_table is not None else {}
     final_cells = []
-    for cell in final_table.cells:
-        cell_evidence = evidence_by_key.get(cell.key)
-        if cell_evidence is None:
+    for raw_cell in raw_cells:
+        if (
+            not isinstance(raw_cell, Mapping)
+            or _valid_bbox(raw_cell.get("bbox")) is None
+        ):
             continue
-        output_cell = copy.deepcopy(dict(cell_evidence.raw))
-        output_cell["text"] = cell.text
+        output_cell = copy.deepcopy(dict(raw_cell))
+        try:
+            key = tuple(
+                int(output_cell[name])
+                for name in ("row_start", "row_end", "col_start", "col_end")
+            )
+        except (KeyError, TypeError, ValueError):
+            key = None
+        final_cell = final_by_key.get(key) if key is not None else None
+        if final_cell is not None:
+            output_cell["text"] = final_cell.text
         final_cells.append(output_cell)
     if final_cells:
         target.span["table_cells"] = final_cells
     else:
         target.span.pop("table_cells", None)
     return len(final_cells)
+
+
+def recover_table_cell_geometry(
+    fused_middle: Mapping[str, Any],
+    ocr_middle: Mapping[str, Any],
+    min_overlap: float = 0.5,
+) -> tuple[int, bool]:
+    """Restore render-only Pipeline Cell geometry without changing fused table HTML."""
+    fused_pages = fused_middle.get("pdf_info", [])
+    ocr_pages = ocr_middle.get("pdf_info", [])
+    if not isinstance(fused_pages, list) or not isinstance(ocr_pages, list):
+        return 0, False
+    attached_cells = 0
+    changed = False
+    for page_index, (fused_page, ocr_page) in enumerate(
+        zip(fused_pages, ocr_pages)
+    ):
+        if not isinstance(fused_page, Mapping) or not isinstance(ocr_page, Mapping):
+            continue
+        targets = collect_structured_spans(fused_page, page_index, {"table"})
+        evidence = collect_structured_spans(ocr_page, page_index, {"table"})
+        assignments = assign_structured_spans(targets, evidence, min_overlap)
+        for target in targets:
+            matched = _best_structured_evidence(assignments[id(target)])
+            if matched is None:
+                continue
+            html = target.span.get("html")
+            final_table = parse_table_html(html) if table_html_usable(html) else None
+            previous = copy.deepcopy(target.span.get("table_cells"))
+            attached_cells += _attach_final_table_cells(
+                target,
+                matched,
+                final_table,
+            )
+            if target.span.get("table_cells") != previous:
+                changed = True
+    return attached_cells, changed
 
 
 def apply_table_cell_fusion(
@@ -880,6 +932,12 @@ def apply_structured_fallbacks(
             evidence = _best_structured_evidence(assignments[id(target)])
             if evidence is None:
                 continue
+            geometry_table = (
+                parse_table_html(hybrid_html)
+                if table_html_usable(hybrid_html)
+                else None
+            )
+            _attach_final_table_cells(target, evidence, geometry_table)
             ocr_html = evidence.span.get("html")
             if not table_html_usable(ocr_html):
                 continue

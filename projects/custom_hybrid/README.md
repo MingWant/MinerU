@@ -295,6 +295,13 @@ that the generated PDF is non-empty with the expected page count. Run `doctor`
 after deployment; `pypdf` and `reportlab` are required for these visualization
 artifacts and are installed by the base project dependencies.
 
+Cell geometry is retained even when a table model supplies valid Cell bboxes but
+omits logical row/column indices. Logical indices remain required for automatic
+cell-text replacement, but not for orange Cell or cyan OCR-content rendering.
+When Preview is opened, completed tasks also recover missing Cell geometry from
+the sibling Pipeline OCR middle JSON before deciding whether `*_span.pdf` needs
+to be redrawn.
+
 For a Jupyter Server Proxy URL, also export `JUPYTER_TOKEN` and use a remote URL
 such as `http://10.100.0.30:8989/proxy/6108`.
 

@@ -34,6 +34,7 @@ from projects.custom_hybrid.workflow import (
     fuse_output_trees,
     load_config,
     levenshtein_distance,
+    regenerate_fused_visualizations,
     run_doctor,
     _generate_fused_visualizations,
     _index_input_documents,
@@ -57,6 +58,83 @@ class WorkflowTests(unittest.TestCase):
             )
 
             self.assertEqual(resolved, origin)
+
+    def test_visualization_refresh_recovers_cells_from_ocr_middle(self):
+        html = "<table><tr><td>Key</td></tr></table>"
+
+        def table_middle(table_cells=None):
+            span = {
+                "type": "table",
+                "bbox": [10, 10, 190, 80],
+                "html": html,
+            }
+            if table_cells is not None:
+                span["table_cells"] = table_cells
+            return {
+                "pdf_info": [
+                    {
+                        "page_size": [200, 300],
+                        "preproc_blocks": [
+                            {
+                                "type": "table_body",
+                                "lines": [
+                                    {
+                                        "bbox": [10, 10, 190, 80],
+                                        "spans": [span],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            }
+
+        fused_middle = table_middle()
+        ocr_middle = table_middle(
+            [
+                {
+                    "bbox": [10, 10, 190, 80],
+                    "content_bbox": [20, 20, 100, 40],
+                }
+            ]
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fused_dir = root / "output" / "fused" / "sample"
+            ocr_dir = root / "output" / "ocr" / "sample"
+            input_dir = root / "input"
+            fused_dir.mkdir(parents=True)
+            ocr_dir.mkdir(parents=True)
+            input_dir.mkdir()
+            (input_dir / "sample.pdf").write_bytes(b"pdf")
+            middle_path = fused_dir / "sample_middle.json"
+            middle_path.write_text(json.dumps(fused_middle), encoding="utf-8")
+            (ocr_dir / "sample_middle.json").write_text(
+                json.dumps(ocr_middle),
+                encoding="utf-8",
+            )
+            (fused_dir / "sample_span.pdf").write_bytes(b"old")
+
+            def render(parse_dir, stem, source_document):
+                refreshed = json.loads(middle_path.read_text(encoding="utf-8"))
+                span = refreshed["pdf_info"][0]["preproc_blocks"][0]["lines"][0]["spans"][0]
+                self.assertEqual(len(span["table_cells"]), 1)
+                output = parse_dir / f"{stem}_span.pdf"
+                output.write_bytes(b"new")
+                return (output,)
+
+            with mock.patch(
+                "projects.custom_hybrid.workflow._generate_fused_visualizations",
+                side_effect=render,
+            ) as regenerate:
+                generated = regenerate_fused_visualizations(
+                    root / "output" / "fused",
+                    input_dir,
+                )
+
+            self.assertEqual((fused_dir / "sample_span.pdf").read_bytes(), b"new")
+            self.assertIn((fused_dir / "sample_span.pdf").resolve(), generated)
+            regenerate.assert_called_once()
 
     @unittest.skipUnless(PDF_RENDERING_AVAILABLE, "PDF rendering dependencies missing")
     def test_fused_visualization_uses_origin_pdf_fallback_and_creates_span(self):
