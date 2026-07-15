@@ -182,7 +182,65 @@ For a long-running MinerU API, run the proxy separately and point
 python projects/custom_hybrid/workflow.py --config workflow.local.json proxy
 ```
 
-## 4. Evaluate
+## 4. Serve the fused workflow over HTTP
+
+The standard `mineru-api` does not run the dual Hybrid + Pipeline OCR fusion
+workflow. Use the dedicated service to upload documents and download a ZIP whose
+root contains `fused/`, `fusion_summary.json`, and the per-task vLLM audit log.
+
+Set a bearer token before binding the service to a public/container interface:
+
+```bash
+export CUSTOM_HYBRID_API_KEY='replace-with-a-long-random-token'
+
+python projects/custom_hybrid/api.py \
+  --config workflow.local.json \
+  --host 0.0.0.0 \
+  --port 8010 \
+  --output-root /work/mineru-output/custom-hybrid-api
+```
+
+Public binding without a token is rejected unless
+`--allow-unauthenticated-public` is explicitly supplied. Keep the service behind
+a private network, VPN, or authenticated reverse proxy. The server uses the
+generation and upstream settings from `workflow.local.json`; request clients
+cannot override them. Tasks run serially because each extraction owns a local
+parameter-proxy port and local OCR resources.
+
+Endpoints:
+
+- `GET /health`: service status;
+- `POST /tasks`: upload PDF/images and receive a task id;
+- `GET /tasks/{task_id}`: poll status;
+- `GET /tasks/{task_id}/result`: download the fused ZIP;
+- `GET /tasks/{task_id}/report`: read `fusion_summary.json`;
+- `DELETE /tasks/{task_id}`: remove a completed/failed task and its files;
+- `POST /file_parse`: wait synchronously and return the fused ZIP.
+
+From a Mac, only Python and `httpx` are required. Run the client from this repo:
+
+```bash
+python -m pip install httpx
+export CUSTOM_HYBRID_API_KEY='replace-with-a-long-random-token'
+
+python projects/custom_hybrid/api_client.py \
+  --url http://10.100.0.30:8010 \
+  --input ~/Documents/invoice.pdf \
+  --output ~/Documents/invoice-fused.zip
+```
+
+The client accepts either one supported file or a directory and streams the ZIP
+to disk. The Jupyter/container port must be published or reverse-proxied before a
+Mac can reach it. Task state is in memory and does not survive a service restart;
+task files remain under `--output-root` until deleted.
+
+If `jupyter-server-proxy` is installed and direct port publishing is unavailable,
+use `http://<jupyter-host>:<jupyter-port>/proxy/8010` as `--url` and export the
+Jupyter access token through `JUPYTER_TOKEN`. The client sends that token as a
+query parameter while retaining the Custom Hybrid bearer token in the
+`Authorization` header.
+
+## 5. Evaluate
 
 Create reference Markdown manually or with a strong model, then compare either
 two files or directory trees with matching `.md` filenames:
