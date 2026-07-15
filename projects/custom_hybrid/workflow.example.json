@@ -19,14 +19,14 @@
       "allow_public_bind": false
     },
     "generation": {
-      "defaults": {
-        "max_tokens": 4096
-      },
+      "defaults": {},
       "overrides": {
+        "max_tokens": 2048,
         "temperature": 0.0,
         "top_p": 1.0,
         "seed": 42
       },
+      "context_reserve_tokens": 4096,
       "remove": [
         "top_k",
         "presence_penalty",

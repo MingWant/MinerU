@@ -29,6 +29,10 @@ DIRECT_LAYOUT_BBOX_BLOCK_TYPES = TEXT_LIKE_BLOCK_TYPES_FOR_BBOX | {
 
 # span.pdf 从这些结构性 block 中收集内部 span bbox。
 SPAN_SOURCE_BLOCK_TYPES = DIRECT_LAYOUT_BBOX_BLOCK_TYPES
+BBOX_RENDERER_VERSION = 2
+MAX_RENDERED_TABLE_CELLS = 200
+MIN_CELL_CONTENT_CONTAINMENT = 0.7
+MAX_SEVERE_OVERLAPS_PER_CELL = 0.5
 
 
 def _get_layout_source_blocks(page):
@@ -112,6 +116,81 @@ def _deduplicate_bboxes(bboxes):
         seen.add(key)
         result.append(bbox)
     return result
+
+
+def _bbox_area(bbox):
+    return max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
+
+
+def _bbox_intersection_area(left, right):
+    return max(0.0, min(left[2], right[2]) - max(left[0], right[0])) * max(
+        0.0,
+        min(left[3], right[3]) - max(left[1], right[1]),
+    )
+
+
+def _bbox_contains(outer, inner, tolerance=2.0):
+    return (
+        outer[0] - tolerance <= inner[0]
+        and outer[1] - tolerance <= inner[1]
+        and outer[2] + tolerance >= inner[2]
+        and outer[3] + tolerance >= inner[3]
+    )
+
+
+def _cell_content_bboxes(cell):
+    content_spans = [
+        span.get("bbox")
+        for span in cell.get("content_spans", [])
+        if isinstance(span, dict) and span.get("bbox")
+    ]
+    if content_spans:
+        return _deduplicate_bboxes(content_spans)
+    content_bbox = cell.get("content_bbox")
+    return _deduplicate_bboxes([content_bbox] if content_bbox else [])
+
+
+def _table_cell_render_bboxes(span):
+    cells = [
+        cell
+        for cell in span.get("table_cells", [])
+        if isinstance(cell, dict)
+        and _deduplicate_bboxes([cell.get("bbox")])
+    ]
+    content_bboxes = _deduplicate_bboxes(
+        bbox
+        for cell in cells
+        for bbox in _cell_content_bboxes(cell)
+    )
+    cell_bboxes = _deduplicate_bboxes(cell["bbox"] for cell in cells)
+    if not cell_bboxes or len(cell_bboxes) > MAX_RENDERED_TABLE_CELLS:
+        return [], content_bboxes
+
+    content_total = 0
+    content_inside = 0
+    for cell in cells:
+        cell_bbox = cell.get("bbox")
+        for content_bbox in _cell_content_bboxes(cell):
+            content_total += 1
+            content_inside += int(_bbox_contains(cell_bbox, content_bbox))
+    if (
+        content_total
+        and content_inside / content_total < MIN_CELL_CONTENT_CONTAINMENT
+    ):
+        return [], content_bboxes
+
+    severe_overlaps = 0
+    for index, left in enumerate(cell_bboxes):
+        left_area = _bbox_area(left)
+        for right in cell_bboxes[index + 1 :]:
+            smaller_area = min(left_area, _bbox_area(right))
+            if smaller_area <= 0:
+                continue
+            if _bbox_intersection_area(left, right) / smaller_area > 0.35:
+                severe_overlaps += 1
+    if severe_overlaps > len(cell_bboxes) * MAX_SEVERE_OVERLAPS_PER_CELL:
+        return [], content_bboxes
+    return cell_bboxes, content_bboxes
 
 
 def draw_bbox_without_number(i, bbox_list, page, c, rgb_config, fill_config):
@@ -212,26 +291,11 @@ def draw_layout_bbox(pdf_info, pdf_bytes, out_path, filename):
                         for line in nested_block.get("lines", []):
                             for span in line.get("spans", []):
                                 if span.get("type") == ContentType.TABLE:
-                                    table_cells.extend(
-                                        cell["bbox"]
-                                        for cell in span.get("table_cells", [])
-                                        if cell.get("bbox")
+                                    cell_boxes, content_boxes = (
+                                        _table_cell_render_bboxes(span)
                                     )
-                                    table_content.extend(
-                                        content_bbox
-                                        for cell in span.get("table_cells", [])
-                                        for content_bbox in (
-                                            [
-                                                content_span["bbox"]
-                                                for content_span in cell.get(
-                                                    "content_spans", []
-                                                )
-                                                if content_span.get("bbox")
-                                            ]
-                                            or [cell.get("content_bbox")]
-                                        )
-                                        if content_bbox
-                                    )
+                                    table_cells.extend(cell_boxes)
+                                    table_content.extend(content_boxes)
                     elif nested_block["type"] == BlockType.TABLE_CAPTION:
                         tables_caption.append(bbox)
                     elif nested_block["type"] == BlockType.TABLE_FOOTNOTE:
@@ -399,24 +463,9 @@ def draw_span_bbox(pdf_info, pdf_bytes, out_path, filename):
         elif span_type == ContentType.TABLE:
             if bbox is not None:
                 page_table_list.append(bbox)
-            page_table_cell_list.extend(
-                cell['bbox']
-                for cell in span.get('table_cells', [])
-                if cell.get('bbox')
-            )
-            page_table_content_list.extend(
-                content_bbox
-                for cell in span.get('table_cells', [])
-                for content_bbox in (
-                    [
-                        content_span['bbox']
-                        for content_span in cell.get('content_spans', [])
-                        if content_span.get('bbox')
-                    ]
-                    or [cell.get('content_bbox')]
-                )
-                if content_bbox
-            )
+            cell_boxes, content_boxes = _table_cell_render_bboxes(span)
+            page_table_cell_list.extend(cell_boxes)
+            page_table_content_list.extend(content_boxes)
 
     for page in pdf_info:
         page_text_list = []

@@ -41,6 +41,9 @@ Copy `workflow.example.json` and edit the copy. Important sections:
 - `vllm.server_args`: arguments accepted by `mineru-vllm-server`/vLLM;
 - `vllm.generation.defaults`: values added only when MinerU did not send one;
 - `vllm.generation.overrides`: values that always replace MinerU's request;
+- `vllm.generation.context_reserve_tokens`: context kept available for prompts;
+- `vllm.generation.max_context_tokens`: optional manual context limit when the
+  upstream `/v1/models` response does not expose `max_model_len`;
 - `vllm.generation.remove`: MinerU/model defaults removed before forwarding;
 - `vllm.generation.rules`: prompt/path/model regex-specific overrides;
 - `mineru`: the OCR and Hybrid strategy used for extraction.
@@ -48,9 +51,13 @@ Copy `workflow.example.json` and edit the copy. Important sections:
 `generation_config` is set to `vllm` in the example so the model repository's
 generation config does not silently replace the workflow's sampling baseline.
 The example also removes MinerU's stale `top_k`, presence/frequency penalties,
-and `vllm_xargs`, while capping generated output at `max_tokens=4096`. For a
-remote server with `max_model_len=8192`, keep prompt tokens plus `max_tokens`
-within 8192. Configure the OpenAI-compatible base URL (for example,
+and `vllm_xargs`, while overriding generated output to `max_tokens=2048` instead
+of using a default that MinerU's own `max_tokens` can bypass. At proxy startup,
+the workflow reads `/v1/models` and clamps requested output tokens to
+`max_model_len - context_reserve_tokens`; this guard runs after task-level UI
+overrides. For a remote server with `max_model_len=8192`, the example reserves
+4096 tokens for the prompt and therefore never forwards more than 4096 output
+tokens. Configure the OpenAI-compatible base URL (for example,
 `http://10.100.0.30:8205`), not its interactive `/docs` page.
 
 Check the local runtime and configured vLLM endpoint before extraction:
@@ -301,6 +308,12 @@ cell-text replacement, but not for orange Cell or cyan OCR-content rendering.
 When Preview is opened, completed tasks also recover missing Cell geometry from
 the sibling Pipeline OCR middle JSON before deciding whether `*_span.pdf` needs
 to be redrawn.
+
+Rendering applies a separate Cell-geometry quality gate. Cyan OCR-content boxes
+remain visible, but orange Cell boxes are suppressed when a table is abnormally
+over-segmented, most content falls outside its assigned Cell, or Cell boxes have
+excessive material overlap. This avoids presenting a hallucinated table grid as
+reliable geometry on degraded scans while retaining orange boxes on stable tables.
 
 For a Jupyter Server Proxy URL, also export `JUPYTER_TOKEN` and use a remote URL
 such as `http://10.100.0.30:8989/proxy/6108`.

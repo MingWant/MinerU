@@ -147,6 +147,29 @@ def _validate_proxy_config(vllm_config: Mapping[str, Any]) -> None:
             raise WorkflowConfigError(f"vllm.generation.{key} must be a JSON object")
     if not isinstance(generation.get("remove", []), list):
         raise WorkflowConfigError("vllm.generation.remove must be a JSON array")
+    max_context_tokens = generation.get("max_context_tokens")
+    if max_context_tokens is not None and (
+        not isinstance(max_context_tokens, int) or max_context_tokens <= 1
+    ):
+        raise WorkflowConfigError(
+            "vllm.generation.max_context_tokens must be an integer greater than 1"
+        )
+    context_reserve_tokens = generation.get("context_reserve_tokens")
+    if context_reserve_tokens is not None and (
+        not isinstance(context_reserve_tokens, int) or context_reserve_tokens < 1
+    ):
+        raise WorkflowConfigError(
+            "vllm.generation.context_reserve_tokens must be a positive integer"
+        )
+    if (
+        isinstance(max_context_tokens, int)
+        and isinstance(context_reserve_tokens, int)
+        and context_reserve_tokens >= max_context_tokens
+    ):
+        raise WorkflowConfigError(
+            "vllm.generation.context_reserve_tokens must be smaller than "
+            "max_context_tokens"
+        )
     rules = generation.get("rules", [])
     if not isinstance(rules, list):
         raise WorkflowConfigError("vllm.generation.rules must be a JSON array")
@@ -357,10 +380,30 @@ def apply_generation_policy(
     task_overrides = generation_config.get("task_overrides", {})
     if isinstance(task_overrides, dict):
         effective.update(task_overrides)
+    max_context_tokens = generation_config.get(
+        "_resolved_max_context_tokens",
+        generation_config.get("max_context_tokens"),
+    )
+    if isinstance(max_context_tokens, int) and max_context_tokens > 1:
+        configured_reserve = generation_config.get("context_reserve_tokens")
+        reserve_tokens = (
+            configured_reserve
+            if isinstance(configured_reserve, int) and configured_reserve > 0
+            else max(1024, max_context_tokens // 2)
+        )
+        output_cap = max(1, max_context_tokens - reserve_tokens)
+        for token_key in ("max_tokens", "max_completion_tokens"):
+            requested_tokens = effective.get(token_key)
+            if (
+                isinstance(requested_tokens, (int, float))
+                and requested_tokens > output_cap
+            ):
+                effective[token_key] = output_cap
 
     tracked_keys = set(generation_config.get("defaults", {}))
     tracked_keys.update(generation_config.get("overrides", {}))
     tracked_keys.update(generation_config.get("task_overrides", {}))
+    tracked_keys.update({"max_tokens", "max_completion_tokens"})
     tracked_keys.update(generation_config.get("remove", []))
     for rule in generation_config.get("rules", []):
         if rule.get("name") in matched_rules:
@@ -607,6 +650,50 @@ def create_proxy_app(config: Mapping[str, Any]) -> ParameterProxyASGI:
     return ParameterProxyASGI(config)
 
 
+def resolve_upstream_max_model_len(config: Mapping[str, Any]) -> int | None:
+    generation = config["vllm"]["generation"]
+    explicit = generation.get("max_context_tokens")
+    if isinstance(explicit, int) and explicit > 1:
+        return explicit
+    try:
+        import httpx
+
+        vllm_config = config["vllm"]
+        headers = {}
+        api_key_env = str(vllm_config.get("api_key_env", "VLLM_API_KEY"))
+        api_key = os.getenv(api_key_env)
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        response = httpx.get(
+            str(vllm_config["upstream_url"]).rstrip("/") + "/v1/models",
+            headers=headers,
+            timeout=3.0,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        return None
+    models = payload.get("data", []) if isinstance(payload, dict) else []
+    context_lengths = [
+        item["max_model_len"]
+        for item in models
+        if isinstance(item, dict)
+        and isinstance(item.get("max_model_len"), int)
+        and item["max_model_len"] > 1
+    ]
+    return min(context_lengths) if context_lengths else None
+
+
+def prepare_parameter_proxy_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    prepared = copy.deepcopy(dict(config))
+    max_model_len = resolve_upstream_max_model_len(prepared)
+    if max_model_len is not None:
+        prepared["vllm"]["generation"][
+            "_resolved_max_context_tokens"
+        ] = max_model_len
+    return prepared
+
+
 def find_free_port(host: str = "127.0.0.1") -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind((host, 0))
@@ -618,7 +705,8 @@ def run_proxy(config: Mapping[str, Any], host: str | None = None, port: int | No
         import uvicorn
     except ImportError as exc:
         raise RuntimeError("Proxy mode requires MinerU's uvicorn dependency") from exc
-    proxy_config = config["vllm"]["proxy"]
+    prepared_config = prepare_parameter_proxy_config(config)
+    proxy_config = prepared_config["vllm"]["proxy"]
     resolved_host = host or str(proxy_config.get("host", "127.0.0.1"))
     if resolved_host not in {"127.0.0.1", "localhost", "::1"} and not proxy_config.get(
         "allow_public_bind", False
@@ -629,7 +717,11 @@ def run_proxy(config: Mapping[str, Any], host: str | None = None, port: int | No
     resolved_port = int(proxy_config.get("port", 30001) if port is None else port)
     if resolved_port == 0:
         resolved_port = find_free_port(resolved_host)
-    uvicorn.run(create_proxy_app(config), host=resolved_host, port=resolved_port)
+    uvicorn.run(
+        create_proxy_app(prepared_config),
+        host=resolved_host,
+        port=resolved_port,
+    )
 
 
 def _option_args(options: Mapping[str, Any]) -> list[str]:
@@ -743,12 +835,18 @@ def _start_parameter_proxy(config: Mapping[str, Any]):
         import uvicorn
     except ImportError as exc:
         raise RuntimeError("This command requires MinerU's uvicorn dependency") from exc
-    proxy_config = config["vllm"]["proxy"]
+    prepared_config = prepare_parameter_proxy_config(config)
+    proxy_config = prepared_config["vllm"]["proxy"]
     host = str(proxy_config.get("host", "127.0.0.1"))
     configured_port = int(proxy_config.get("port", 30001))
     port = configured_port or find_free_port(host)
     server = uvicorn.Server(
-        uvicorn.Config(create_proxy_app(config), host=host, port=port, log_level="warning")
+        uvicorn.Config(
+            create_proxy_app(prepared_config),
+            host=host,
+            port=port,
+            log_level="warning",
+        )
     )
     thread = threading.Thread(target=server.run, name="mineru-vllm-proxy", daemon=True)
     thread.start()
@@ -912,7 +1010,11 @@ def _generate_fused_visualizations(
     if source_pdf is None:
         return ()
 
-    from mineru.utils.draw_bbox import draw_layout_bbox, draw_span_bbox
+    from mineru.utils.draw_bbox import (
+        BBOX_RENDERER_VERSION,
+        draw_layout_bbox,
+        draw_span_bbox,
+    )
 
     middle_json_path = parse_dir / f"{document_stem}_middle.json"
     middle_json = json.loads(middle_json_path.read_text(encoding="utf-8"))
@@ -947,7 +1049,23 @@ def _generate_fused_visualizations(
         layout_temp.unlink(missing_ok=True)
     finally:
         layout_temp.unlink(missing_ok=True)
+    marker_path = parse_dir / f"{document_stem}_visualization.json"
+    marker_path.write_text(
+        json.dumps({"bbox_renderer_version": BBOX_RENDERER_VERSION}, indent=2),
+        encoding="utf-8",
+    )
     return tuple(generated)
+
+
+def _visualization_renderer_is_current(parse_dir: Path, stem: str) -> bool:
+    from mineru.utils.draw_bbox import BBOX_RENDERER_VERSION
+
+    marker_path = parse_dir / f"{stem}_visualization.json"
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return False
+    return marker.get("bbox_renderer_version") == BBOX_RENDERER_VERSION
 
 
 def regenerate_fused_visualizations(
@@ -976,7 +1094,11 @@ def regenerate_fused_visualizations(
                 )
         span_path = middle_path.parent / f"{stem}_span.pdf"
         layout_path = middle_path.parent / f"{stem}_layout.pdf"
-        if metadata_changed or not span_path.is_file():
+        if (
+            metadata_changed
+            or not span_path.is_file()
+            or not _visualization_renderer_is_current(middle_path.parent, stem)
+        ):
             generated.extend(
                 _generate_fused_visualizations(
                     middle_path.parent,
@@ -1856,6 +1978,19 @@ def run_doctor(config: Mapping[str, Any]) -> dict[str, Any]:
         )
         upstream_status["status_code"] = response.status_code
         upstream_status["reachable"] = response.is_success
+        if response.is_success:
+            payload = response.json()
+            models = payload.get("data", []) if isinstance(payload, dict) else []
+            context_lengths = [
+                item["max_model_len"]
+                for item in models
+                if isinstance(item, dict)
+                and isinstance(item.get("max_model_len"), int)
+                and item["max_model_len"] > 1
+            ]
+            upstream_status["max_model_len"] = (
+                min(context_lengths) if context_lengths else None
+            )
     except Exception as exc:
         upstream_status["error"] = type(exc).__name__
 

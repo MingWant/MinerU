@@ -34,7 +34,9 @@ from projects.custom_hybrid.workflow import (
     fuse_output_trees,
     load_config,
     levenshtein_distance,
+    prepare_parameter_proxy_config,
     regenerate_fused_visualizations,
+    resolve_upstream_max_model_len,
     run_doctor,
     _generate_fused_visualizations,
     _index_input_documents,
@@ -169,6 +171,12 @@ class WorkflowTests(unittest.TestCase):
             self.assertIn(span_path, generated)
             self.assertTrue(span_path.is_file())
             self.assertEqual(len(PdfReader(str(span_path)).pages), 1)
+            marker = json.loads(
+                (parse_dir / "renamed_visualization.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(marker["bbox_renderer_version"], 2)
             self.assertFalse(list(parse_dir.glob(".*-span.pdf")))
 
     def test_real_proxy_rewrites_openai_request_and_writes_safe_audit(self):
@@ -245,7 +253,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(forwarded["temperature"], 0.0)
             self.assertEqual(forwarded["top_p"], 1.0)
             self.assertEqual(forwarded["seed"], 42)
-            self.assertEqual(forwarded["max_tokens"], 4096)
+            self.assertEqual(forwarded["max_tokens"], 2048)
             self.assertNotIn("top_k", forwarded)
             self.assertNotIn("presence_penalty", forwarded)
             self.assertNotIn("frequency_penalty", forwarded)
@@ -256,7 +264,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(
                 audit["effective_generation_parameters"],
                 {
-                    "max_tokens": 4096,
+                    "max_tokens": 2048,
                     "seed": 42,
                     "temperature": 0.0,
                     "top_p": 1.0,
@@ -324,6 +332,43 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("min_p", applied.body)
         self.assertEqual(applied.matched_rules, ("ocr",))
         self.assertEqual(original["min_p"], 0.1)
+
+    def test_generation_policy_reserves_context_for_prompt_tokens(self):
+        policy = {
+            "task_overrides": {"max_tokens": 8192},
+            "_resolved_max_context_tokens": 8192,
+            "context_reserve_tokens": 4096,
+        }
+
+        applied = apply_generation_policy(
+            "/v1/chat/completions",
+            {"model": "mineru", "max_tokens": 8192},
+            policy,
+        )
+
+        self.assertEqual(applied.body["max_tokens"], 4096)
+        self.assertEqual(applied.changed_parameters["max_tokens"], 4096)
+
+    def test_proxy_config_discovers_remote_model_context_length(self):
+        config = load_config(Path(__file__).parents[1] / "workflow.example.json")
+        response = mock.Mock()
+        response.json.return_value = {
+            "data": [
+                {"id": "larger", "max_model_len": 32768},
+                {"id": "mineru", "max_model_len": 8192},
+            ]
+        }
+
+        with mock.patch("httpx.get", return_value=response) as get_models:
+            resolved = resolve_upstream_max_model_len(config)
+            prepared = prepare_parameter_proxy_config(config)
+
+        self.assertEqual(resolved, 8192)
+        self.assertEqual(
+            prepared["vllm"]["generation"]["_resolved_max_context_tokens"],
+            8192,
+        )
+        self.assertEqual(get_models.call_count, 2)
 
     def test_prompt_extraction_excludes_data_uri_images(self):
         body = {

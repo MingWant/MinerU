@@ -132,3 +132,34 @@ def test_span_bbox_renderer_finds_cells_in_finalized_para_blocks(monkeypatch, tm
 
     assert rendered_table_cells == [[50, 60, 100, 100]]
     assert rendered_content_spans == [[55, 68, 88, 84]]
+
+
+def test_unreliable_overlapping_cell_geometry_is_hidden_but_content_remains():
+    span = {
+        "table_cells": [
+            {
+                "bbox": [10 + index, 10, 100 + index, 100],
+                "content_bbox": [20 + index, 20, 50 + index, 40],
+            }
+            for index in range(4)
+        ]
+    }
+
+    cell_boxes, content_boxes = draw_bbox_module._table_cell_render_bboxes(span)
+
+    assert cell_boxes == []
+    assert len(content_boxes) == 4
+
+
+def test_reliable_non_overlapping_cell_geometry_is_retained():
+    span = {
+        "table_cells": [
+            {"bbox": [10, 10, 100, 50], "content_bbox": [20, 20, 80, 40]},
+            {"bbox": [100, 10, 190, 50], "content_bbox": [110, 20, 180, 40]},
+        ]
+    }
+
+    cell_boxes, content_boxes = draw_bbox_module._table_cell_render_bboxes(span)
+
+    assert cell_boxes == [[10, 10, 100, 50], [100, 10, 190, 50]]
+    assert content_boxes == [[20, 20, 80, 40], [110, 20, 180, 40]]
