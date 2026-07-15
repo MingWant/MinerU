@@ -342,6 +342,16 @@ class FusionTests(unittest.TestCase):
             {
                 "bbox": [10, 30, 90, 60],
                 "text": "100B",
+                "content_bbox": [18, 38, 72, 52],
+                "confidence": 0.99,
+                "content_spans": [
+                    {
+                        "bbox": [18, 38, 72, 52],
+                        "polygon": [18, 38, 72, 38, 72, 52, 18, 52],
+                        "text": "100B",
+                        "score": 0.99,
+                    }
+                ],
                 "row_start": 1,
                 "row_end": 1,
                 "col_start": 0,
@@ -375,6 +385,10 @@ class FusionTests(unittest.TestCase):
         self.assertEqual(seen[0][0].cell_bbox, (10.0, 30.0, 90.0, 60.0))
         self.assertEqual(len(seen[0][0].row_cells), 2)
         self.assertEqual(len(seen[0][0].column_cells), 2)
+        fused_cells = span["table_cells"]
+        self.assertEqual(fused_cells[2]["text"], "100B")
+        self.assertEqual(fused_cells[2]["content_bbox"], [18, 38, 72, 52])
+        self.assertEqual(fused_cells[2]["content_spans"][0]["score"], 0.99)
         self.assertEqual(report["counts"]["table_cell_visual_pipeline_replacements"], 1)
         self.assertEqual(report["counts"]["table_cell_consensus"], 3)
 
@@ -473,11 +487,10 @@ class FusionTests(unittest.TestCase):
                 payload = json.loads(self.rfile.read(length))
                 self.server.received.append(payload)
                 prompt = payload["messages"][0]["content"][0]["text"]
-                result = (
-                    '{"source":"pipeline"}'
-                    if "source is exactly" in prompt
-                    else '{"text":"invoice 100B"}'
-                )
+                if '"hybrid" or "ocr"' in prompt:
+                    result = '{"source":"ocr"}'
+                else:
+                    result = '{"source":"pipeline"}'
                 body = json.dumps(
                     {
                         "choices": [
@@ -556,7 +569,7 @@ class FusionTests(unittest.TestCase):
                     "100B",
                 )
 
-            self.assertEqual(result, "invoice 100B")
+            self.assertEqual(result, "ocr")
             self.assertEqual(selected, "pipeline")
             self.assertEqual(selected_cell, "pipeline")
             self.assertEqual(server.received[0]["model"], "vision-model")
@@ -618,6 +631,86 @@ class FusionTests(unittest.TestCase):
         span = fused["pdf_info"][0]["preproc_blocks"][0]["lines"][0]["spans"][0]
         self.assertEqual(span["content"], "invoice 100B")
         self.assertEqual(report["counts"]["verified_replacements"], 1)
+
+    def test_source_only_visual_verifier_uses_exact_candidate(self):
+        hybrid = middle("invoice 1008")
+        ocr = middle("invoice 100B", 0.98)
+
+        fused, report = fuse_middle_json(
+            hybrid,
+            ocr,
+            FusionSettings(consensus_similarity=0.99),
+            verifier=lambda *_args: "ocr",
+        )
+
+        span = fused["pdf_info"][0]["preproc_blocks"][0]["lines"][0]["spans"][0]
+        self.assertEqual(span["content"], "invoice 100B")
+        self.assertEqual(report["decisions"][0]["reason"], "visual_verifier_ocr")
+
+    def test_high_confidence_unmatched_ocr_is_recovered_in_anchor_order(self):
+        hybrid = middle("First", bbox=(10, 10, 190, 30))
+        hybrid_block = hybrid["pdf_info"][0]["preproc_blocks"][0]
+        hybrid_block["index"] = 10
+        second = middle("Third", bbox=(10, 70, 190, 90))["pdf_info"][0][
+            "preproc_blocks"
+        ][0]
+        second["index"] = 30
+        hybrid["pdf_info"][0]["preproc_blocks"].append(second)
+
+        ocr = middle("First", 0.99, bbox=(10, 10, 190, 30))
+        missing = middle("Second", 0.97, bbox=(10, 40, 190, 60))["pdf_info"][0][
+            "preproc_blocks"
+        ][0]
+        third = middle("Third", 0.99, bbox=(10, 70, 190, 90))["pdf_info"][0][
+            "preproc_blocks"
+        ][0]
+        ocr["pdf_info"][0]["preproc_blocks"].extend([missing, third])
+
+        fused, report = fuse_middle_json(hybrid, ocr, FusionSettings())
+
+        blocks = fused["pdf_info"][0]["preproc_blocks"]
+        texts = [block["lines"][0]["spans"][0]["content"] for block in blocks]
+        self.assertEqual(texts, ["First", "Second", "Third"])
+        self.assertEqual(blocks[1]["fusion_source"], "ocr_recovered")
+        self.assertEqual(blocks[1]["index"], 20)
+        self.assertEqual(report["counts"]["missing_ocr_blocks_recovered"], 1)
+
+    def test_missing_ocr_recovery_rejects_low_confidence_and_honors_budget(self):
+        hybrid = middle("Anchor", bbox=(10, 10, 190, 30))
+        ocr = middle("Anchor", 0.99, bbox=(10, 10, 190, 30))
+        for text, score, bbox in (
+            ("Low", 0.89, (10, 40, 190, 55)),
+            ("Keep", 0.99, (10, 60, 190, 75)),
+            ("Over budget", 0.99, (10, 80, 190, 95)),
+        ):
+            block = middle(text, score, bbox=bbox)["pdf_info"][0]["preproc_blocks"][0]
+            ocr["pdf_info"][0]["preproc_blocks"].append(block)
+
+        fused, report = fuse_middle_json(
+            hybrid,
+            ocr,
+            FusionSettings(max_missing_ocr_blocks_per_document=1),
+        )
+
+        contents = [
+            block["lines"][0]["spans"][0]["content"]
+            for block in fused["pdf_info"][0]["preproc_blocks"]
+        ]
+        self.assertEqual(contents, ["Anchor", "Keep"])
+        self.assertEqual(report["counts"]["missing_ocr_candidates"], 2)
+        self.assertEqual(report["counts"]["missing_ocr_blocks_recovered"], 1)
+
+    def test_missing_ocr_inside_table_is_not_recovered_as_paragraph(self):
+        hybrid = structured_middle(
+            "table",
+            html="<table><tr><td>Value</td></tr></table>",
+        )
+        ocr = middle("Value", 0.99, bbox=(20, 20, 180, 60))
+
+        fused, report = fuse_middle_json(hybrid, ocr, FusionSettings())
+
+        self.assertEqual(len(fused["pdf_info"][0]["preproc_blocks"]), 1)
+        self.assertEqual(report["counts"]["missing_ocr_candidates"], 0)
 
     def test_unrelated_verifier_output_is_rejected(self):
         hybrid = middle("invoice 1008")

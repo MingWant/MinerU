@@ -147,6 +147,7 @@ def draw_layout_bbox(pdf_info, pdf_bytes, out_path, filename):
     dropped_bbox_list = []
     tables_body_list, tables_caption_list, tables_footnote_list = [], [], []
     table_cells_list = []
+    table_content_list = []
     imgs_body_list, imgs_caption_list, imgs_footnote_list = [], [], []
     codes_body_list, codes_caption_list, codes_footnote_list = [], [], []
     titles_list = []
@@ -160,6 +161,7 @@ def draw_layout_bbox(pdf_info, pdf_bytes, out_path, filename):
         page_dropped_list = []
         tables_body, tables_caption, tables_footnote = [], [], []
         table_cells = []
+        table_content = []
         imgs_body, imgs_caption, imgs_footnote = [], [], []
         codes_body, codes_caption, codes_footnote = [], [], []
         titles = []
@@ -186,6 +188,21 @@ def draw_layout_bbox(pdf_info, pdf_bytes, out_path, filename):
                                         cell["bbox"]
                                         for cell in span.get("table_cells", [])
                                         if cell.get("bbox")
+                                    )
+                                    table_content.extend(
+                                        content_bbox
+                                        for cell in span.get("table_cells", [])
+                                        for content_bbox in (
+                                            [
+                                                content_span["bbox"]
+                                                for content_span in cell.get(
+                                                    "content_spans", []
+                                                )
+                                                if content_span.get("bbox")
+                                            ]
+                                            or [cell.get("content_bbox")]
+                                        )
+                                        if content_bbox
                                     )
                     elif nested_block["type"] == BlockType.TABLE_CAPTION:
                         tables_caption.append(bbox)
@@ -240,6 +257,7 @@ def draw_layout_bbox(pdf_info, pdf_bytes, out_path, filename):
 
         tables_body_list.append(tables_body)
         table_cells_list.append(table_cells)
+        table_content_list.append(table_content)
         tables_caption_list.append(tables_caption)
         tables_footnote_list.append(tables_footnote)
         imgs_body_list.append(imgs_body)
@@ -291,6 +309,7 @@ def draw_layout_bbox(pdf_info, pdf_bytes, out_path, filename):
         c = draw_bbox_without_number(i, dropped_bbox_list, page, c, [158, 158, 158], True)
         c = draw_bbox_without_number(i, tables_body_list, page, c, [204, 204, 0], True)
         c = draw_bbox_without_number(i, table_cells_list, page, c, [255, 128, 0], False)
+        c = draw_bbox_without_number(i, table_content_list, page, c, [0, 180, 255], False)
         c = draw_bbox_without_number(i, tables_caption_list, page, c, [255, 255, 102], True)
         c = draw_bbox_without_number(i, tables_footnote_list, page, c, [229, 255, 204], True)
         c = draw_bbox_without_number(i, imgs_body_list, page, c, [153, 255, 51], True)
@@ -333,6 +352,7 @@ def draw_span_bbox(pdf_info, pdf_bytes, out_path, filename):
     image_list = []
     table_list = []
     table_cell_list = []
+    table_content_list = []
     dropped_list = []
 
     def get_span_info(span):
@@ -351,6 +371,19 @@ def draw_span_bbox(pdf_info, pdf_bytes, out_path, filename):
                 for cell in span.get('table_cells', [])
                 if cell.get('bbox')
             )
+            page_table_content_list.extend(
+                content_bbox
+                for cell in span.get('table_cells', [])
+                for content_bbox in (
+                    [
+                        content_span['bbox']
+                        for content_span in cell.get('content_spans', [])
+                        if content_span.get('bbox')
+                    ]
+                    or [cell.get('content_bbox')]
+                )
+                if content_bbox
+            )
 
     for page in pdf_info:
         page_text_list = []
@@ -359,6 +392,7 @@ def draw_span_bbox(pdf_info, pdf_bytes, out_path, filename):
         page_image_list = []
         page_table_list = []
         page_table_cell_list = []
+        page_table_content_list = []
         page_dropped_list = []
 
 
@@ -386,6 +420,7 @@ def draw_span_bbox(pdf_info, pdf_bytes, out_path, filename):
         image_list.append(page_image_list)
         table_list.append(page_table_list)
         table_cell_list.append(page_table_cell_list)
+        table_content_list.append(page_table_content_list)
 
     pdf_bytes_io = BytesIO(pdf_bytes)
     pdf_docs = PdfReader(pdf_bytes_io)
@@ -407,6 +442,7 @@ def draw_span_bbox(pdf_info, pdf_bytes, out_path, filename):
         draw_bbox_without_number(i, image_list, page, c, [255, 204, 0], False)
         draw_bbox_without_number(i, table_list, page, c, [204, 0, 255], False)
         draw_bbox_without_number(i, table_cell_list, page, c, [255, 128, 0], False)
+        draw_bbox_without_number(i, table_content_list, page, c, [0, 180, 255], False)
         draw_bbox_without_number(i, dropped_list, page, c, [158, 158, 158], False)
 
         c.save()

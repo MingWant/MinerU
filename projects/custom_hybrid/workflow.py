@@ -49,6 +49,18 @@ FORWARDED_RESPONSE_HEADERS = {
     "x-request-id",
 }
 IGNORED_REQUEST_HEADERS = {"content-length", "host"}
+AUDITED_GENERATION_PARAMETERS = {
+    "temperature",
+    "top_p",
+    "top_k",
+    "presence_penalty",
+    "frequency_penalty",
+    "repetition_penalty",
+    "max_tokens",
+    "max_completion_tokens",
+    "seed",
+    "vllm_xargs",
+}
 
 
 class WorkflowConfigError(ValueError):
@@ -171,6 +183,7 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         "table_cell_consensus_similarity": (0.0, 1.0),
         "table_cell_min_ocr_confidence": (0.0, 1.0),
         "table_cell_metadata_text_similarity": (0.0, 1.0),
+        "missing_ocr_min_confidence": (0.0, 1.0),
     }
     for key, (minimum, maximum) in bounded_values.items():
         value = fusion_config.get(key)
@@ -198,6 +211,7 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         "table_cell_empty_fallback_enabled",
         "table_cell_suspicious_fallback_enabled",
         "table_cell_allow_unscored_ocr",
+        "recover_missing_ocr_blocks",
     ):
         value = fusion_config.get(key, True)
         if not isinstance(value, bool):
@@ -210,6 +224,7 @@ def _validate_fusion_config(fusion_config: Any) -> None:
     for key, default in (
         ("max_table_cells_per_table", 500),
         ("max_table_cell_verifications_per_document", 80),
+        ("max_missing_ocr_blocks_per_document", 200),
     ):
         value = fusion_config.get(key, default)
         minimum = 1 if key == "max_table_cells_per_table" else 0
@@ -566,6 +581,11 @@ class ParameterProxyASGI:
             "latency_ms": round((time.perf_counter() - started) * 1000, 2),
             "matched_rules": applied.matched_rules,
             "changed_parameters": applied.changed_parameters,
+            "effective_generation_parameters": {
+                key: applied.body[key]
+                for key in sorted(AUDITED_GENERATION_PARAMETERS)
+                if key in applied.body
+            },
             "prompt_chars": len(prompt_text),
             "prompt_sha256": hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
             if prompt_text

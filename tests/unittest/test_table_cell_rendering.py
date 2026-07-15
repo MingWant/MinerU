@@ -16,10 +16,13 @@ def _blank_pdf_bytes(width=200, height=200):
 
 def test_span_bbox_renderer_uses_page_level_table_cell_bboxes(monkeypatch, tmp_path):
     rendered_table_cells = []
+    rendered_content_spans = []
 
     def record_bbox(i, bbox_list, page, pdf_canvas, rgb_config, fill_config):
         if rgb_config == [255, 128, 0]:
             rendered_table_cells.extend(bbox_list[i])
+        elif rgb_config == [0, 180, 255]:
+            rendered_content_spans.extend(bbox_list[i])
         return pdf_canvas
 
     monkeypatch.setattr(draw_bbox_module, "draw_bbox_without_number", record_bbox)
@@ -42,10 +45,14 @@ def test_span_bbox_renderer_uses_page_level_table_cell_bboxes(monkeypatch, tmp_p
                                             "table_cells": [
                                                 {
                                                     "bbox": [50, 60, 100, 100],
+                                                    "content_bbox": [55, 68, 88, 84],
                                                     "text": "Key",
                                                 },
                                                 {
                                                     "bbox": [100, 60, 150, 100],
+                                                    "content_spans": [
+                                                        {"bbox": [108, 68, 142, 84]}
+                                                    ],
                                                     "text": "Value",
                                                 },
                                             ],
@@ -70,4 +77,8 @@ def test_span_bbox_renderer_uses_page_level_table_cell_bboxes(monkeypatch, tmp_p
     assert rendered_table_cells == [
         [50, 60, 100, 100],
         [100, 60, 150, 100],
+    ]
+    assert rendered_content_spans == [
+        [55, 68, 88, 84],
+        [108, 68, 142, 84],
     ]

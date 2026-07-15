@@ -1,5 +1,6 @@
 # Copyright (c) Opendatalab. All rights reserved.
 import math
+from html import unescape
 from typing import Any
 
 import numpy as np
@@ -104,6 +105,42 @@ def table_cell_bbox_to_page(
     return page_bbox
 
 
+def table_bbox_to_page_polygon(
+    bbox: Any,
+    crop_bbox: list[int] | tuple[int, int, int, int],
+    rotation_label: str | int = "0",
+) -> list[int] | None:
+    """Convert a crop-relative rectangle/quad to a flattened page polygon."""
+    if not crop_bbox or len(crop_bbox) != 4:
+        return None
+    crop_x0, crop_y0, crop_x1, crop_y1 = [float(value) for value in crop_bbox]
+    crop_width = crop_x1 - crop_x0
+    crop_height = crop_y1 - crop_y0
+    if crop_width <= 0 or crop_height <= 0:
+        return None
+    points = _bbox_points(bbox)
+    if not points:
+        return None
+    polygon = []
+    for x, y in points:
+        source_x, source_y = _inverse_rotate_point(
+            x,
+            y,
+            str(rotation_label or "0"),
+            crop_width,
+            crop_height,
+        )
+        source_x = min(max(source_x, 0.0), crop_width)
+        source_y = min(max(source_y, 0.0), crop_height)
+        polygon.extend(
+            [
+                int(round(crop_x0 + source_x)),
+                int(round(crop_y0 + source_y)),
+            ]
+        )
+    return polygon
+
+
 def _normalize_logic_point(logic_point: Any) -> list[int] | None:
     try:
         values = np.asarray(logic_point, dtype=np.int64).reshape(-1)
@@ -120,6 +157,8 @@ def build_table_cells(
     html_code: str,
     crop_bbox: list[int] | tuple[int, int, int, int],
     rotation_label: str | int = "0",
+    ocr_result: Any = None,
+    ocr_crop_bbox: list[int] | tuple[int, int, int, int] | None = None,
 ) -> list[dict]:
     """Build JSON-serializable table cells with page-image bboxes and structure."""
     if cell_bboxes is None:
@@ -193,4 +232,103 @@ def build_table_cells(
 
         table_cells.append(cell)
 
+    _attach_ocr_content_spans(
+        table_cells,
+        ocr_result,
+        ocr_crop_bbox or crop_bbox,
+        rotation_label,
+    )
+
     return table_cells
+
+
+def _bbox_intersection_area(left: list[int], right: list[int]) -> float:
+    width = max(0.0, min(left[2], right[2]) - max(left[0], right[0]))
+    height = max(0.0, min(left[3], right[3]) - max(left[1], right[1]))
+    return width * height
+
+
+def _best_cell_index(table_cells: list[dict], bbox: list[int]) -> int | None:
+    center_x = (bbox[0] + bbox[2]) / 2.0
+    center_y = (bbox[1] + bbox[3]) / 2.0
+    candidates = []
+    for index, cell in enumerate(table_cells):
+        cell_bbox = cell.get("bbox")
+        if not isinstance(cell_bbox, list) or len(cell_bbox) != 4:
+            continue
+        contains_center = (
+            cell_bbox[0] <= center_x <= cell_bbox[2]
+            and cell_bbox[1] <= center_y <= cell_bbox[3]
+        )
+        intersection = _bbox_intersection_area(cell_bbox, bbox)
+        if not contains_center and intersection <= 0:
+            continue
+        cell_area = max(
+            (cell_bbox[2] - cell_bbox[0]) * (cell_bbox[3] - cell_bbox[1]),
+            1,
+        )
+        candidates.append((int(contains_center), intersection, -cell_area, index))
+    return max(candidates)[-1] if candidates else None
+
+
+def _attach_ocr_content_spans(
+    table_cells: list[dict],
+    ocr_result: Any,
+    crop_bbox: list[int] | tuple[int, int, int, int],
+    rotation_label: str | int,
+) -> None:
+    if not table_cells or not isinstance(ocr_result, list):
+        return
+    for raw_item in ocr_result:
+        if not isinstance(raw_item, (list, tuple)) or len(raw_item) < 2:
+            continue
+        raw_bbox = raw_item[0]
+        bbox = table_cell_bbox_to_page(
+            raw_bbox,
+            crop_bbox,
+            rotation_label=rotation_label,
+        )
+        if bbox is None:
+            continue
+        cell_index = _best_cell_index(table_cells, bbox)
+        if cell_index is None:
+            continue
+        raw_text = raw_item[1]
+        text = unescape(raw_text) if isinstance(raw_text, str) else ""
+        span = {
+            "bbox": bbox,
+            "text": text,
+        }
+        polygon = table_bbox_to_page_polygon(
+            raw_bbox,
+            crop_bbox,
+            rotation_label=rotation_label,
+        )
+        if polygon is not None:
+            span["polygon"] = polygon
+        score = raw_item[2] if len(raw_item) >= 3 else None
+        if isinstance(score, (int, float)) and math.isfinite(float(score)):
+            span["score"] = max(0.0, min(1.0, float(score)))
+        table_cells[cell_index].setdefault("content_spans", []).append(span)
+
+    for cell in table_cells:
+        spans = cell.get("content_spans", [])
+        if not spans:
+            continue
+        cell["content_bbox"] = [
+            min(span["bbox"][0] for span in spans),
+            min(span["bbox"][1] for span in spans),
+            max(span["bbox"][2] for span in spans),
+            max(span["bbox"][3] for span in spans),
+        ]
+        scored = [
+            (span["score"], max(len(span.get("text", "").strip()), 1))
+            for span in spans
+            if isinstance(span.get("score"), (int, float))
+        ]
+        if scored:
+            cell["confidence"] = round(
+                sum(score * weight for score, weight in scored)
+                / sum(weight for _, weight in scored),
+                6,
+            )

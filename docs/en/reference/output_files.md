@@ -327,7 +327,7 @@ Text levels are distinguished through the `text_level` field:
 - `list` entries may use `sub_type` to distinguish ordinary lists from reference-style lists.
 - `image` / `chart` entries may include an optional `sub_type` field to carry the visual subtype through downstream outputs.
 - Seal content is represented as an `image` entry with `sub_type: "seal"`.
-- Pipeline `table` entries may include `table_cells`. Each cell contains a 0-1000 mapped `bbox`, `text`, `row_start`, `row_end`, `col_start`, `col_end`, and an optional `is_header` flag.
+- Pipeline `table` entries may include `table_cells`. Each cell contains a 0-1000 mapped `bbox`, `text`, `row_start`, `row_end`, `col_start`, `col_end`, and an optional `is_header` flag. When table OCR is available, a cell may also include `content_bbox`, weighted `confidence`, and `content_spans`; each content span contains its own `bbox`, optional quadrilateral `polygon`, `text`, and OCR `score`.
 
 ##### Sample Data
 
@@ -416,7 +416,7 @@ Text levels are distinguished through the `text_level` field:
 | `anchor` | `string` | Optional anchor; some `DOCX` titles or index items may include it |
 
 `image` / `chart` items may also include an optional top-level `sub_type` field for visual subtype propagation.
-Pipeline table content may include `table_cells` with the same fields as the legacy content list, stored under `content.table_cells`.
+Pipeline table content may include `table_cells` with the same Cell and OCR content geometry fields as the legacy content list, stored under `content.table_cells`.
 
 ##### Common Types
 

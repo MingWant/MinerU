@@ -23,6 +23,25 @@ def _table_para_block():
                                 "table_cells": [
                                     {
                                         "bbox": [120, 220, 220, 260],
+                                        "content_bbox": [130, 230, 210, 250],
+                                        "confidence": 0.97,
+                                        "content_spans": [
+                                            {
+                                                "bbox": [130, 230, 210, 250],
+                                                "polygon": [
+                                                    130,
+                                                    230,
+                                                    210,
+                                                    230,
+                                                    210,
+                                                    250,
+                                                    130,
+                                                    250,
+                                                ],
+                                                "text": "Value",
+                                                "score": 0.97,
+                                            }
+                                        ],
                                         "text": "Value",
                                         "row_start": 0,
                                         "row_end": 0,
@@ -56,6 +75,16 @@ def test_content_lists_include_normalized_table_cell_bboxes():
 
     expected_cell = {
         "bbox": [300, 275, 550, 325],
+        "content_bbox": [325, 287, 525, 312],
+        "confidence": 0.97,
+        "content_spans": [
+            {
+                "bbox": [325, 287, 525, 312],
+                "polygon": [325, 287, 525, 287, 525, 312, 325, 312],
+                "text": "Value",
+                "score": 0.97,
+            }
+        ],
         "text": "Value",
         "row_start": 0,
         "row_end": 0,
@@ -74,7 +103,26 @@ def test_magic_model_scales_table_cells_with_the_table_block():
             {
                 "bbox": [100, 200, 300, 400],
                 "table_cells": [
-                    {"bbox": [120, 220, 220, 260], "text": "Value"}
+                    {
+                        "bbox": [120, 220, 220, 260],
+                        "content_bbox": [130, 230, 210, 250],
+                        "content_spans": [
+                            {
+                                "bbox": [130, 230, 210, 250],
+                                "polygon": [
+                                    130,
+                                    230,
+                                    210,
+                                    230,
+                                    210,
+                                    250,
+                                    130,
+                                    250,
+                                ],
+                            }
+                        ],
+                        "text": "Value",
+                    }
                 ],
             }
         ]
@@ -85,3 +133,20 @@ def test_magic_model_scales_table_cells_with_the_table_block():
     layout_det = magic_model._MagicModel__page_model_info["layout_dets"][0]
     assert layout_det["bbox"] == [50, 100, 150, 200]
     assert layout_det["table_cells"][0]["bbox"] == [60, 110, 110, 130]
+    assert layout_det["table_cells"][0]["content_bbox"] == [65, 115, 105, 125]
+    assert layout_det["table_cells"][0]["content_spans"][0]["bbox"] == [
+        65,
+        115,
+        105,
+        125,
+    ]
+    assert layout_det["table_cells"][0]["content_spans"][0]["polygon"] == [
+        65,
+        115,
+        105,
+        115,
+        105,
+        125,
+        65,
+        125,
+    ]

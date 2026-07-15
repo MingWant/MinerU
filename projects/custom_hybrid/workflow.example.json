@@ -20,14 +20,19 @@
     },
     "generation": {
       "defaults": {
-        "max_tokens": 16384
+        "max_tokens": 4096
       },
       "overrides": {
         "temperature": 0.0,
         "top_p": 1.0,
         "seed": 42
       },
-      "remove": [],
+      "remove": [
+        "top_k",
+        "presence_penalty",
+        "frequency_penalty",
+        "vllm_xargs"
+      ],
       "rules": [
         {
           "name": "deterministic-ocr",
@@ -76,6 +81,9 @@
     "table_cell_metadata_text_similarity": 0.8,
     "max_table_cells_per_table": 500,
     "max_table_cell_verifications_per_document": 80,
+    "recover_missing_ocr_blocks": true,
+    "missing_ocr_min_confidence": 0.9,
+    "max_missing_ocr_blocks_per_document": 200,
     "verifier": {
       "enabled": true,
       "base_url": null,

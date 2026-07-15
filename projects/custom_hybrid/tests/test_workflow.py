@@ -77,6 +77,10 @@ class WorkflowTests(unittest.TestCase):
                 request_payload = {
                     "model": "mineru",
                     "temperature": 0.7,
+                    "top_k": 1,
+                    "presence_penalty": 0.4,
+                    "frequency_penalty": 0.2,
+                    "vllm_xargs": {"bad_words": ["stale"]},
                     "messages": [
                         {
                             "role": "user",
@@ -107,10 +111,23 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(forwarded["temperature"], 0.0)
             self.assertEqual(forwarded["top_p"], 1.0)
             self.assertEqual(forwarded["seed"], 42)
-            self.assertEqual(forwarded["max_tokens"], 16384)
+            self.assertEqual(forwarded["max_tokens"], 4096)
+            self.assertNotIn("top_k", forwarded)
+            self.assertNotIn("presence_penalty", forwarded)
+            self.assertNotIn("frequency_penalty", forwarded)
+            self.assertNotIn("vllm_xargs", forwarded)
             self.assertEqual(response.json()["received"], forwarded)
             self.assertIn("deterministic-ocr", audit["matched_rules"])
             self.assertEqual(audit["changed_parameters"]["temperature"], 0.0)
+            self.assertEqual(
+                audit["effective_generation_parameters"],
+                {
+                    "max_tokens": 4096,
+                    "seed": 42,
+                    "temperature": 0.0,
+                    "top_p": 1.0,
+                },
+            )
             self.assertIn("Extract text exactly", audit["prompt_preview"])
             self.assertNotIn("SECRET_IMAGE", audit["prompt_preview"])
         finally:

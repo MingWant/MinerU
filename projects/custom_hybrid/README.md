@@ -41,11 +41,17 @@ Copy `workflow.example.json` and edit the copy. Important sections:
 - `vllm.server_args`: arguments accepted by `mineru-vllm-server`/vLLM;
 - `vllm.generation.defaults`: values added only when MinerU did not send one;
 - `vllm.generation.overrides`: values that always replace MinerU's request;
+- `vllm.generation.remove`: MinerU/model defaults removed before forwarding;
 - `vllm.generation.rules`: prompt/path/model regex-specific overrides;
 - `mineru`: the OCR and Hybrid strategy used for extraction.
 
 `generation_config` is set to `vllm` in the example so the model repository's
 generation config does not silently replace the workflow's sampling baseline.
+The example also removes MinerU's stale `top_k`, presence/frequency penalties,
+and `vllm_xargs`, while capping generated output at `max_tokens=4096`. For a
+remote server with `max_model_len=8192`, keep prompt tokens plus `max_tokens`
+within 8192. Configure the OpenAI-compatible base URL (for example,
+`http://10.100.0.30:8205`), not its interactive `/docs` page.
 
 Check the local runtime and configured vLLM endpoint before extraction:
 
@@ -80,7 +86,8 @@ two independent parses:
 
 - `output/hybrid`: Hybrid/VLM result with configured generation parameters;
 - `output/ocr`: pipeline backend forced to OCR mode;
-- `output/fused`: Hybrid structure with conservative OCR/VLM text corrections;
+- `output/fused`: Hybrid structure with conservative OCR/VLM corrections and
+  retained Pipeline table Cell/content geometry;
 - `output/fusion_summary.json`: per-document status and replacement counts.
 
 Each fused parse directory also contains `<document>_fusion.json`, which records
@@ -93,8 +100,12 @@ all `data:` URIs; leave it at `0` for normal runs.
 
 Fusion only auto-replaces empty, corrupt, repeated, or abnormally expanded VLM
 text when OCR confidence passes the threshold. Other disagreements are shown as
-page crops to the configured visual verifier. Verifier output must remain similar
-to at least one candidate or it is rejected. Equations and table bodies are not
+page crops to the configured visual verifier. The built-in verifier can only
+select the exact `hybrid` or `ocr` candidate; it cannot transcribe a third value.
+High-confidence OCR lines that have no Hybrid target can be inserted as recovered
+text blocks, but lines inside tables/images/charts/formulas are excluded. Control
+this with `recover_missing_ocr_blocks`, `missing_ocr_min_confidence`, and
+`max_missing_ocr_blocks_per_document`. Equations and table bodies are not
 rewritten by the text correction pass. Empty formulas still use the matched
 Pipeline formula; conflicting non-empty formulas use conservative visual
 candidate selection.
@@ -108,9 +119,10 @@ Tables use a global-structure/local-content/global-validation pipeline:
    `colspan`. Hybrid remains the structural backbone.
 3. Enable cell fusion only when row/column dimensions and every logical cell
    range match exactly. A mismatch falls back to whole-table selection.
-4. Use Pipeline `table_cells` metadata for exact page-level cell bboxes. Metadata
-   text must agree with the corresponding Pipeline HTML cell before its bbox or
-   confidence is trusted.
+4. Use Pipeline `table_cells` metadata for exact page-level cell bboxes. Each
+   Cell can additionally contain `content_bbox`, OCR `content_spans` with bbox and
+   polygon, and a weighted OCR `confidence`. Metadata text must agree with the
+   corresponding Pipeline HTML cell before its geometry or confidence is trusted.
 5. Keep consensus cells, fill empty Hybrid cells, and replace suspicious Hybrid
    cells only when Pipeline supplies sufficient OCR confidence (or the explicit
    `table_cell_allow_unscored_ocr` opt-in is enabled).
@@ -122,11 +134,11 @@ Tables use a global-structure/local-content/global-validation pipeline:
    HTML, invalid reconstruction, verifier errors, missing bboxes, and request
    limits all keep Hybrid.
 
-Pipeline currently supplies reliable cell geometry but may omit per-cell OCR
-confidence. With the safe default `table_cell_allow_unscored_ocr=false`, such
-conflicts go to visual verification instead of being auto-replaced. Use a verifier
-that follows JSON instructions reliably; the MinerU-specialized extraction model
-may be weaker at this arbitration task.
+The fused table copies Pipeline Cell geometry into the final Hybrid table and
+synchronizes every Cell's `text` with the final fused HTML. Bounding-box PDFs draw
+Cell boundaries in orange and OCR content-tight boxes in cyan. If OCR confidence
+is absent, the safe default `table_cell_allow_unscored_ocr=false` sends conflicts
+to visual verification instead of auto-replacing them.
 
 Important table controls:
 

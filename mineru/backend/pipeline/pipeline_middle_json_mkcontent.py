@@ -562,6 +562,32 @@ def _get_table_cells(para_block, page_size):
                         continue
                     output_cell = dict(table_cell)
                     output_cell['bbox'] = bbox
+                    content_bbox = _build_bbox(
+                        table_cell.get('content_bbox'), page_size
+                    )
+                    if content_bbox is not None:
+                        output_cell['content_bbox'] = content_bbox
+                    output_spans = []
+                    for content_span in table_cell.get('content_spans', []):
+                        span_bbox = _build_bbox(content_span.get('bbox'), page_size)
+                        if span_bbox is None:
+                            continue
+                        output_span = dict(content_span)
+                        output_span['bbox'] = span_bbox
+                        polygon = content_span.get('polygon')
+                        if polygon and len(polygon) >= 8 and page_size:
+                            page_width, page_height = page_size
+                            output_span['polygon'] = [
+                                int(
+                                    value
+                                    * 1000
+                                    / (page_width if index % 2 == 0 else page_height)
+                                )
+                                for index, value in enumerate(polygon)
+                            ]
+                        output_spans.append(output_span)
+                    if output_spans:
+                        output_cell['content_spans'] = output_spans
                     output_cells.append(output_cell)
                 return output_cells
     return []

@@ -308,12 +308,26 @@ class MagicModel:
             ]
             layout_det["bbox"] = bbox
             for table_cell in layout_det.get("table_cells", []):
-                cell_bbox = table_cell.get("bbox")
-                if not cell_bbox or len(cell_bbox) != 4:
-                    continue
-                table_cell["bbox"] = [
-                    int(float(value) / self.__scale) for value in cell_bbox
-                ]
+                for bbox_key in ("bbox", "content_bbox"):
+                    cell_bbox = table_cell.get(bbox_key)
+                    if cell_bbox and len(cell_bbox) == 4:
+                        table_cell[bbox_key] = [
+                            int(float(value) / self.__scale)
+                            for value in cell_bbox
+                        ]
+                for content_span in table_cell.get("content_spans", []):
+                    span_bbox = content_span.get("bbox")
+                    if span_bbox and len(span_bbox) == 4:
+                        content_span["bbox"] = [
+                            int(float(value) / self.__scale)
+                            for value in span_bbox
+                        ]
+                    polygon = content_span.get("polygon")
+                    if polygon and len(polygon) >= 8:
+                        content_span["polygon"] = [
+                            int(float(value) / self.__scale)
+                            for value in polygon
+                        ]
             # 删除高度或者宽度小于等于2的spans
             if bbox[2] - bbox[0] <= 2 or bbox[3] - bbox[1] <= 2:
                 need_remove_list.append(layout_det)

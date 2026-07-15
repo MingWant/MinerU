@@ -327,7 +327,7 @@
 - `list` 类型可通过 `sub_type` 区分普通列表和参考文献列表。
 - `image` / `chart` 类型可包含可选 `sub_type` 字段，用于透传视觉子类型。
 - 印章内容通过 `sub_type: "seal"` 的 `image` 类型表示。
-- Pipeline 后端的 `table` 类型可包含 `table_cells`。每个单元格包含映射到 0-1000 范围的 `bbox`、`text`、`row_start`、`row_end`、`col_start`、`col_end`，以及可选的 `is_header`。
+- Pipeline 后端的 `table` 类型可包含 `table_cells`。每个单元格包含映射到 0-1000 范围的 `bbox`、`text`、`row_start`、`row_end`、`col_start`、`col_end`，以及可选的 `is_header`。当表格 OCR 可用时，还可包含 `content_bbox`、加权 `confidence` 和 `content_spans`；每个内容片段包含独立的 `bbox`、可选四边形 `polygon`、`text` 与 OCR `score`。
 
 ##### 示例数据
 
@@ -416,7 +416,7 @@
 | `anchor` | `string` | 可选，部分 `DOCX` 标题或索引项会携带锚点 |
 
 其中 `image` / `chart` 类型还可能包含可选顶层字段 `sub_type`，用于表示视觉子类型。
-Pipeline 后端的表格内容可包含 `table_cells`，字段结构与旧版内容列表一致，并位于 `content.table_cells`。
+Pipeline 后端的表格内容可包含 `table_cells`，Cell 与 OCR 内容几何字段和旧版内容列表一致，并位于 `content.table_cells`。
 
 ##### 常见类型
 

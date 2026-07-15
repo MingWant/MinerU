@@ -734,6 +734,8 @@ class BatchAnalyze:
                     html_code,
                     crop_bbox,
                     rotation_label=table_res_dict.get("rotate_label", "0"),
+                    ocr_result=table_res_dict.get("ocr_result"),
+                    ocr_crop_bbox=table_res_dict.get("wireless_crop_bbox"),
                 )
                 if table_cells:
                     table_res_dict["table_res"]["table_cells"] = table_cells
