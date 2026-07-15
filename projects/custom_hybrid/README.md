@@ -202,20 +202,41 @@ python projects/custom_hybrid/api.py \
 
 Public binding without a token is rejected unless
 `--allow-unauthenticated-public` is explicitly supplied. Keep the service behind
-a private network, VPN, or authenticated reverse proxy. The server uses the
-generation and upstream settings from `workflow.local.json`; request clients
-cannot override them. Tasks run serially because each extraction owns a local
-parameter-proxy port and local OCR resources.
+a private network, VPN, or authenticated reverse proxy. The server uses
+`workflow.local.json` as its baseline. Each task may safely override `effort`,
+parse method, language, `temperature`, `top_p`, `seed`, `max_tokens`, and
+`repetition_penalty`; the API validates their types and ranges. Task generation
+values are applied after prompt-specific workflow rules, so the submitted values
+are the final values forwarded to vLLM. Upstream URL, credentials, proxy binding,
+fusion thresholds, and arbitrary vLLM arguments remain server-controlled. Tasks
+run serially because each extraction owns a local parameter-proxy port and local
+OCR resources. Completed ZIP files include `task_parameters.json` with the
+effective task-scoped settings and `vllm_requests.jsonl` with per-request
+generation audit data.
 
 Endpoints:
 
 - `GET /health`: service status;
-- `POST /tasks`: upload PDF/images and receive a task id;
+- `POST /tasks`: upload PDF/images plus optional task parameters and receive a task id;
 - `GET /tasks/{task_id}`: poll status;
 - `GET /tasks/{task_id}/result`: download the fused ZIP;
 - `GET /tasks/{task_id}/report`: read `fusion_summary.json`;
 - `DELETE /tasks/{task_id}`: remove a completed/failed task and its files;
 - `POST /file_parse`: wait synchronously and return the fused ZIP.
+
+Example task-level parameter override:
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer $CUSTOM_HYBRID_API_KEY" \
+  -F "files=@invoice.pdf" \
+  -F "effort=medium" \
+  -F "temperature=0.1" \
+  -F "top_p=0.95" \
+  -F "seed=123" \
+  -F "max_tokens=2048" \
+  http://10.100.0.30:6108/tasks
+```
 
 From a Mac, only Python and `httpx` are required. Run the client from this repo:
 
@@ -258,8 +279,21 @@ python projects/custom_hybrid/ui.py \
 ```
 
 Open `http://127.0.0.1:7860`, drag in PDF/images, submit the task, inspect the
-fusion report, and download the fused ZIP. The UI refuses public binding unless
-`--allow-public-bind` is supplied explicitly.
+fusion report, and download the fused ZIP. Extraction Settings and vLLM
+Generation controls are task-scoped; the task details panel echoes the accepted
+parameter snapshot. For PDF inputs, the fused workflow
+generates both `*_layout.pdf` and `*_span.pdf`; after completion the Document
+Preview automatically switches to `*_span.pdf`, where Table Cell boxes are orange
+and OCR content-tight boxes are cyan. Use the Original / Bounding Boxes controls
+to switch views. The UI refuses public binding unless `--allow-public-bind` is
+supplied explicitly.
+
+`span.pdf` generation resolves the source PDF from the uploaded task input first
+and then falls back to the fused `*_origin.pdf` artifact. The preview endpoint
+also regenerates a missing `*_span.pdf` on demand for completed tasks and validates
+that the generated PDF is non-empty with the expected page count. Run `doctor`
+after deployment; `pypdf` and `reportlab` are required for these visualization
+artifacts and are installed by the base project dependencies.
 
 For a Jupyter Server Proxy URL, also export `JUPYTER_TOKEN` and use a remote URL
 such as `http://10.100.0.30:8989/proxy/6108`.

@@ -10,7 +10,7 @@ from typing import Sequence
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
@@ -70,6 +70,55 @@ def create_ui_app(
             )[0],
         )
 
+    async def streamed_task_request(
+        task_id: str,
+        suffix: str,
+        *,
+        default_media_type: str,
+        default_disposition: str,
+    ):
+        client = make_client()
+        try:
+            request = client.build_request(
+                "GET",
+                task_url(task_id, suffix),
+                headers=headers,
+                params=params,
+            )
+            response = await client.send(request, stream=True)
+        except httpx.HTTPError as exc:
+            await client.aclose()
+            return JSONResponse(
+                status_code=502,
+                content={"detail": f"Remote artifact request failed: {exc}"},
+            )
+        if response.is_error:
+            content = await response.aread()
+            media_type = response.headers.get("content-type", "application/json")
+            await response.aclose()
+            await client.aclose()
+            return Response(
+                content=content,
+                status_code=response.status_code,
+                media_type=media_type,
+            )
+
+        async def close_remote() -> None:
+            await response.aclose()
+            await client.aclose()
+
+        return StreamingResponse(
+            response.aiter_bytes(),
+            media_type=response.headers.get("content-type", default_media_type),
+            headers={
+                "Content-Disposition": response.headers.get(
+                    "content-disposition",
+                    default_disposition,
+                )
+            },
+            background=BackgroundTask(close_remote),
+        )
+
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
         return HTMLResponse(UI_HTML_PATH.read_text(encoding="utf-8"))
@@ -79,7 +128,17 @@ def create_ui_app(
         return await buffered_request("GET", f"{remote_base}/health")
 
     @app.post("/api/tasks")
-    async def submit_task(files: list[UploadFile] = File(...)) -> Response:
+    async def submit_task(
+        files: list[UploadFile] = File(...),
+        effort: str | None = Form(default=None),
+        method: str | None = Form(default=None),
+        lang: str | None = Form(default=None),
+        temperature: float | None = Form(default=None),
+        top_p: float | None = Form(default=None),
+        seed: int | None = Form(default=None),
+        max_tokens: int | None = Form(default=None),
+        repetition_penalty: float | None = Form(default=None),
+    ) -> Response:
         if not files:
             raise HTTPException(status_code=400, detail="Select at least one file")
         payload = [
@@ -93,11 +152,26 @@ def create_ui_app(
             )
             for upload in files
         ]
+        task_parameters = {
+            key: value
+            for key, value in {
+                "effort": effort,
+                "method": method,
+                "lang": lang,
+                "temperature": temperature,
+                "top_p": top_p,
+                "seed": seed,
+                "max_tokens": max_tokens,
+                "repetition_penalty": repetition_penalty,
+            }.items()
+            if value is not None
+        }
         try:
             async with make_client() as client:
                 response = await client.post(
                     f"{remote_base}/tasks",
                     files=payload,
+                    data=task_parameters,
                     headers=headers,
                     params=params,
                 )
@@ -131,46 +205,20 @@ def create_ui_app(
 
     @app.get("/api/tasks/{task_id}/result")
     async def get_result(task_id: str):
-        client = make_client()
-        try:
-            request = client.build_request(
-                "GET",
-                task_url(task_id, "/result"),
-                headers=headers,
-                params=params,
-            )
-            response = await client.send(request, stream=True)
-        except httpx.HTTPError as exc:
-            await client.aclose()
-            return JSONResponse(
-                status_code=502,
-                content={"detail": f"Download failed: {exc}"},
-            )
-        if response.is_error:
-            content = await response.aread()
-            media_type = response.headers.get("content-type", "application/json")
-            await response.aclose()
-            await client.aclose()
-            return Response(
-                content=content,
-                status_code=response.status_code,
-                media_type=media_type,
-            )
+        return await streamed_task_request(
+            task_id,
+            "/result",
+            default_media_type="application/zip",
+            default_disposition=f'attachment; filename="{task_id}-fused.zip"',
+        )
 
-        async def close_remote() -> None:
-            await response.aclose()
-            await client.aclose()
-
-        return StreamingResponse(
-            response.aiter_bytes(),
-            media_type=response.headers.get("content-type", "application/zip"),
-            headers={
-                "Content-Disposition": response.headers.get(
-                    "content-disposition",
-                    f'attachment; filename="{task_id}-fused.zip"',
-                )
-            },
-            background=BackgroundTask(close_remote),
+    @app.get("/api/tasks/{task_id}/preview")
+    async def get_preview(task_id: str):
+        return await streamed_task_request(
+            task_id,
+            "/preview",
+            default_media_type="application/pdf",
+            default_disposition=f'inline; filename="{task_id}-span.pdf"',
         )
 
     return app

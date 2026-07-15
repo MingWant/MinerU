@@ -20,14 +20,27 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 import uvicorn
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import FileResponse, JSONResponse
 
 REPOSITORY_ROOT = Path(__file__).parents[2]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from projects.custom_hybrid.workflow import load_config, run_extract
+from projects.custom_hybrid.workflow import (
+    load_config,
+    regenerate_fused_visualizations,
+    run_extract,
+)
 
 
 SUPPORTED_INPUT_SUFFIXES = {
@@ -42,6 +55,11 @@ SUPPORTED_INPUT_SUFFIXES = {
 }
 TERMINAL_STATUSES = {"completed", "failed"}
 Runner = Callable[[Mapping[str, Any], str | Path, str | Path], int]
+GENERATION_PARAMETER_LIMITS = {
+    "temperature": (0.0, 2.0),
+    "top_p": (0.0, 1.0),
+    "repetition_penalty": (0.01, 2.0),
+}
 
 
 def _now() -> str:
@@ -71,6 +89,7 @@ class TaskRecord:
     input_root: Path
     output_root: Path
     archive_path: Path
+    parameters: dict[str, Any] = field(default_factory=dict)
     status: str = "queued"
     created_at: str = field(default_factory=_now)
     started_at: str | None = None
@@ -104,7 +123,12 @@ class CustomHybridTaskManager:
         )
         self._worker.start()
 
-    def create(self, task_id: str, input_names: list[str]) -> TaskRecord:
+    def create(
+        self,
+        task_id: str,
+        input_names: list[str],
+        parameters: Mapping[str, Any] | None = None,
+    ) -> TaskRecord:
         task_root = self.output_root / task_id
         record = TaskRecord(
             task_id=task_id,
@@ -113,6 +137,7 @@ class CustomHybridTaskManager:
             input_root=task_root / "input",
             output_root=task_root / "output",
             archive_path=task_root / "fused-result.zip",
+            parameters=copy.deepcopy(dict(parameters or {})),
         )
         with self._lock:
             self._records[task_id] = record
@@ -183,8 +208,18 @@ class CustomHybridTaskManager:
             record.started_at = _now()
         try:
             config = load_config(self.config_path)
+            _apply_task_parameters(config, record.parameters)
             config["vllm"]["audit_log"] = str(
                 record.output_root / "vllm_requests.jsonl"
+            )
+            record.output_root.mkdir(parents=True, exist_ok=True)
+            (record.output_root / "task_parameters.json").write_text(
+                json.dumps(
+                    _task_parameter_defaults(config),
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
             )
             exit_code = self.runner(config, record.input_root, record.output_root)
             if exit_code:
@@ -203,12 +238,128 @@ class CustomHybridTaskManager:
             event.set()
 
 
+def _normalize_task_parameters(
+    *,
+    effort: str | None = None,
+    method: str | None = None,
+    lang: str | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    seed: int | None = None,
+    max_tokens: int | None = None,
+    repetition_penalty: float | None = None,
+) -> dict[str, Any]:
+    mineru: dict[str, Any] = {}
+    generation: dict[str, Any] = {}
+    if effort is not None:
+        if effort not in {"medium", "high"}:
+            raise HTTPException(status_code=400, detail="effort must be medium or high")
+        mineru["effort"] = effort
+    if method is not None:
+        if method not in {"auto", "txt", "ocr"}:
+            raise HTTPException(status_code=400, detail="method must be auto, txt, or ocr")
+        mineru["method"] = method
+    if lang is not None:
+        normalized_lang = lang.strip()
+        if not normalized_lang or len(normalized_lang) > 32:
+            raise HTTPException(
+                status_code=400,
+                detail="lang must be a non-empty value up to 32 characters",
+            )
+        mineru["lang"] = normalized_lang
+    for name, value in (
+        ("temperature", temperature),
+        ("top_p", top_p),
+        ("repetition_penalty", repetition_penalty),
+    ):
+        if value is None:
+            continue
+        minimum, maximum = GENERATION_PARAMETER_LIMITS[name]
+        outside_range = not minimum <= float(value) <= maximum
+        if name == "top_p" and value <= 0:
+            outside_range = True
+        if outside_range:
+            qualifier = (
+                "greater than 0 and at most 1"
+                if name == "top_p"
+                else f"between {minimum} and {maximum}"
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=f"{name} must be {qualifier}",
+            )
+        generation[name] = float(value)
+    if seed is not None:
+        if not -(2**63) <= seed < 2**63:
+            raise HTTPException(status_code=400, detail="seed must be a signed 64-bit integer")
+        generation["seed"] = seed
+    if max_tokens is not None:
+        if not 1 <= max_tokens <= 131072:
+            raise HTTPException(
+                status_code=400,
+                detail="max_tokens must be between 1 and 131072",
+            )
+        generation["max_tokens"] = max_tokens
+    parameters: dict[str, Any] = {}
+    if mineru:
+        parameters["mineru"] = mineru
+    if generation:
+        parameters["generation"] = generation
+    return parameters
+
+
+def _apply_task_parameters(config: dict[str, Any], parameters: Mapping[str, Any]) -> None:
+    mineru = parameters.get("mineru", {})
+    if isinstance(mineru, Mapping):
+        config["mineru"].update(mineru)
+    generation = parameters.get("generation", {})
+    if isinstance(generation, Mapping):
+        config["vllm"]["generation"]["task_overrides"] = dict(generation)
+
+
+def _task_parameter_defaults(config: Mapping[str, Any]) -> dict[str, Any]:
+    mineru_config = config["mineru"]
+    generation_config = config["vllm"]["generation"]
+    defaults = generation_config.get("defaults", {})
+    overrides = generation_config.get("overrides", {})
+    task_overrides = generation_config.get("task_overrides", {})
+
+    def generation_value(name: str) -> Any:
+        if name in task_overrides:
+            return task_overrides[name]
+        if name in overrides:
+            return overrides[name]
+        return defaults.get(name)
+
+    return {
+        "mineru": {
+            "effort": mineru_config.get("effort", "high"),
+            "method": mineru_config.get("method", "auto"),
+            "lang": mineru_config.get("lang", "ch"),
+        },
+        "generation": {
+            name: generation_value(name)
+            for name in (
+                "temperature",
+                "top_p",
+                "seed",
+                "max_tokens",
+                "repetition_penalty",
+            )
+        },
+    }
+
+
 def _create_fused_archive(output_root: Path, archive_path: Path) -> None:
     fused_root = output_root / "fused"
     if not fused_root.is_dir():
         raise RuntimeError(f"Fused output was not created: {fused_root}")
     selected = [fused_root]
-    for optional_name in ("fusion_summary.json", "vllm_requests.jsonl"):
+    for optional_name in (
+        "fusion_summary.json",
+        "task_parameters.json",
+        "vllm_requests.jsonl",
+    ):
         optional_path = output_root / optional_name
         if optional_path.is_file():
             selected.append(optional_path)
@@ -267,6 +418,7 @@ def _task_payload(record: TaskRecord, request: Request) -> dict[str, Any]:
         "task_id": record.task_id,
         "status": record.status,
         "input_names": record.input_names,
+        "parameters": record.parameters,
         "created_at": record.created_at,
         "started_at": record.started_at,
         "completed_at": record.completed_at,
@@ -274,6 +426,9 @@ def _task_payload(record: TaskRecord, request: Request) -> dict[str, Any]:
         "status_url": str(request.url_for("get_task", task_id=record.task_id)),
         "result_url": str(request.url_for("get_task_result", task_id=record.task_id)),
         "report_url": str(request.url_for("get_task_report", task_id=record.task_id)),
+        "preview_url": str(
+            request.url_for("get_task_preview", task_id=record.task_id)
+        ),
     }
     return payload
 
@@ -311,7 +466,11 @@ def create_app(
         if api_key is None:
             return
         prefix = "Bearer "
-        supplied = authorization[len(prefix) :] if authorization and authorization.startswith(prefix) else ""
+        supplied = (
+            authorization[len(prefix) :]
+            if authorization and authorization.startswith(prefix)
+            else ""
+        )
         if not hmac.compare_digest(supplied, api_key):
             raise HTTPException(status_code=401, detail="Invalid or missing bearer token")
 
@@ -321,13 +480,24 @@ def create_app(
             raise HTTPException(status_code=404, detail="Task not found")
         return record
 
-    async def create_uploaded_task(files: Sequence[UploadFile]) -> TaskRecord:
+    def require_completed_task(task_id: str) -> TaskRecord:
+        record = require_task(task_id)
+        if record.status == "failed":
+            raise HTTPException(status_code=409, detail=record.error or "Task failed")
+        if record.status != "completed":
+            raise HTTPException(status_code=409, detail=f"Task is {record.status}")
+        return record
+
+    async def create_uploaded_task(
+        files: Sequence[UploadFile],
+        parameters: Mapping[str, Any] | None = None,
+    ) -> TaskRecord:
         task_id = uuid.uuid4().hex
         task_root = manager.output_root / task_id
         input_root = task_root / "input"
         try:
             names = await _save_uploads(files, input_root, max_upload_bytes)
-            record = manager.create(task_id, names)
+            record = manager.create(task_id, names, parameters)
             manager.enqueue(task_id)
             return record
         except Exception:
@@ -336,20 +506,40 @@ def create_app(
 
     @app.get("/health", name="health")
     async def health() -> dict[str, Any]:
+        config = load_config(resolved_config)
         return {
             "status": "ok",
             "service": "custom-hybrid-mineru",
-            "upstream_url": load_config(resolved_config)["vllm"]["upstream_url"],
+            "upstream_url": config["vllm"]["upstream_url"],
             "authentication_required": api_key is not None,
             "max_upload_mb": max_upload_mb,
+            "task_parameter_defaults": _task_parameter_defaults(config),
         }
 
     @app.post("/tasks", status_code=202, dependencies=[Depends(authorize)])
     async def submit_task(
         request: Request,
         files: list[UploadFile] = File(...),
+        effort: str | None = Form(default=None),
+        method: str | None = Form(default=None),
+        lang: str | None = Form(default=None),
+        temperature: float | None = Form(default=None),
+        top_p: float | None = Form(default=None),
+        seed: int | None = Form(default=None),
+        max_tokens: int | None = Form(default=None),
+        repetition_penalty: float | None = Form(default=None),
     ) -> dict[str, Any]:
-        record = await create_uploaded_task(files)
+        parameters = _normalize_task_parameters(
+            effort=effort,
+            method=method,
+            lang=lang,
+            temperature=temperature,
+            top_p=top_p,
+            seed=seed,
+            max_tokens=max_tokens,
+            repetition_penalty=repetition_penalty,
+        )
+        record = await create_uploaded_task(files, parameters)
         return _task_payload(record, request)
 
     @app.get("/tasks/{task_id}", name="get_task", dependencies=[Depends(authorize)])
@@ -362,15 +552,47 @@ def create_app(
         dependencies=[Depends(authorize)],
     )
     async def get_task_result(task_id: str):
-        record = require_task(task_id)
-        if record.status == "failed":
-            raise HTTPException(status_code=409, detail=record.error or "Task failed")
-        if record.status != "completed":
-            raise HTTPException(status_code=409, detail=f"Task is {record.status}")
+        record = require_completed_task(task_id)
         return FileResponse(
             record.archive_path,
             media_type="application/zip",
             filename=f"{task_id}-fused.zip",
+        )
+
+    @app.get(
+        "/tasks/{task_id}/preview",
+        name="get_task_preview",
+        dependencies=[Depends(authorize)],
+    )
+    async def get_task_preview(task_id: str):
+        record = require_completed_task(task_id)
+        previews = sorted((record.output_root / "fused").rglob("*_span.pdf"))
+        if not previews:
+            try:
+                await asyncio.to_thread(
+                    regenerate_fused_visualizations,
+                    record.output_root / "fused",
+                    record.input_root,
+                )
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Bounding Box PDF generation failed: {exc}",
+                ) from exc
+            previews = sorted((record.output_root / "fused").rglob("*_span.pdf"))
+        if not previews:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "No Bounding Box PDF is available; the task has no matching "
+                    "PDF source or origin artifact"
+                ),
+            )
+        return FileResponse(
+            previews[0],
+            media_type="application/pdf",
+            filename=previews[0].name,
+            content_disposition_type="inline",
         )
 
     @app.get(
@@ -390,8 +612,28 @@ def create_app(
         )
 
     @app.post("/file_parse", dependencies=[Depends(authorize)])
-    async def file_parse(files: list[UploadFile] = File(...)):
-        record = await create_uploaded_task(files)
+    async def file_parse(
+        files: list[UploadFile] = File(...),
+        effort: str | None = Form(default=None),
+        method: str | None = Form(default=None),
+        lang: str | None = Form(default=None),
+        temperature: float | None = Form(default=None),
+        top_p: float | None = Form(default=None),
+        seed: int | None = Form(default=None),
+        max_tokens: int | None = Form(default=None),
+        repetition_penalty: float | None = Form(default=None),
+    ):
+        parameters = _normalize_task_parameters(
+            effort=effort,
+            method=method,
+            lang=lang,
+            temperature=temperature,
+            top_p=top_p,
+            seed=seed,
+            max_tokens=max_tokens,
+            repetition_penalty=repetition_penalty,
+        )
+        record = await create_uploaded_task(files, parameters)
         completed = await asyncio.to_thread(manager.wait, record.task_id)
         if completed.status == "failed":
             raise HTTPException(status_code=409, detail=completed.error or "Task failed")

@@ -25,7 +25,7 @@
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       background: #f7f8fb;
     }
-    button, input { font: inherit; }
+    button, input, select { font: inherit; }
     .shell { width: min(1500px, calc(100% - 36px)); margin: 0 auto; padding: 26px 0 54px; }
     .hero {
       position: relative;
@@ -55,12 +55,18 @@
     .dot { width: 8px; height: 8px; border-radius: 50%; background: #c4ccd8; }
     .service-pill.online .dot { background: #68e0b2; box-shadow: 0 0 0 4px rgba(104,224,178,0.16); }
     .service-pill.offline .dot { background: #ff8585; box-shadow: 0 0 0 4px rgba(255,133,133,0.16); }
-    .workspace { display: grid; grid-template-columns: 300px minmax(360px, 1fr) minmax(390px, 1fr); gap: 16px; margin-top: 20px; align-items: stretch; }
+    .workspace { display: grid; grid-template-columns: 340px minmax(360px, 1fr) minmax(390px, 1fr); gap: 16px; margin-top: 20px; align-items: stretch; }
     .panel { min-width: 0; min-height: 620px; overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: white; box-shadow: 0 8px 25px rgba(43, 61, 88, 0.055); }
     .panel-title { display: flex; align-items: center; gap: 8px; min-height: 47px; padding: 0 16px; border-bottom: 1px solid var(--line); font-size: 13px; font-weight: 750; }
     .panel-title span { color: var(--blue); }
+    .preview-title { justify-content: space-between; }
+    .preview-title-label { display: flex; align-items: center; gap: 8px; }
+    .preview-switch { display: flex; gap: 5px; }
+    .preview-switch button { padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; color: var(--muted); background: white; font-size: 10px; }
+    .preview-switch button:hover { transform: none; background: var(--soft); }
+    .preview-switch button.active { color: white; border-color: var(--blue); background: var(--blue); }
     .controls { padding: 14px; }
-    .drop-zone { display: grid; place-items: center; min-height: 220px; padding: 22px 14px; border: 1.5px dashed #c3ccd9; border-radius: 9px; text-align: center; cursor: pointer; transition: 150ms ease; }
+    .drop-zone { display: grid; place-items: center; min-height: 180px; padding: 20px 14px; border: 1.5px dashed #c3ccd9; border-radius: 9px; text-align: center; cursor: pointer; transition: 150ms ease; }
     .drop-zone:hover, .drop-zone.dragging { border-color: var(--blue); background: #f4f8ff; }
     .upload-icon { display: grid; place-items: center; width: 48px; height: 48px; margin-bottom: 13px; border-radius: 14px; color: var(--blue); background: #eaf2ff; font-size: 25px; font-weight: 700; }
     .drop-zone strong { font-size: 15px; }
@@ -73,7 +79,13 @@
     .setting-card { margin-top: 12px; padding: 13px; border: 1px solid var(--line); border-radius: 9px; }
     .setting-label { margin-bottom: 5px; font-size: 12px; font-weight: 750; }
     .setting-help { color: var(--muted); font-size: 11px; line-height: 1.5; }
-    .fixed-value { margin-top: 9px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--soft); font-size: 12px; font-weight: 650; }
+    .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; margin-top: 11px; }
+    .field { min-width: 0; }
+    .field-wide { grid-column: 1 / -1; }
+    .field label { display: block; margin-bottom: 4px; color: #465268; font-size: 10px; font-weight: 750; }
+    .field input, .field select { width: 100%; min-width: 0; padding: 8px 9px; border: 1px solid #cfd7e3; border-radius: 7px; color: var(--ink); outline: none; background: white; font-size: 12px; }
+    .field input:focus, .field select:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(40,110,232,0.1); }
+    .parameter-note { margin-top: 9px; color: var(--muted); font-size: 10px; line-height: 1.45; }
     .actions { display: grid; grid-template-columns: 1fr 0.65fr; gap: 8px; margin-top: 12px; }
     button, .download-button { appearance: none; border: 0; border-radius: 8px; padding: 10px 12px; cursor: pointer; text-decoration: none; font-size: 13px; font-weight: 720; transition: 140ms ease; }
     button:hover, .download-button:hover { transform: translateY(-1px); }
@@ -147,13 +159,56 @@
         <div id="fileList" class="file-list"></div>
 
         <div class="setting-card">
-          <div class="setting-label">Workflow</div>
-          <div class="setting-help">Server-controlled extraction settings for consistent output.</div>
-          <div class="fixed-value">Custom Hybrid · High Effort</div>
+          <div class="setting-label">Extraction Settings</div>
+          <div class="setting-help">Applied to this task only.</div>
+          <div class="settings-grid">
+            <div class="field">
+              <label for="effortInput">Effort</label>
+              <select id="effortInput">
+                <option value="medium">Medium</option>
+                <option value="high" selected>High</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="methodInput">Parse Method</label>
+              <select id="methodInput">
+                <option value="auto" selected>Auto</option>
+                <option value="ocr">OCR</option>
+                <option value="txt">Text</option>
+              </select>
+            </div>
+            <div class="field field-wide">
+              <label for="langInput">Language</label>
+              <input id="langInput" type="text" value="ch" maxlength="32" autocomplete="off">
+            </div>
+          </div>
         </div>
         <div class="setting-card">
-          <div class="setting-label">Output</div>
-          <div class="setting-help">Fused Markdown, JSON, Cell metadata, bounding boxes, and audit report.</div>
+          <div class="setting-label">vLLM Generation</div>
+          <div class="setting-help">These values take priority over workflow rules for this task.</div>
+          <div class="settings-grid">
+            <div class="field">
+              <label for="temperatureInput">Temperature</label>
+              <input id="temperatureInput" type="number" min="0" max="2" step="0.05" value="0">
+            </div>
+            <div class="field">
+              <label for="topPInput">Top P</label>
+              <input id="topPInput" type="number" min="0.01" max="1" step="0.01" value="1">
+            </div>
+            <div class="field">
+              <label for="seedInput">Seed</label>
+              <input id="seedInput" type="number" step="1" value="42">
+            </div>
+            <div class="field">
+              <label for="maxTokensInput">Max Tokens</label>
+              <input id="maxTokensInput" type="number" min="1" max="131072" step="1" value="2048">
+            </div>
+            <div class="field field-wide">
+              <label for="repetitionPenaltyInput">Repetition Penalty</label>
+              <input id="repetitionPenaltyInput" type="number" min="0.01" max="2" step="0.01" value="1">
+            </div>
+          </div>
+          <div class="parameter-note">Keep prompt tokens + Max Tokens within the remote model context window.</div>
         </div>
 
         <div class="actions">
@@ -166,7 +221,13 @@
     </aside>
 
     <section class="panel">
-      <div class="panel-title"><span>02</span> Document Preview</div>
+      <div class="panel-title preview-title">
+        <div class="preview-title-label"><span>02</span> Document Preview</div>
+        <div class="preview-switch">
+          <button id="viewOriginalButton" class="active" disabled>Original</button>
+          <button id="viewBboxButton" disabled>Bounding Boxes</button>
+        </div>
+      </div>
       <div id="previewBody" class="preview-body">
         <div id="emptyPreview" class="empty-preview">The selected PDF or image will be previewed here before it is sent to the remote MinerU service.</div>
         <iframe id="previewFrame" class="preview-frame hidden" title="PDF preview"></iframe>
@@ -217,6 +278,14 @@
   const fileInput = document.querySelector('#fileInput');
   const dropZone = document.querySelector('#dropZone');
   const fileList = document.querySelector('#fileList');
+  const effortInput = document.querySelector('#effortInput');
+  const methodInput = document.querySelector('#methodInput');
+  const langInput = document.querySelector('#langInput');
+  const temperatureInput = document.querySelector('#temperatureInput');
+  const topPInput = document.querySelector('#topPInput');
+  const seedInput = document.querySelector('#seedInput');
+  const maxTokensInput = document.querySelector('#maxTokensInput');
+  const repetitionPenaltyInput = document.querySelector('#repetitionPenaltyInput');
   const submitButton = document.querySelector('#submitButton');
   const clearButton = document.querySelector('#clearButton');
   const taskState = document.querySelector('#taskState');
@@ -225,6 +294,8 @@
   const emptyPreview = document.querySelector('#emptyPreview');
   const previewFrame = document.querySelector('#previewFrame');
   const previewImage = document.querySelector('#previewImage');
+  const viewOriginalButton = document.querySelector('#viewOriginalButton');
+  const viewBboxButton = document.querySelector('#viewBboxButton');
   const reportEmpty = document.querySelector('#reportEmpty');
   const reportOutput = document.querySelector('#reportOutput');
   const taskEmpty = document.querySelector('#taskEmpty');
@@ -236,6 +307,11 @@
   let previewUrl = null;
   let pollTimer = null;
   let serviceOnline = false;
+
+  const parameterInputs = [
+    effortInput, methodInput, langInput, temperatureInput, topPInput,
+    seedInput, maxTokensInput, repetitionPenaltyInput,
+  ];
 
   const stageOrder = ['prepare', 'service', 'upload', 'queue', 'parse', 'build', 'done'];
 
@@ -263,6 +339,25 @@
     return node.innerHTML;
   }
 
+  function applyParameterDefaults(defaults) {
+    if (!defaults) return;
+    const mineru = defaults.mineru || {};
+    const generation = defaults.generation || {};
+    const assignments = [
+      [effortInput, mineru.effort],
+      [methodInput, mineru.method],
+      [langInput, mineru.lang],
+      [temperatureInput, generation.temperature],
+      [topPInput, generation.top_p],
+      [seedInput, generation.seed],
+      [maxTokensInput, generation.max_tokens],
+      [repetitionPenaltyInput, generation.repetition_penalty],
+    ];
+    assignments.forEach(([input, value]) => {
+      input.value = value === null || value === undefined ? '' : String(value);
+    });
+  }
+
   function renderFiles() {
     fileList.innerHTML = selectedFiles.map(file => `
       <div class="file-item"><span class="file-name">${escapeHtml(file.name)}</span><span class="file-size">${formatBytes(file.size)}</span></div>
@@ -280,11 +375,16 @@
     if (!selectedFiles.length) {
       emptyPreview.classList.remove('hidden');
       previewUrl = null;
+      viewOriginalButton.disabled = true;
+      viewBboxButton.disabled = true;
       return;
     }
     const file = selectedFiles[0];
     previewUrl = URL.createObjectURL(file);
     emptyPreview.classList.add('hidden');
+    viewOriginalButton.disabled = false;
+    viewOriginalButton.classList.add('active');
+    viewBboxButton.classList.remove('active');
     if (file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')) {
       previewFrame.src = previewUrl;
       previewFrame.classList.remove('hidden');
@@ -294,8 +394,23 @@
     }
   }
 
+  function showBoundingBoxPreview(taskId) {
+    if (previewUrl) {
+      URL.revokeObjectURL(previewUrl);
+      previewUrl = null;
+    }
+    emptyPreview.classList.add('hidden');
+    previewImage.classList.add('hidden');
+    previewFrame.src = `/api/tasks/${taskId}/preview`;
+    previewFrame.classList.remove('hidden');
+    viewOriginalButton.classList.remove('active');
+    viewBboxButton.classList.add('active');
+  }
+
   function selectFiles(files) {
     selectedFiles = Array.from(files);
+    viewBboxButton.disabled = true;
+    viewBboxButton.onclick = null;
     renderFiles();
     renderPreview();
     taskState.textContent = selectedFiles.length ? 'ready' : 'waiting';
@@ -342,6 +457,7 @@
   }));
   dropZone.addEventListener('drop', event => selectFiles(event.dataTransfer.files));
   clearButton.addEventListener('click', clearAll);
+  viewOriginalButton.addEventListener('click', () => renderPreview());
 
   document.querySelectorAll('.tab-button').forEach(button => {
     button.addEventListener('click', () => {
@@ -360,7 +476,8 @@
 
   async function checkHealth() {
     try {
-      await jsonResponse(await fetch('/api/health'));
+      const health = await jsonResponse(await fetch('/api/health'));
+      applyParameterDefaults(health.task_parameter_defaults);
       serviceOnline = true;
       serverStatus.className = 'hero-badge service-pill online';
       serverStatus.lastElementChild.textContent = 'Remote service online';
@@ -411,6 +528,13 @@
         downloadButton.href = `/api/tasks/${taskId}/result`;
         downloadCard.classList.add('visible');
         downloadEmpty.classList.add('hidden');
+        const firstFile = selectedFiles[0];
+        const isPdf = firstFile && (firstFile.type === 'application/pdf' || firstFile.name.toLowerCase().endsWith('.pdf'));
+        if (isPdf) {
+          viewBboxButton.disabled = false;
+          viewBboxButton.onclick = () => showBoundingBoxPreview(taskId);
+          showBoundingBoxPreview(taskId);
+        }
         completeThrough('done');
       } else if (status.status === 'failed') {
         if (pollTimer) clearInterval(pollTimer);
@@ -428,6 +552,11 @@
 
   submitButton.addEventListener('click', async () => {
     if (!selectedFiles.length || !serviceOnline) return;
+    const invalidInput = parameterInputs.find(input => !input.checkValidity());
+    if (invalidInput) {
+      invalidInput.reportValidity();
+      return;
+    }
     submitButton.disabled = true;
     clearButton.disabled = true;
     resetResults();
@@ -438,6 +567,19 @@
     setStage('upload', ['prepare', 'service']);
     const form = new FormData();
     selectedFiles.forEach(file => form.append('files', file, file.name));
+    const taskParameters = {
+      effort: effortInput.value,
+      method: methodInput.value,
+      lang: langInput.value.trim(),
+      temperature: temperatureInput.value,
+      top_p: topPInput.value,
+      seed: seedInput.value,
+      max_tokens: maxTokensInput.value,
+      repetition_penalty: repetitionPenaltyInput.value,
+    };
+    Object.entries(taskParameters).forEach(([name, value]) => {
+      if (value !== '') form.append(name, value);
+    });
     try {
       const task = await jsonResponse(await fetch('/api/tasks', { method: 'POST', body: form }));
       updateTask(task);

@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import random
 import sys
@@ -9,6 +10,10 @@ from pathlib import Path
 from unittest import mock
 
 import httpx
+
+PDF_RENDERING_AVAILABLE = all(
+    importlib.util.find_spec(name) is not None for name in ("pypdf", "reportlab")
+)
 
 REPOSITORY_ROOT = Path(__file__).parents[3]
 if str(REPOSITORY_ROOT) not in sys.path:
@@ -30,13 +35,64 @@ from projects.custom_hybrid.workflow import (
     load_config,
     levenshtein_distance,
     run_doctor,
+    _generate_fused_visualizations,
     _index_input_documents,
+    _resolve_visualization_pdf,
     _start_parameter_proxy,
     _stop_parameter_proxy,
 )
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_visualization_source_falls_back_to_fused_origin_pdf(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parse_dir = Path(temp_dir)
+            origin = parse_dir / "renamed_origin.pdf"
+            origin.write_bytes(b"pdf")
+
+            resolved = _resolve_visualization_pdf(
+                parse_dir,
+                "renamed",
+                source_document=None,
+            )
+
+            self.assertEqual(resolved, origin)
+
+    @unittest.skipUnless(PDF_RENDERING_AVAILABLE, "PDF rendering dependencies missing")
+    def test_fused_visualization_uses_origin_pdf_fallback_and_creates_span(self):
+        from pypdf import PdfReader, PdfWriter
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parse_dir = Path(temp_dir)
+            middle = {
+                "pdf_info": [
+                    {
+                        "discarded_blocks": [],
+                        "preproc_blocks": [],
+                    }
+                ]
+            }
+            (parse_dir / "renamed_middle.json").write_text(
+                json.dumps(middle),
+                encoding="utf-8",
+            )
+            writer = PdfWriter()
+            writer.add_blank_page(width=200, height=300)
+            with (parse_dir / "renamed_origin.pdf").open("wb") as stream:
+                writer.write(stream)
+
+            generated = _generate_fused_visualizations(
+                parse_dir,
+                "renamed",
+                source_document=None,
+            )
+
+            span_path = parse_dir / "renamed_span.pdf"
+            self.assertIn(span_path, generated)
+            self.assertTrue(span_path.is_file())
+            self.assertEqual(len(PdfReader(str(span_path)).pages), 1)
+            self.assertFalse(list(parse_dir.glob(".*-span.pdf")))
+
     def test_real_proxy_rewrites_openai_request_and_writes_safe_audit(self):
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -164,12 +220,13 @@ class WorkflowTests(unittest.TestCase):
         policy = {
             "defaults": {"temperature": 0.0, "top_p": 1.0},
             "overrides": {"seed": 42},
+            "task_overrides": {"temperature": 0.35, "seed": 123},
             "remove": ["min_p"],
             "rules": [
                 {
                     "name": "ocr",
                     "match": {"text_regex": "extract text"},
-                    "overrides": {"max_tokens": 12000},
+                    "overrides": {"max_tokens": 12000, "temperature": 0.0},
                 }
             ],
         }
@@ -182,9 +239,9 @@ class WorkflowTests(unittest.TestCase):
 
         applied = apply_generation_policy("/v1/chat/completions", original, policy)
 
-        self.assertEqual(applied.body["temperature"], 0.2)
+        self.assertEqual(applied.body["temperature"], 0.35)
         self.assertEqual(applied.body["top_p"], 1.0)
-        self.assertEqual(applied.body["seed"], 42)
+        self.assertEqual(applied.body["seed"], 123)
         self.assertEqual(applied.body["max_tokens"], 12000)
         self.assertNotIn("min_p", applied.body)
         self.assertEqual(applied.matched_rules, ("ocr",))
@@ -381,6 +438,8 @@ class WorkflowTests(unittest.TestCase):
 
         self.assertIn("ready", report)
         self.assertTrue(report["local_mineru_source"])
+        self.assertIn("pypdf", report["dependencies"])
+        self.assertIn("reportlab", report["dependencies"])
         self.assertIn("six", report["dependencies"])
         self.assertEqual(report["upstream"]["url"], "http://127.0.0.1:1")
         self.assertFalse(report["upstream"]["reachable"])
@@ -574,7 +633,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(span["content"], "abcd")
         self.assertFalse(summary["failed"])
         self.assertEqual(summary["documents"]["sample"]["counts"]["ocr_replacements"], 1)
-        regenerate.assert_called_once()
+        regenerate.assert_called_once_with(
+            fused_path.parent,
+            "sample",
+            input_pdf.resolve(),
+        )
 
 
 if __name__ == "__main__":

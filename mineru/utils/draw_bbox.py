@@ -1,6 +1,8 @@
 # Copyright (c) Opendatalab. All rights reserved.
 import json
+import math
 from io import BytesIO
+from numbers import Real
 
 from loguru import logger
 from pypdf import PdfReader, PdfWriter, PageObject
@@ -83,11 +85,21 @@ def cal_canvas_rect(page, bbox):
     return rect
 
 
+def _page_bboxes(bbox_list, page_index):
+    if page_index >= len(bbox_list):
+        return ()
+    return (
+        bbox
+        for bbox in bbox_list[page_index]
+        if isinstance(bbox, (list, tuple))
+        and len(bbox) == 4
+        and all(isinstance(value, Real) and math.isfinite(value) for value in bbox)
+    )
+
+
 def draw_bbox_without_number(i, bbox_list, page, c, rgb_config, fill_config):
     new_rgb = [float(color) / 255 for color in rgb_config]
-    page_data = bbox_list[i]
-
-    for bbox in page_data:
+    for bbox in _page_bboxes(bbox_list, i):
         rect = cal_canvas_rect(page, bbox)  # Define the rectangle  
 
         if fill_config:  # filled rectangle
@@ -101,11 +113,10 @@ def draw_bbox_without_number(i, bbox_list, page, c, rgb_config, fill_config):
 
 def draw_bbox_with_number(i, bbox_list, page, c, rgb_config, fill_config, draw_bbox=True):
     new_rgb = [float(color) / 255 for color in rgb_config]
-    page_data = bbox_list[i]
     # 强制转换为 float
     page_width, page_height = float(page.cropbox[2]), float(page.cropbox[3])
 
-    for j, bbox in enumerate(page_data):
+    for j, bbox in enumerate(_page_bboxes(bbox_list, i)):
         # 确保bbox的每个元素都是float
         rect = cal_canvas_rect(page, bbox)  # Define the rectangle  
         
@@ -356,16 +367,21 @@ def draw_span_bbox(pdf_info, pdf_bytes, out_path, filename):
     dropped_list = []
 
     def get_span_info(span):
-        if span['type'] == ContentType.TEXT:
-            page_text_list.append(span['bbox'])
-        elif span['type'] == ContentType.INLINE_EQUATION:
-            page_inline_equation_list.append(span['bbox'])
-        elif span['type'] == ContentType.INTERLINE_EQUATION:
-            page_interline_equation_list.append(span['bbox'])
-        elif span['type'] in [ContentType.IMAGE, ContentType.CHART]:
-            page_image_list.append(span['bbox'])
-        elif span['type'] == ContentType.TABLE:
-            page_table_list.append(span['bbox'])
+        bbox = span.get('bbox')
+        span_type = span.get('type')
+        if bbox is None and span_type != ContentType.TABLE:
+            return
+        if span_type == ContentType.TEXT:
+            page_text_list.append(bbox)
+        elif span_type == ContentType.INLINE_EQUATION:
+            page_inline_equation_list.append(bbox)
+        elif span_type == ContentType.INTERLINE_EQUATION:
+            page_interline_equation_list.append(bbox)
+        elif span_type in [ContentType.IMAGE, ContentType.CHART]:
+            page_image_list.append(bbox)
+        elif span_type == ContentType.TABLE:
+            if bbox is not None:
+                page_table_list.append(bbox)
             page_table_cell_list.extend(
                 cell['bbox']
                 for cell in span.get('table_cells', [])
@@ -397,22 +413,28 @@ def draw_span_bbox(pdf_info, pdf_bytes, out_path, filename):
 
 
         # 构造dropped_list
-        for block in page['discarded_blocks']:
-            for line in block['lines']:
-                for span in line['spans']:
-                    page_dropped_list.append(span['bbox'])
+        for block in page.get('discarded_blocks', []):
+            for line in block.get('lines', []):
+                for span in line.get('spans', []):
+                    if span.get('bbox') is not None:
+                        page_dropped_list.append(span['bbox'])
         dropped_list.append(page_dropped_list)
         # 构造其余useful_list
         # for block in page['para_blocks']:  # span直接用分段合并前的结果就可以
-        for block in page['preproc_blocks']:
-            if block['type'] in SPAN_SOURCE_BLOCK_TYPES:
-                for line in block['lines']:
-                    for span in line['spans']:
+        for block in page.get('preproc_blocks', []):
+            if block.get('type') in SPAN_SOURCE_BLOCK_TYPES:
+                for line in block.get('lines', []):
+                    for span in line.get('spans', []):
                         get_span_info(span)
-            elif block['type'] in [BlockType.IMAGE, BlockType.TABLE, BlockType.CHART, BlockType.CODE]:
-                for sub_block in block['blocks']:
-                    for line in sub_block['lines']:
-                        for span in line['spans']:
+            elif block.get('type') in [
+                BlockType.IMAGE,
+                BlockType.TABLE,
+                BlockType.CHART,
+                BlockType.CODE,
+            ]:
+                for sub_block in block.get('blocks', []):
+                    for line in sub_block.get('lines', []):
+                        for span in line.get('spans', []):
                             get_span_info(span)
         text_list.append(page_text_list)
         inline_equation_list.append(page_inline_equation_list)

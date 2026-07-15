@@ -141,7 +141,7 @@ def _validate_proxy_config(vllm_config: Mapping[str, Any]) -> None:
     if not isinstance(timeout, (int, float)) or float(timeout) <= 0:
         raise WorkflowConfigError("vllm.request_timeout_seconds must be positive")
     generation = _require_mapping(vllm_config, "generation")
-    for key in ("defaults", "overrides"):
+    for key in ("defaults", "overrides", "task_overrides"):
         if not isinstance(generation.get(key, {}), dict):
             raise WorkflowConfigError(f"vllm.generation.{key} must be a JSON object")
     if not isinstance(generation.get("remove", []), list):
@@ -353,9 +353,13 @@ def apply_generation_policy(
         if _rule_matches(rule, path, body, text):
             _apply_policy_section(effective, rule)
             matched_rules.append(rule["name"])
+    task_overrides = generation_config.get("task_overrides", {})
+    if isinstance(task_overrides, dict):
+        effective.update(task_overrides)
 
     tracked_keys = set(generation_config.get("defaults", {}))
     tracked_keys.update(generation_config.get("overrides", {}))
+    tracked_keys.update(generation_config.get("task_overrides", {}))
     tracked_keys.update(generation_config.get("remove", []))
     for rule in generation_config.get("rules", []):
         if rule.get("name") in matched_rules:
@@ -849,12 +853,118 @@ def _require_empty_output(path: Path, label: str) -> None:
         )
 
 
-def _regenerate_fused_outputs(parse_dir: Path, document_stem: str) -> None:
+def _regenerate_fused_outputs(
+    parse_dir: Path,
+    document_stem: str,
+    source_document: Path | None = None,
+) -> tuple[Path, ...]:
     if str(REPOSITORY_ROOT) not in sys.path:
         sys.path.insert(0, str(REPOSITORY_ROOT))
     from mineru.cli.client_side_output import regenerate_client_side_outputs
 
-    regenerate_client_side_outputs(parse_dir, document_stem)
+    generated = list(regenerate_client_side_outputs(parse_dir, document_stem))
+    generated.extend(
+        _generate_fused_visualizations(
+            parse_dir,
+            document_stem,
+            source_document,
+        )
+    )
+    return tuple(generated)
+
+
+def _resolve_visualization_pdf(
+    parse_dir: Path,
+    document_stem: str,
+    source_document: Path | None,
+) -> Path | None:
+    candidates = []
+    if source_document is not None and source_document.suffix.lower() == ".pdf":
+        candidates.append(source_document)
+    candidates.append(parse_dir / f"{document_stem}_origin.pdf")
+    return next((path for path in candidates if path.is_file()), None)
+
+
+def _validate_visualization_pdf(path: Path, expected_pages: int) -> None:
+    if not path.is_file() or path.stat().st_size == 0:
+        raise RuntimeError(f"Visualization renderer did not create {path.name}")
+    from pypdf import PdfReader
+
+    actual_pages = len(PdfReader(str(path)).pages)
+    if actual_pages != expected_pages:
+        raise RuntimeError(
+            f"Visualization page count mismatch for {path.name}: "
+            f"expected {expected_pages}, got {actual_pages}"
+        )
+
+
+def _generate_fused_visualizations(
+    parse_dir: Path,
+    document_stem: str,
+    source_document: Path | None = None,
+) -> tuple[Path, ...]:
+    source_pdf = _resolve_visualization_pdf(
+        parse_dir,
+        document_stem,
+        source_document,
+    )
+    if source_pdf is None:
+        return ()
+
+    from mineru.utils.draw_bbox import draw_layout_bbox, draw_span_bbox
+
+    middle_json_path = parse_dir / f"{document_stem}_middle.json"
+    middle_json = json.loads(middle_json_path.read_text(encoding="utf-8"))
+    pdf_info = middle_json.get("pdf_info")
+    if not isinstance(pdf_info, list):
+        raise ValueError("Fused middle JSON must contain pdf_info for visualization")
+    pdf_bytes = source_pdf.read_bytes()
+    layout_path = parse_dir / f"{document_stem}_layout.pdf"
+    span_path = parse_dir / f"{document_stem}_span.pdf"
+    span_temp = parse_dir / f".{document_stem}-{uuid.uuid4().hex}-span.pdf"
+    layout_temp = parse_dir / f".{document_stem}-{uuid.uuid4().hex}-layout.pdf"
+
+    try:
+        draw_span_bbox(pdf_info, pdf_bytes, str(parse_dir), span_temp.name)
+        _validate_visualization_pdf(span_temp, len(pdf_info))
+        span_temp.replace(span_path)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to generate {span_path.name} from {source_pdf.name}: {exc}"
+        ) from exc
+    finally:
+        span_temp.unlink(missing_ok=True)
+
+    generated = [span_path]
+    try:
+        draw_layout_bbox(pdf_info, pdf_bytes, str(parse_dir), layout_temp.name)
+        _validate_visualization_pdf(layout_temp, len(pdf_info))
+        layout_temp.replace(layout_path)
+        generated.insert(0, layout_path)
+    except Exception:
+        # span.pdf is the required UI artifact; layout.pdf remains best-effort.
+        layout_temp.unlink(missing_ok=True)
+    finally:
+        layout_temp.unlink(missing_ok=True)
+    return tuple(generated)
+
+
+def regenerate_fused_visualizations(
+    fused_root: str | Path,
+    input_path: str | Path,
+) -> tuple[Path, ...]:
+    root = Path(fused_root).expanduser().resolve()
+    documents = _index_input_documents(input_path)
+    generated = []
+    for stem, middle_path in _index_middle_json(root).items():
+        generated.extend(
+            _generate_fused_visualizations(
+                middle_path.parent,
+                stem,
+                documents.get(stem),
+            )
+        )
+    return tuple(generated)
 
 
 def fuse_output_trees(
@@ -913,11 +1023,16 @@ def fuse_output_trees(
                 json.dumps(report, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            _regenerate_fused_outputs(fused_path.parent, stem)
+            generated_files = _regenerate_fused_outputs(
+                fused_path.parent,
+                stem,
+                document_path,
+            )
             summary["documents"][stem] = {
                 "middle_json": str(fused_path),
                 "report": str(report_path),
                 "counts": report["counts"],
+                "artifacts": [str(path) for path in generated_files],
             }
         except Exception as exc:
             summary["failed"][stem] = f"{type(exc).__name__}: {exc}"
@@ -1685,7 +1800,9 @@ def run_doctor(config: Mapping[str, Any]) -> dict[str, Any]:
         "uvicorn",
         "mineru_vl_utils",
         "PIL",
+        "pypdf",
         "pypdfium2",
+        "reportlab",
         "torch",
         "cv2",
         "numpy",
