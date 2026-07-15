@@ -9,6 +9,7 @@ import hmac
 import json
 import os
 import shutil
+import sys
 import threading
 import uuid
 import zipfile
@@ -21,6 +22,10 @@ from typing import Any, Callable, Mapping, Sequence
 import uvicorn
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
+
+REPOSITORY_ROOT = Path(__file__).parents[2]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from projects.custom_hybrid.workflow import load_config, run_extract
 
