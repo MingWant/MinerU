@@ -1,0 +1,118 @@
+{
+  "version": 1,
+  "vllm": {
+    "upstream_url": "http://127.0.0.1:30000",
+    "api_key_env": "VLLM_API_KEY",
+    "request_timeout_seconds": 600,
+    "audit_log": "./output/custom_hybrid/vllm_requests.jsonl",
+    "audit_prompt_preview_chars": 0,
+    "server_args": {
+      "port": 30000,
+      "gpu_memory_utilization": 0.85,
+      "max_model_len": 32768,
+      "max_num_seqs": 8,
+      "generation_config": "vllm"
+    },
+    "proxy": {
+      "host": "127.0.0.1",
+      "port": 30001,
+      "allow_public_bind": false
+    },
+    "generation": {
+      "defaults": {
+        "max_tokens": 16384
+      },
+      "overrides": {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "seed": 42
+      },
+      "remove": [],
+      "rules": [
+        {
+          "name": "deterministic-ocr",
+          "match": {
+            "text_regex": "ocr|recogniz|transcri|extract"
+          },
+          "overrides": {
+            "temperature": 0.0,
+            "top_p": 1.0
+          }
+        }
+      ]
+    }
+  },
+  "mineru": {
+    "backend": "hybrid-http-client",
+    "effort": "high",
+    "method": "auto",
+    "lang": "ch",
+    "formula": true,
+    "table": true,
+    "image_analysis": true,
+    "extra_args": []
+  },
+  "fusion": {
+    "enabled": true,
+    "min_overlap": 0.5,
+    "min_ocr_confidence": 0.82,
+    "consensus_similarity": 0.94,
+    "candidate_guard_similarity": 0.55,
+    "suspicious_length_ratio": 1.8,
+    "max_verifications_per_document": 80,
+    "table_fallback_enabled": true,
+    "formula_fallback_enabled": true,
+    "table_visual_verification_enabled": true,
+    "formula_visual_verification_enabled": true,
+    "table_consensus_similarity": 0.98,
+    "formula_consensus_similarity": 0.98,
+    "max_structured_verifications_per_document": 20,
+    "table_cell_fusion_enabled": true,
+    "table_cell_empty_fallback_enabled": true,
+    "table_cell_suspicious_fallback_enabled": true,
+    "table_cell_allow_unscored_ocr": false,
+    "table_cell_consensus_similarity": 0.98,
+    "table_cell_min_ocr_confidence": 0.85,
+    "table_cell_metadata_text_similarity": 0.8,
+    "max_table_cells_per_table": 500,
+    "max_table_cell_verifications_per_document": 80,
+    "verifier": {
+      "enabled": true,
+      "base_url": null,
+      "model": null,
+      "api_key_env": "VLLM_API_KEY",
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "max_tokens": 1024,
+      "timeout_seconds": 120,
+      "render_scale": 2.0,
+      "table_cell_render_scale": 4.0,
+      "padding_ratio": 0.08,
+      "jpeg_quality": 92,
+      "cache_pages": 2,
+      "structured_candidate_max_chars": 12000,
+      "table_cell_context_max_chars": 4000,
+      "table_cell_max_context_cells": 40,
+      "table_cell_include_table_image": true,
+      "table_cell_include_row_image": true,
+      "table_cell_include_column_image": true
+    }
+  },
+  "sweep": {
+    "generation": {
+      "temperature": [0.0, 0.1],
+      "top_p": [0.95, 1.0],
+      "repetition_penalty": [1.0, 1.03]
+    },
+    "max_runs": 8
+  },
+  "evaluation": {
+    "regression_tolerance": 0.002,
+    "normalization": {
+      "unicode_nfkc": true,
+      "trim_trailing_whitespace": true,
+      "collapse_blank_lines": true,
+      "collapse_whitespace": false
+    }
+  }
+}

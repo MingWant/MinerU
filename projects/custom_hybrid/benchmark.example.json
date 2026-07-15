@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "documents": [
+    {
+      "id": "small_ocr",
+      "reference": "benchmark/reference/small_ocr.md",
+      "candidate_filename": "small_ocr.md",
+      "tags": ["scan", "ch"],
+      "weight": 1.0
+    },
+    {
+      "id": "two_column_paper",
+      "reference": "benchmark/reference/two_column_paper.md",
+      "tags": ["native_pdf", "two_column", "formula", "en"],
+      "weight": 1.0
+    },
+    {
+      "id": "financial_table",
+      "reference": "benchmark/reference/financial_table.md",
+      "tags": ["scan", "table", "mixed_language"],
+      "weight": 1.0
+    }
+  ]
+}
