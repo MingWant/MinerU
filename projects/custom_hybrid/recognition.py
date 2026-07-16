@@ -7,6 +7,7 @@ import math
 import os
 import re
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -186,23 +187,102 @@ class OpenAIBBoxRecognizer:
             jpeg_quality=int(self.config.get("jpeg_quality", 92)),
         )
 
-    def _build_batch_content(
-        self,
-        page_index: int,
-        page_size: Sequence[float],
-        candidates: Sequence[Mapping[str, Any]],
-    ) -> tuple[str, list[str]]:
-        max_images = max(int(self.config.get("max_images_per_request", 24)), 1)
-        include_kinds = ["target"]
+    def _included_context_kinds(self) -> tuple[str, ...]:
+        result = []
         for kind, default in (
             ("row", True),
             ("column", False),
             ("table", False),
         ):
             if self.config.get(f"include_{kind}_image", default):
-                include_kinds.append(kind)
+                result.append(kind)
+        return tuple(result)
+
+    def _batch_image_count(
+        self,
+        candidates: Sequence[Mapping[str, Any]],
+    ) -> int:
+        """Count target images plus deduplicated context crops for a batch."""
+        targets = 0
+        context_bboxes: set[tuple[float, ...]] = set()
+        for candidate in candidates:
+            contexts = candidate.get("contexts", {})
+            if not isinstance(contexts, Mapping):
+                continue
+            target_bbox = contexts.get("target")
+            if isinstance(target_bbox, list) and len(target_bbox) == 4:
+                targets += 1
+            for kind in self._included_context_kinds():
+                bbox = contexts.get(kind)
+                if isinstance(bbox, list) and len(bbox) == 4:
+                    context_bboxes.add(tuple(float(value) for value in bbox))
+        return targets + len(context_bboxes)
+
+    def _pack_candidate_batches(
+        self,
+        candidates: Sequence[Mapping[str, Any]],
+        max_batch_size: int,
+        max_images: int,
+    ) -> list[list[Mapping[str, Any]]]:
+        """Greedily retain complete contexts while respecting the image budget."""
+        batches: list[list[Mapping[str, Any]]] = []
+        current: list[Mapping[str, Any]] = []
+        for candidate in candidates:
+            proposed = [*current, candidate]
+            if current and (
+                len(proposed) > max_batch_size
+                or self._batch_image_count(proposed) > max_images
+            ):
+                batches.append(current)
+                current = [candidate]
+            else:
+                current = proposed
+        if current:
+            batches.append(current)
+        return batches
+
+    @staticmethod
+    def _server_image_limit(exc: Exception) -> int | None:
+        parts = [str(exc)]
+        response = getattr(exc, "response", None)
+        if response is not None:
+            try:
+                parts.append(str(response.text))
+            except Exception:
+                pass
+            try:
+                parts.append(json.dumps(response.json(), ensure_ascii=False))
+            except Exception:
+                pass
+        match = re.search(
+            r"at\s+most\s+(\d+)\s+image(?:\(s\)|s)?",
+            "\n".join(parts),
+            flags=re.IGNORECASE,
+        )
+        if match is None:
+            return None
+        limit = int(match.group(1))
+        return limit if limit > 0 else None
+
+    def _build_batch_content(
+        self,
+        page_index: int,
+        page_size: Sequence[float],
+        candidates: Sequence[Mapping[str, Any]],
+        max_images: int | None = None,
+    ) -> tuple[str, list[str], list[dict[str, str]]]:
+        max_images = max(
+            int(
+                max_images
+                if max_images is not None
+                else self.config.get("max_images_per_request", 8)
+            ),
+            1,
+        )
+        include_kinds = ("target", *self._included_context_kinds())
         image_urls: list[str] = []
         image_refs: dict[tuple[float, ...], str] = {}
+        dropped_contexts: list[dict[str, str]] = []
         prompt_candidates = []
         hide_ids = bool(
             self.config.get("hide_ids_in_prompt_when_constrained", True)
@@ -239,6 +319,12 @@ class OpenAIBBoxRecognizer:
                 ref = image_refs.get(bbox_key)
                 if ref is None:
                     if len(image_urls) >= max_images:
+                        dropped_contexts.append(
+                            {
+                                "id": str(candidate.get("id", "")),
+                                "kind": kind,
+                            }
+                        )
                         continue
                     ref = f"image-{len(image_urls)}"
                     image_refs[bbox_key] = ref
@@ -289,7 +375,7 @@ class OpenAIBBoxRecognizer:
         max_prompt_chars = int(self.config.get("max_prompt_chars", 16000))
         if len(prompt) > max_prompt_chars:
             raise ValueError("Recognizer prompt exceeds max_prompt_chars")
-        return prompt, image_urls
+        return prompt, image_urls, dropped_contexts
 
     def _post_batch(
         self,
@@ -375,19 +461,37 @@ class OpenAIBBoxRecognizer:
         candidates: Sequence[Mapping[str, Any]],
     ) -> dict[str, Any]:
         max_batch_size = max(int(self.config.get("max_batch_size", 8)), 1)
-        max_images = max(int(self.config.get("max_images_per_request", 24)), 1)
-        # Every candidate requires one authoritative target crop. Limiting the
-        # batch to the image budget prevents candidates at the end of a batch
-        # from being silently omitted when users configure a smaller budget.
-        batch_size = min(max_batch_size, max_images)
+        max_images = max(int(self.config.get("max_images_per_request", 8)), 1)
+        max_image_limit_retries = max(
+            int(self.config.get("max_image_limit_retries", 2)),
+            0,
+        )
         max_requests = max(int(self.config.get("max_requests_per_document", 80)), 0)
         result_items = []
         batch_audit = []
         invalid_outputs = 0
         errors = 0
         requests = 0
-        for offset in range(0, len(candidates), batch_size):
-            batch = candidates[offset : offset + batch_size]
+        rebatches = 0
+        pending = deque(
+            {
+                "candidates": batch,
+                "image_limit": max_images,
+                "rebatch_count": 0,
+                "server_image_limit": None,
+            }
+            for batch in self._pack_candidate_batches(
+                candidates,
+                max_batch_size,
+                max_images,
+            )
+        )
+        while pending:
+            pending_batch = pending.popleft()
+            batch = pending_batch["candidates"]
+            image_limit = int(pending_batch["image_limit"])
+            rebatch_count = int(pending_batch["rebatch_count"])
+            server_image_limit = pending_batch["server_image_limit"]
             ids = [str(item.get("id")) for item in batch]
             if self.requests_made >= max_requests:
                 batch_audit.append(
@@ -399,11 +503,13 @@ class OpenAIBBoxRecognizer:
                 )
                 continue
             started = time.monotonic()
+            image_urls: list[str] = []
             try:
-                prompt, image_urls = self._build_batch_content(
+                prompt, image_urls, dropped_contexts = self._build_batch_content(
                     page_index,
                     page_size,
                     batch,
+                    image_limit,
                 )
                 self.requests_made += 1
                 requests += 1
@@ -454,13 +560,18 @@ class OpenAIBBoxRecognizer:
                         else "invalid_schema"
                     ),
                     "responses": len(accepted),
+                    "candidates": len(batch),
                     "images": len(image_urls),
+                    "contexts_dropped": dropped_contexts,
                     "invalid_outputs": batch_invalid_outputs + int(not container_valid),
                     "missing_ids": missing_ids,
                     "structured_output_mode": self._structured_output_mode(),
+                    "rebatch_count": rebatch_count,
                     "latency_ms": round((time.monotonic() - started) * 1000, 3),
                     **response_audit,
                 }
+                if isinstance(server_image_limit, int):
+                    batch_record["server_image_limit"] = server_image_limit
                 preview_chars = int(
                     self.config.get("audit_response_preview_chars", 0)
                 )
@@ -470,6 +581,44 @@ class OpenAIBBoxRecognizer:
                 invalid_outputs += batch_invalid_outputs
                 invalid_outputs += int(not container_valid)
             except Exception as exc:
+                detected_limit = self._server_image_limit(exc)
+                can_retry = (
+                    isinstance(detected_limit, int)
+                    and rebatch_count < max_image_limit_retries
+                    and len(image_urls) > detected_limit
+                )
+                if can_retry:
+                    retry_batches = self._pack_candidate_batches(
+                        batch,
+                        max_batch_size,
+                        detected_limit,
+                    )
+                    if retry_batches:
+                        rebatches += 1
+                        batch_audit.append(
+                            {
+                                "page": page_index,
+                                "candidate_ids": ids,
+                                "status": "image_limit_rebatch",
+                                "attempted_images": len(image_urls),
+                                "server_image_limit": detected_limit,
+                                "rebatch_count": rebatch_count + 1,
+                                "latency_ms": round(
+                                    (time.monotonic() - started) * 1000,
+                                    3,
+                                ),
+                            }
+                        )
+                        for retry_batch in reversed(retry_batches):
+                            pending.appendleft(
+                                {
+                                    "candidates": retry_batch,
+                                    "image_limit": detected_limit,
+                                    "rebatch_count": rebatch_count + 1,
+                                    "server_image_limit": detected_limit,
+                                }
+                            )
+                        continue
                 errors += 1
                 batch_audit.append(
                     {
@@ -486,6 +635,7 @@ class OpenAIBBoxRecognizer:
             "requests": requests,
             "invalid_outputs": invalid_outputs,
             "errors": errors,
+            "rebatches": rebatches,
         }
 
     def close(self) -> None:

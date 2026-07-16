@@ -69,7 +69,7 @@ GENERATION_PARAMETER_LIMITS = {
     "repetition_penalty": (0.01, 2.0),
 }
 COST_PROFILES = {"balanced", "quality"}
-EXTRACTION_MODES = {"hybrid_fusion", "bbox_vlm"}
+EXTRACTION_MODES = {"hybrid_fusion", "bbox_vlm", "bbox_vlm_recovery"}
 DEFAULT_COST_PROFILE = "balanced"
 BALANCED_FUSION_OVERRIDES = {
     "max_verifications_per_document": 0,
@@ -80,6 +80,7 @@ BALANCED_FUSION_OVERRIDES = {
     "max_table_cell_verifications_per_document": 0,
     "verifier": {"enabled": False},
     "recognizer": {"enabled": False},
+    "recovery": {"enabled": False},
     "reconciliation": {"enabled": False},
 }
 BBOX_VLM_FUSION_OVERRIDES = {
@@ -101,9 +102,12 @@ BBOX_VLM_FUSION_OVERRIDES = {
         "table_ocr_enabled": True,
         "selection_policy": "vlm_primary",
         "include_row_image": True,
-        "include_table_image": True,
+        "include_table_image": False,
+        "max_images_per_request": 8,
+        "max_image_limit_retries": 2,
     },
     "verifier": {"enabled": False},
+    "recovery": {"enabled": False},
     "reconciliation": {"enabled": False},
 }
 
@@ -305,6 +309,9 @@ def _normalize_task_parameters(
     seed: int | None = None,
     max_tokens: int | None = None,
     repetition_penalty: float | None = None,
+    recovery_max_tables: int | None = None,
+    recovery_max_proposals: int | None = None,
+    recovery_min_confidence: float | None = None,
 ) -> dict[str, Any]:
     mineru: dict[str, Any] = {}
     generation: dict[str, Any] = {}
@@ -330,10 +337,34 @@ def _normalize_task_parameters(
         if extraction_mode not in EXTRACTION_MODES:
             raise HTTPException(
                 status_code=400,
-                detail="extraction_mode must be hybrid_fusion or bbox_vlm",
+                detail=(
+                    "extraction_mode must be hybrid_fusion, bbox_vlm, or "
+                    "bbox_vlm_recovery"
+                ),
             )
-        if extraction_mode == "bbox_vlm":
-            fusion.update(copy.deepcopy(BBOX_VLM_FUSION_OVERRIDES))
+        if extraction_mode in {"bbox_vlm", "bbox_vlm_recovery"}:
+            bbox_vlm_overrides = copy.deepcopy(BBOX_VLM_FUSION_OVERRIDES)
+            bbox_vlm_overrides["recognizer"]["include_table_image"] = (
+                cost_profile == "quality"
+            )
+            if extraction_mode == "bbox_vlm_recovery":
+                bbox_vlm_overrides["mode"] = "bbox_vlm_recovery"
+                bbox_vlm_overrides["recovery"] = {
+                    "enabled": True,
+                    "max_tables_per_document": 10
+                    if cost_profile == "quality"
+                    else 3,
+                    "max_proposals_per_document": 100
+                    if cost_profile == "quality"
+                    else 30,
+                    "max_proposals_per_table": 30
+                    if cost_profile == "quality"
+                    else 10,
+                    "max_requests_per_document": 10
+                    if cost_profile == "quality"
+                    else 3,
+                }
+            fusion.update(bbox_vlm_overrides)
         else:
             fusion["mode"] = "hybrid_fusion"
     if effort is not None:
@@ -389,10 +420,44 @@ def _normalize_task_parameters(
             )
         generation["max_tokens"] = max_tokens
         recognizer_generation["max_tokens"] = max_tokens
-    if extraction_mode == "bbox_vlm" and recognizer_generation:
+    if extraction_mode in {"bbox_vlm", "bbox_vlm_recovery"} and recognizer_generation:
         recognizer_overrides = fusion.setdefault("recognizer", {})
         if isinstance(recognizer_overrides, dict):
             recognizer_overrides.update(recognizer_generation)
+        if extraction_mode == "bbox_vlm_recovery":
+            recovery_overrides = fusion.setdefault("recovery", {})
+            if isinstance(recovery_overrides, dict):
+                recovery_overrides.update(recognizer_generation)
+    recovery_overrides = fusion.setdefault("recovery", {}) if any(
+        value is not None
+        for value in (
+            recovery_max_tables,
+            recovery_max_proposals,
+            recovery_min_confidence,
+        )
+    ) else None
+    if isinstance(recovery_overrides, dict):
+        for name, value, maximum in (
+            ("max_tables_per_document", recovery_max_tables, 1000),
+            ("max_proposals_per_document", recovery_max_proposals, 10000),
+        ):
+            if value is None:
+                continue
+            if not 0 <= value <= maximum:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"recovery_{name} must be between 0 and {maximum}",
+                )
+            recovery_overrides[name] = value
+        if recovery_min_confidence is not None:
+            if not 0 <= recovery_min_confidence <= 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail="recovery_min_confidence must be between 0 and 1",
+                )
+            recovery_overrides["min_confidence"] = float(
+                recovery_min_confidence
+            )
     parameters: dict[str, Any] = {}
     if cost_profile is not None:
         parameters["cost_profile"] = cost_profile
@@ -470,6 +535,17 @@ def _task_parameter_defaults(
                 "max_tokens",
                 "repetition_penalty",
             )
+        },
+        "recovery": {
+            "max_tables_per_document": effective_config.get("fusion", {})
+            .get("recovery", {})
+            .get("max_tables_per_document", 10),
+            "max_proposals_per_document": effective_config.get("fusion", {})
+            .get("recovery", {})
+            .get("max_proposals_per_document", 100),
+            "min_confidence": effective_config.get("fusion", {})
+            .get("recovery", {})
+            .get("min_confidence", 0.85),
         },
     }
 
@@ -685,6 +761,9 @@ def create_app(
         seed: int | None = Form(default=None),
         max_tokens: int | None = Form(default=None),
         repetition_penalty: float | None = Form(default=None),
+        recovery_max_tables: int | None = Form(default=None),
+        recovery_max_proposals: int | None = Form(default=None),
+        recovery_min_confidence: float | None = Form(default=None),
     ) -> dict[str, Any]:
         parameters = _normalize_task_parameters(
             cost_profile=cost_profile,
@@ -697,6 +776,9 @@ def create_app(
             seed=seed,
             max_tokens=max_tokens,
             repetition_penalty=repetition_penalty,
+            recovery_max_tables=recovery_max_tables,
+            recovery_max_proposals=recovery_max_proposals,
+            recovery_min_confidence=recovery_min_confidence,
         )
         record = await create_uploaded_task(files, parameters)
         return _task_payload(record, request)
@@ -830,6 +912,9 @@ def create_app(
         seed: int | None = Form(default=None),
         max_tokens: int | None = Form(default=None),
         repetition_penalty: float | None = Form(default=None),
+        recovery_max_tables: int | None = Form(default=None),
+        recovery_max_proposals: int | None = Form(default=None),
+        recovery_min_confidence: float | None = Form(default=None),
     ):
         parameters = _normalize_task_parameters(
             cost_profile=cost_profile,
@@ -842,6 +927,9 @@ def create_app(
             seed=seed,
             max_tokens=max_tokens,
             repetition_penalty=repetition_penalty,
+            recovery_max_tables=recovery_max_tables,
+            recovery_max_proposals=recovery_max_proposals,
+            recovery_min_confidence=recovery_min_confidence,
         )
         record = await create_uploaded_task(files, parameters)
         completed = await asyncio.to_thread(manager.wait, record.task_id)

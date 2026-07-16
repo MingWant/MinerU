@@ -170,6 +170,33 @@ VLM text is primary while guarded OCR remains the fallback. Keep
 `fusion.mode=hybrid_fusion` for the existing dual-parse workflow and its
 conservative optional recognizer behavior.
 
+Set `fusion.mode=bbox_vlm_recovery` for the opt-in high-quality geometry recovery
+path. It keeps the same Pipeline-only baseline and local transcription behavior,
+but first inspects Table Cells for visible ink that is missing from, or extends
+beyond, existing content boxes. Blank Cells do not trigger a model request.
+Suspicious Tables are rendered once with gray Cell borders, cyan existing content
+boxes, and red suspicious Cells. A constrained Vision reviewer may return only
+`add` or `adjust` proposals for known Cell/box IDs using rough normalized Table
+coordinates.
+
+Reviewer coordinates never become final geometry directly. The workflow clips
+them to the immutable Cell boundary, refines them against dark document pixels,
+then applies confidence, area-ratio, IoU deduplication, adjustment-overlap,
+per-Table, and per-document gates. Table bounds, Cell bounds, row/column indices,
+and HTML grid signatures are snapshotted; any invariant failure rolls back every
+accepted proposal on that page. Accepted empty recovered boxes can enter local
+VLM transcription only when their geometry confidence passes
+`recognizer.recovered_empty_min_confidence`.
+
+Recovery cost is bounded by `recovery.max_tables_per_document`,
+`max_requests_per_document`, `max_proposals_per_document`, and
+`max_proposals_per_table`. API `balanced` defaults to three reviewed Tables and
+thirty proposals; `quality` defaults to ten Tables and one hundred proposals.
+The English UI exposes optional overrides under **Advanced BBox Recovery
+Settings**. Fusion reports record reviewed Tables, requests, accepted/added/
+adjusted/rejected proposals, reviewer batches, decisions, and the Table/Cell
+geometry invariant.
+
 `fusion.recognizer.enabled=false` is the default. When explicitly enabled, the
 recognizer runs before structured fusion and treats Pipeline OCR geometry as
 immutable: the Vision model receives existing bbox IDs and crops, then returns
@@ -183,9 +210,13 @@ always receive image-budget priority. Row context is enabled by default; column
 and Table images are opt-in because they increase multimodal context cost. Batch
 size, image/request limits, rendering scale, padding, timeout, model, endpoint,
 sampling values, output tokens, and context reserve are server-controlled under
-`fusion.recognizer`. If the image budget is smaller than the requested batch,
-the client automatically creates more batches rather than dropping target
-crops.
+`fusion.recognizer`. The default image limit is eight per request. Candidate
+batches are packed using the actual target images plus deduplicated row, column,
+and Table contexts, so enabled context images are retained instead of being
+silently displaced by target crops. If the server still rejects a request with
+an `At most N image(s)` error, the recognizer learns that limit for the failed
+batch, repartitions it, and retries up to `max_image_limit_retries`. Other HTTP
+400 responses are not retried blindly.
 
 `structured_output_mode=json_schema` is the default example and sends a dynamic
 strict schema whose ID enum and item count match the current batch. vLLM-native
@@ -245,6 +276,8 @@ For a separate instruction-following Vision endpoint:
       "max_context_tokens": 8192,
       "context_reserve_tokens": 2048,
       "max_batch_size": 8,
+      "max_images_per_request": 8,
+      "max_image_limit_retries": 2,
       "include_row_image": true,
       "include_column_image": false,
       "include_table_image": false
@@ -421,8 +454,13 @@ does not disable Table extraction, Pipeline OCR, deterministic fusion, or cyan
 content bboxes. Submit `extraction_mode=bbox_vlm` after either cost profile to
 enable the Pipeline BBox + local VLM path; this task override re-enables only the
 required Table recognizer and disables the unrelated verifier/reconciliation
-requests. Submit `cost_profile=quality` to use the corresponding workflow
-configuration instead. Each task may safely override `effort`,
+requests. Submit `extraction_mode=bbox_vlm_recovery` to add the selective
+geometry-review and pixel-refinement pass before transcription. In BBox VLM
+mode, `balanced` sends target and row crops while keeping
+whole-Table images off; `quality` also enables the whole-Table context image.
+Both profiles enforce the eight-image request budget. Submit
+`cost_profile=quality` to use the corresponding workflow configuration instead.
+Each task may safely override `effort`,
 parse method, language, `temperature`, `top_p`, `seed`, `max_tokens`, and
 `repetition_penalty`; the API validates their types and ranges. Task generation
 values are applied after prompt-specific workflow rules, so the submitted values
@@ -455,7 +493,10 @@ curl -X POST \
   -H "Authorization: Bearer $CUSTOM_HYBRID_API_KEY" \
   -F "files=@invoice.pdf" \
   -F "cost_profile=balanced" \
-  -F "extraction_mode=bbox_vlm" \
+  -F "extraction_mode=bbox_vlm_recovery" \
+  -F "recovery_max_tables=3" \
+  -F "recovery_max_proposals=30" \
+  -F "recovery_min_confidence=0.85" \
   -F "effort=medium" \
   -F "temperature=0.1" \
   -F "top_p=0.95" \
@@ -475,7 +516,10 @@ python projects/custom_hybrid/api_client.py \
   --input ~/Documents/invoice.pdf \
   --output ~/Documents/invoice-fused.zip \
   --cost-profile balanced \
-  --extraction-mode bbox_vlm
+  --extraction-mode bbox_vlm_recovery \
+  --recovery-max-tables 3 \
+  --recovery-max-proposals 30 \
+  --recovery-min-confidence 0.85
 ```
 
 The client accepts either one supported file or a directory and streams the ZIP
@@ -514,7 +558,8 @@ through a task-scoped, image-only endpoint with path traversal protection.
 
 Extraction and vLLM Generation controls are task-scoped; the Fusion Report tab
 includes the accepted task parameter snapshot. The English `Extraction Mode`
-selector offers `Hybrid Fusion` and `OCR BBox + VLM`. After a task completes, the same
+selector offers `Hybrid Fusion`, `OCR BBox + VLM`, and
+`OCR BBox + VLM Recovery`. After a task completes, the same
 selected files and parameters remain available and Convert changes to Convert
 Again, so rerunning does not require Clear. For PDF inputs, the fused workflow
 generates both `*_layout.pdf` and `*_span.pdf`; Document Preview automatically

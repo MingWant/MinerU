@@ -152,6 +152,9 @@ def create_ui_app(
         seed: int | None = Form(default=None),
         max_tokens: int | None = Form(default=None),
         repetition_penalty: float | None = Form(default=None),
+        recovery_max_tables: int | None = Form(default=None),
+        recovery_max_proposals: int | None = Form(default=None),
+        recovery_min_confidence: float | None = Form(default=None),
     ) -> Response:
         if not files:
             raise HTTPException(status_code=400, detail="Select at least one file")
@@ -179,6 +182,9 @@ def create_ui_app(
                 "seed": seed,
                 "max_tokens": max_tokens,
                 "repetition_penalty": repetition_penalty,
+                "recovery_max_tables": recovery_max_tables,
+                "recovery_max_proposals": recovery_max_proposals,
+                "recovery_min_confidence": recovery_min_confidence,
             }.items()
             if value is not None
         }

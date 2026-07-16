@@ -45,7 +45,11 @@ class CustomHybridUiTests(unittest.TestCase):
                 self.assertIn(b'name="cost_profile"', body)
                 self.assertIn(b"balanced", body)
                 self.assertIn(b'name="extraction_mode"', body)
-                self.assertIn(b"bbox_vlm", body)
+                self.assertIn(b"bbox_vlm_recovery", body)
+                self.assertIn(b'name="recovery_max_tables"', body)
+                self.assertIn(b"4", body)
+                self.assertIn(b'name="recovery_min_confidence"', body)
+                self.assertIn(b"0.9", body)
                 self.assertIn(b'name="effort"', body)
                 self.assertIn(b"medium", body)
                 self.assertIn(b'name="temperature"', body)
@@ -123,6 +127,9 @@ class CustomHybridUiTests(unittest.TestCase):
             self.assertIn("Protocol Echoes", page.text)
             self.assertIn("Invalid VLM Outputs", page.text)
             self.assertIn("Recognition Errors", page.text)
+            self.assertIn("Image-Limit Rebatches", page.text)
+            self.assertIn("Recovery Tables Reviewed", page.text)
+            self.assertIn("Recovered Boxes Added", page.text)
             self.assertIn("Advanced vLLM Settings", page.text)
             self.assertIn("Markdown Rendering", page.text)
             self.assertIn("Markdown Text", page.text)
@@ -131,9 +138,12 @@ class CustomHybridUiTests(unittest.TestCase):
             self.assertIn('id="costProfileInput"', page.text)
             self.assertIn('id="extractionModeInput"', page.text)
             self.assertIn("OCR BBox + VLM", page.text)
+            self.assertIn("OCR BBox + VLM Recovery", page.text)
             self.assertIn('id="effortInput"', page.text)
             self.assertIn('id="temperatureInput"', page.text)
             self.assertIn('id="seedInput"', page.text)
+            self.assertIn('id="recoveryMaxTablesInput"', page.text)
+            self.assertIn("Advanced BBox Recovery Settings", page.text)
             self.assertNotIn("拖拽", page.text)
             self.assertEqual(client.get("/api/health").json()["status"], "ok")
             submitted = client.post(
@@ -141,10 +151,12 @@ class CustomHybridUiTests(unittest.TestCase):
                 files={"files": ("invoice.pdf", b"pdf")},
                 data={
                     "cost_profile": "balanced",
-                    "extraction_mode": "bbox_vlm",
+                    "extraction_mode": "bbox_vlm_recovery",
                     "effort": "medium",
                     "temperature": "0.25",
                     "seed": "123",
+                    "recovery_max_tables": "4",
+                    "recovery_min_confidence": "0.9",
                 },
             )
             self.assertEqual(submitted.status_code, 202)

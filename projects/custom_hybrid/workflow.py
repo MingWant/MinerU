@@ -38,6 +38,7 @@ from projects.custom_hybrid.fusion import (
     recover_table_cell_geometry,
 )
 from projects.custom_hybrid.recognition import OpenAIBBoxRecognizer
+from projects.custom_hybrid.recovery import OpenAIBBoxRecoveryReviewer
 from projects.custom_hybrid.table_fusion import extract_table_snapshots
 
 
@@ -197,13 +198,13 @@ def _validate_fusion_config(fusion_config: Any) -> None:
     if not isinstance(fusion_config, dict):
         raise WorkflowConfigError("fusion must be a JSON object")
     mode = fusion_config.get("mode", "hybrid_fusion")
-    if mode not in {"hybrid_fusion", "bbox_vlm"}:
+    if mode not in {"hybrid_fusion", "bbox_vlm", "bbox_vlm_recovery"}:
         raise WorkflowConfigError(
-            "fusion.mode must be hybrid_fusion or bbox_vlm"
+            "fusion.mode must be hybrid_fusion, bbox_vlm, or bbox_vlm_recovery"
         )
-    if mode == "bbox_vlm" and not fusion_config.get("enabled", False):
+    if mode in {"bbox_vlm", "bbox_vlm_recovery"} and not fusion_config.get("enabled", False):
         raise WorkflowConfigError(
-            "fusion.enabled must be true when fusion.mode is bbox_vlm"
+            "fusion.enabled must be true for BBox VLM extraction modes"
         )
     if not fusion_config.get("enabled", False):
         return
@@ -231,6 +232,107 @@ def _validate_fusion_config(fusion_config: Any) -> None:
     recognizer = fusion_config.get("recognizer", {})
     if not isinstance(recognizer, dict):
         raise WorkflowConfigError("fusion.recognizer must be a JSON object")
+    recovery = fusion_config.get("recovery", {})
+    if not isinstance(recovery, dict):
+        raise WorkflowConfigError("fusion.recovery must be a JSON object")
+    if not isinstance(recovery.get("enabled", False), bool):
+        raise WorkflowConfigError("fusion.recovery.enabled must be a boolean")
+    recovery_base_url = recovery.get("base_url")
+    if recovery_base_url is not None and (
+        not isinstance(recovery_base_url, str)
+        or not recovery_base_url.startswith(("http://", "https://"))
+    ):
+        raise WorkflowConfigError(
+            "fusion.recovery.base_url must be null or an http(s) URL"
+        )
+    for key in ("model", "api_key_env"):
+        field = recovery.get(key)
+        if field is not None and (not isinstance(field, str) or not field.strip()):
+            raise WorkflowConfigError(
+                f"fusion.recovery.{key} must be null or a non-empty string"
+            )
+    for key in (
+        "min_confidence",
+        "min_area_ratio",
+        "max_area_ratio",
+        "duplicate_iou",
+        "adjust_min_iou",
+        "min_ink_ratio",
+        "min_uncovered_ink_ratio",
+    ):
+        field = recovery.get(key)
+        if field is not None and (
+            not isinstance(field, (int, float)) or not 0 <= float(field) <= 1
+        ):
+            raise WorkflowConfigError(f"fusion.recovery.{key} must be between 0 and 1")
+    if float(recovery.get("max_area_ratio", 0.95)) < float(
+        recovery.get("min_area_ratio", 0.001)
+    ):
+        raise WorkflowConfigError("fusion.recovery area ratios must be ordered")
+    for key in (
+        "max_tables_per_document",
+        "max_proposals_per_document",
+        "max_proposals_per_table",
+        "max_requests_per_document",
+    ):
+        field = recovery.get(key)
+        if field is not None and (
+            isinstance(field, bool) or not isinstance(field, int) or field < 0
+        ):
+            raise WorkflowConfigError(
+                f"fusion.recovery.{key} must be a non-negative integer"
+            )
+    for key in ("timeout_seconds", "render_scale"):
+        field = recovery.get(key)
+        if field is not None and (
+            isinstance(field, bool)
+            or not isinstance(field, (int, float))
+            or float(field) <= 0
+        ):
+            raise WorkflowConfigError(f"fusion.recovery.{key} must be positive")
+    for key in ("max_tokens", "cache_pages"):
+        field = recovery.get(key)
+        if field is not None and (
+            isinstance(field, bool) or not isinstance(field, int) or field < 1
+        ):
+            raise WorkflowConfigError(
+                f"fusion.recovery.{key} must be a positive integer"
+            )
+    recovery_temperature = recovery.get("temperature", 0.0)
+    if (
+        isinstance(recovery_temperature, bool)
+        or not isinstance(recovery_temperature, (int, float))
+        or not 0 <= float(recovery_temperature) <= 2
+    ):
+        raise WorkflowConfigError(
+            "fusion.recovery.temperature must be between 0 and 2"
+        )
+    recovery_top_p = recovery.get("top_p", 1.0)
+    if (
+        isinstance(recovery_top_p, bool)
+        or not isinstance(recovery_top_p, (int, float))
+        or not 0 < float(recovery_top_p) <= 1
+    ):
+        raise WorkflowConfigError(
+            "fusion.recovery.top_p must be greater than 0 and at most 1"
+        )
+    recovery_seed = recovery.get("seed")
+    if recovery_seed is not None and (
+        isinstance(recovery_seed, bool)
+        or not isinstance(recovery_seed, int)
+        or not -(2**63) <= recovery_seed < 2**63
+    ):
+        raise WorkflowConfigError(
+            "fusion.recovery.seed must be a signed 64-bit integer"
+        )
+    recovery_jpeg_quality = recovery.get("jpeg_quality", 92)
+    if (
+        not isinstance(recovery_jpeg_quality, int)
+        or not 1 <= recovery_jpeg_quality <= 100
+    ):
+        raise WorkflowConfigError(
+            "fusion.recovery.jpeg_quality must be from 1 to 100"
+        )
     selection_policy = recognizer.get("selection_policy", "conservative")
     if selection_policy not in {"conservative", "vlm_primary"}:
         raise WorkflowConfigError(
@@ -285,6 +387,7 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         "assumed_vlm_confidence",
         "min_batch_acceptable_ratio",
         "vlm_primary_min_quality",
+        "recovered_empty_min_confidence",
     ):
         value = recognizer.get(key)
         if value is not None and (
@@ -350,6 +453,16 @@ def _validate_fusion_config(fusion_config: Any) -> None:
     ):
         raise WorkflowConfigError(
             "fusion.recognizer.max_requests_per_document must be a "
+            "non-negative integer"
+        )
+    max_image_limit_retries = recognizer.get("max_image_limit_retries", 2)
+    if (
+        isinstance(max_image_limit_retries, bool)
+        or not isinstance(max_image_limit_retries, int)
+        or max_image_limit_retries < 0
+    ):
+        raise WorkflowConfigError(
+            "fusion.recognizer.max_image_limit_retries must be a "
             "non-negative integer"
         )
     temperature = recognizer.get("temperature", 0.0)
@@ -1337,6 +1450,7 @@ def fuse_output_trees(
     settings = FusionSettings.from_mapping(fusion_config)
     verifier_config = fusion_config.get("verifier", {})
     recognizer_config = fusion_config.get("recognizer", {})
+    recovery_config = fusion_config.get("recovery", {})
     summary = {"documents": {}, "failed": {}}
 
     for stem, hybrid_path in hybrid_files.items():
@@ -1348,6 +1462,7 @@ def fuse_output_trees(
             continue
         verifier = None
         recognizer = None
+        recovery_reviewer = None
         try:
             if verifier_config.get("enabled", False) and document_path is not None:
                 verifier_base_url = str(verifier_config.get("base_url") or proxy_url)
@@ -1365,6 +1480,19 @@ def fuse_output_trees(
                     document_path,
                     recognizer_config,
                 )
+            if settings.bbox_recovery_enabled and document_path is not None:
+                effective_recovery_config = dict(recognizer_config)
+                effective_recovery_config.update(recovery_config)
+                recovery_base_url = str(
+                    recovery_config.get("base_url")
+                    or recognizer_config.get("base_url")
+                    or proxy_url
+                )
+                recovery_reviewer = OpenAIBBoxRecoveryReviewer(
+                    recovery_base_url,
+                    document_path,
+                    effective_recovery_config,
+                )
             hybrid_middle = json.loads(hybrid_path.read_text(encoding="utf-8"))
             ocr_middle = json.loads(ocr_path.read_text(encoding="utf-8"))
             fused_middle, report = fuse_middle_json(
@@ -1378,6 +1506,9 @@ def fuse_output_trees(
                 ),
                 page_reconciler=verifier.reconcile_page if verifier else None,
                 bbox_recognizer=recognizer if recognizer else None,
+                bbox_recovery_reviewer=(
+                    recovery_reviewer if recovery_reviewer else None
+                ),
             )
             fused_path.write_text(
                 json.dumps(fused_middle, ensure_ascii=False, indent=4),
@@ -1406,6 +1537,8 @@ def fuse_output_trees(
                 verifier.close()
             if recognizer is not None:
                 recognizer.close()
+            if recovery_reviewer is not None:
+                recovery_reviewer.close()
     return summary
 
 
@@ -1417,14 +1550,14 @@ def run_extract(config: Mapping[str, Any], input_path: str | Path, output_path: 
     if fusion_enabled:
         child_names = (
             ("ocr", "fused")
-            if fusion_mode == "bbox_vlm"
+            if fusion_mode in {"bbox_vlm", "bbox_vlm_recovery"}
             else ("hybrid", "ocr", "fused")
         )
         for child_name in child_names:
             _require_empty_output(output_root / child_name, child_name.capitalize())
     server, thread, proxy_url = _start_parameter_proxy(config)
     try:
-        if fusion_enabled and fusion_mode == "bbox_vlm":
+        if fusion_enabled and fusion_mode in {"bbox_vlm", "bbox_vlm_recovery"}:
             ocr_output = output_root / "ocr"
             fused_output = output_root / "fused"
             _run_mineru_command(build_pipeline_command(config, input_path, ocr_output))
@@ -2251,13 +2384,18 @@ def run_doctor(config: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(fusion_config, Mapping)
         else {}
     )
+    recovery_config = (
+        fusion_config.get("recovery", {})
+        if isinstance(fusion_config, Mapping)
+        else {}
+    )
     recognizer_enabled = bool(
         isinstance(recognizer_config, Mapping)
         and (
             recognizer_config.get("enabled", False)
             or (
                 isinstance(fusion_config, Mapping)
-                and fusion_config.get("mode") == "bbox_vlm"
+                and fusion_config.get("mode") in {"bbox_vlm", "bbox_vlm_recovery"}
             )
         )
     )
@@ -2371,12 +2509,123 @@ def run_doctor(config: Mapping[str, Any]) -> dict[str, Any]:
         except Exception as exc:
             recognizer_status["error"] = type(exc).__name__
 
+    recovery_enabled = bool(
+        isinstance(recovery_config, Mapping)
+        and (
+            recovery_config.get("enabled", False)
+            or (
+                isinstance(fusion_config, Mapping)
+                and fusion_config.get("mode") == "bbox_vlm_recovery"
+            )
+        )
+    )
+    recovery_status: dict[str, Any] = {
+        "enabled": recovery_enabled,
+        "ready": not recovery_enabled,
+        "capability_trial_required": recovery_enabled,
+    }
+    if recovery_enabled:
+        recovery_url = str(
+            recovery_config.get("base_url")
+            or recognizer_config.get("base_url")
+            or upstream_url
+        ).rstrip("/")
+        configured_recovery_model = (
+            recovery_config.get("model") or recognizer_config.get("model")
+        )
+        recovery_status.update(
+            {
+                "url": recovery_url,
+                "reachable": False,
+                "status_code": None,
+                "configured_model": configured_recovery_model,
+                "structured_output_mode": "json_schema",
+                "structured_output_supported": False,
+            }
+        )
+        try:
+            import httpx
+
+            recovery_headers = {}
+            recovery_api_key_env = str(
+                recovery_config.get("api_key_env")
+                or recognizer_config.get("api_key_env")
+                or config["vllm"].get("api_key_env", "VLLM_API_KEY")
+            )
+            recovery_api_key = os.getenv(recovery_api_key_env)
+            if recovery_api_key:
+                recovery_headers["Authorization"] = f"Bearer {recovery_api_key}"
+            models_response = httpx.get(
+                recovery_url + "/v1/models",
+                headers=recovery_headers,
+                timeout=3.0,
+            )
+            recovery_status["status_code"] = models_response.status_code
+            recovery_status["reachable"] = models_response.is_success
+            model_ids = []
+            context_lengths = []
+            if models_response.is_success:
+                payload = models_response.json()
+                models = payload.get("data", []) if isinstance(payload, dict) else []
+                model_ids = [
+                    item["id"]
+                    for item in models
+                    if isinstance(item, dict) and isinstance(item.get("id"), str)
+                ]
+                context_lengths = [
+                    item["max_model_len"]
+                    for item in models
+                    if isinstance(item, dict)
+                    and isinstance(item.get("max_model_len"), int)
+                    and item["max_model_len"] > 1
+                ]
+            recovery_status["available_models"] = model_ids
+            recovery_status["model_available"] = (
+                bool(model_ids)
+                if not isinstance(configured_recovery_model, str)
+                or not configured_recovery_model
+                else configured_recovery_model in model_ids
+            )
+            recovery_status["max_model_len"] = (
+                min(context_lengths) if context_lengths else None
+            )
+            openapi_response = httpx.get(
+                recovery_url + "/openapi.json",
+                headers=recovery_headers,
+                timeout=3.0,
+            )
+            openapi = openapi_response.json() if openapi_response.is_success else {}
+            schemas = (
+                openapi.get("components", {}).get("schemas", {})
+                if isinstance(openapi, dict)
+                else {}
+            )
+            response_format_enum = (
+                schemas.get("ResponseFormat", {})
+                .get("properties", {})
+                .get("type", {})
+                .get("enum", [])
+                if isinstance(schemas, dict)
+                else []
+            )
+            recovery_status["structured_output_supported"] = (
+                "json_schema" in response_format_enum
+            )
+            recovery_status["ready"] = bool(
+                recovery_status["reachable"]
+                and recovery_status["model_available"]
+                and recovery_status["structured_output_supported"]
+            )
+        except Exception as exc:
+            recovery_status["error"] = type(exc).__name__
+
     missing_dependencies = [name for name, available in dependencies.items() if not available]
     ready = (
         local_mineru_source
         and not missing_dependencies
         and upstream_status["reachable"]
         and recognizer_status["ready"]
+        and recovery_status["ready"]
     )
     return {
         "ready": ready,
@@ -2388,6 +2637,7 @@ def run_doctor(config: Mapping[str, Any]) -> dict[str, Any]:
         "missing_dependencies": missing_dependencies,
         "upstream": upstream_status,
         "recognizer": recognizer_status,
+        "recovery": recovery_status,
     }
 
 

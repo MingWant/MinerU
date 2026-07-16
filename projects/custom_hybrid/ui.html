@@ -322,6 +322,7 @@
               <select id="extractionModeInput">
                 <option value="hybrid_fusion" selected>Hybrid Fusion</option>
                 <option value="bbox_vlm">OCR BBox + VLM</option>
+                <option value="bbox_vlm_recovery">OCR BBox + VLM Recovery</option>
               </select>
             </div>
             <div class="field field-wide">
@@ -375,6 +376,24 @@
             <div class="field field-wide">
               <label for="repetitionPenaltyInput">Repetition Penalty</label>
               <input id="repetitionPenaltyInput" type="number" min="0.01" max="2" step="0.01" value="1">
+            </div>
+          </div>
+        </details>
+
+        <details id="recoverySettings" class="advanced-settings">
+          <summary>Advanced BBox Recovery Settings</summary>
+          <div class="settings-grid">
+            <div class="field">
+              <label for="recoveryMaxTablesInput">Max Tables</label>
+              <input id="recoveryMaxTablesInput" type="number" min="0" max="1000" step="1" placeholder="Profile default">
+            </div>
+            <div class="field">
+              <label for="recoveryMaxProposalsInput">Max Proposals</label>
+              <input id="recoveryMaxProposalsInput" type="number" min="0" max="10000" step="1" placeholder="Profile default">
+            </div>
+            <div class="field field-wide">
+              <label for="recoveryMinConfidenceInput">Minimum Geometry Confidence</label>
+              <input id="recoveryMinConfidenceInput" type="number" min="0" max="1" step="0.01" placeholder="0.85">
             </div>
           </div>
         </details>
@@ -455,6 +474,11 @@
           <div class="coverage-metric"><strong id="protocolEchoesValue">-</strong><span>Protocol Echoes</span></div>
           <div class="coverage-metric"><strong id="invalidRecognitionValue">-</strong><span>Invalid VLM Outputs</span></div>
           <div class="coverage-metric"><strong id="recognitionErrorsValue">-</strong><span>Recognition Errors</span></div>
+          <div class="coverage-metric"><strong id="recognitionRebatchesValue">-</strong><span>Image-Limit Rebatches</span></div>
+          <div class="coverage-metric"><strong id="recoveryTablesValue">-</strong><span>Recovery Tables Reviewed</span></div>
+          <div class="coverage-metric"><strong id="recoveryAddedValue">-</strong><span>Recovered Boxes Added</span></div>
+          <div class="coverage-metric"><strong id="recoveryAdjustedValue">-</strong><span>Recovered Boxes Adjusted</span></div>
+          <div class="coverage-metric"><strong id="recoveryRejectedValue">-</strong><span>Recovery Proposals Rejected</span></div>
         </div>
         <div id="fusionEmpty" class="result-empty">Fusion statistics will appear here.</div>
         <h3 id="fusionReportTitle" class="fusion-section-title hidden">Fusion Report</h3>
@@ -480,6 +504,10 @@
   const seedInput = document.querySelector('#seedInput');
   const maxTokensInput = document.querySelector('#maxTokensInput');
   const repetitionPenaltyInput = document.querySelector('#repetitionPenaltyInput');
+  const recoverySettings = document.querySelector('#recoverySettings');
+  const recoveryMaxTablesInput = document.querySelector('#recoveryMaxTablesInput');
+  const recoveryMaxProposalsInput = document.querySelector('#recoveryMaxProposalsInput');
+  const recoveryMinConfidenceInput = document.querySelector('#recoveryMinConfidenceInput');
   const submitButton = document.querySelector('#submitButton');
   const clearButton = document.querySelector('#clearButton');
   const taskState = document.querySelector('#taskState');
@@ -513,6 +541,10 @@
   const parameterInputs = [
     extractionModeInput, costProfileInput, effortInput, methodInput, langInput, temperatureInput,
     topPInput, seedInput, maxTokensInput, repetitionPenaltyInput,
+    recoveryMaxTablesInput, recoveryMaxProposalsInput, recoveryMinConfidenceInput,
+  ];
+  const recoveryInputs = [
+    recoveryMaxTablesInput, recoveryMaxProposalsInput, recoveryMinConfidenceInput,
   ];
   const stageOrder = ['prepare', 'service', 'upload', 'queue', 'parse', 'build', 'done'];
 
@@ -568,12 +600,21 @@
     fileInput.disabled = busy;
     dropZone.classList.toggle('disabled', busy);
     parameterInputs.forEach(input => { input.disabled = busy; });
+    syncRecoveryControls();
     submitButton.disabled = busy || !selectedFiles.length || !serviceOnline;
     clearButton.disabled = busy || !selectedFiles.length;
     submitButton.textContent = busy
       ? 'Converting...'
       : (activeTaskId ? 'Convert Again' : 'Convert');
   }
+
+  function syncRecoveryControls() {
+    const enabled = extractionModeInput.value === 'bbox_vlm_recovery';
+    recoverySettings.classList.toggle('disabled', !enabled);
+    recoveryInputs.forEach(input => { input.disabled = taskBusy || !enabled; });
+  }
+
+  extractionModeInput.addEventListener('change', syncRecoveryControls);
 
   function renderFiles() {
     fileList.innerHTML = selectedFiles.map(file => `
@@ -890,7 +931,9 @@
     } else if (status.status === 'processing') {
       message.textContent = extractionModeInput.value === 'bbox_vlm'
         ? 'Running Pipeline OCR, local Table BBox recognition, and safe text fusion.'
-        : 'Running Hybrid extraction, Pipeline OCR, and fusion.';
+        : extractionModeInput.value === 'bbox_vlm_recovery'
+          ? 'Reviewing suspicious Table geometry, recovering content boxes, and transcribing local crops.'
+          : 'Running Hybrid extraction, Pipeline OCR, and fusion.';
       setStage('parse', ['prepare', 'service', 'upload', 'queue']);
     } else if (status.status === 'completed') {
       message.textContent = 'Conversion completed. You can convert the same files again.';
@@ -901,7 +944,7 @@
   }
 
   function renderCoverageSummary(report) {
-    const totals = {total: 0, matched: 0, recovered: 0, uncovered: 0, unreliableTables: 0, keyValuePairs: 0, vlmRecognized: 0, ocrRetained: 0, protocolEchoes: 0, invalidRecognition: 0, recognitionErrors: 0};
+    const totals = {total: 0, matched: 0, recovered: 0, uncovered: 0, unreliableTables: 0, keyValuePairs: 0, vlmRecognized: 0, ocrRetained: 0, protocolEchoes: 0, invalidRecognition: 0, recognitionErrors: 0, recognitionRebatches: 0, recoveryTables: 0, recoveryAdded: 0, recoveryAdjusted: 0, recoveryRejected: 0};
     const documents = report && report.documents ? Object.values(report.documents) : [];
     documents.forEach(documentResult => {
       const counts = documentResult && documentResult.counts ? documentResult.counts : {};
@@ -916,6 +959,11 @@
       totals.protocolEchoes += Number(counts.bbox_recognition_protocol_echoes || 0);
       totals.invalidRecognition += Number(counts.bbox_recognition_invalid_outputs || 0);
       totals.recognitionErrors += Number(counts.bbox_recognition_errors || 0);
+      totals.recognitionRebatches += Number(counts.bbox_recognition_rebatches || 0);
+      totals.recoveryTables += Number(counts.bbox_recovery_tables_reviewed || 0);
+      totals.recoveryAdded += Number(counts.bbox_recovery_added || 0);
+      totals.recoveryAdjusted += Number(counts.bbox_recovery_adjusted || 0);
+      totals.recoveryRejected += Number(counts.bbox_recovery_rejected || 0);
     });
     const coverage = totals.total ? ((totals.matched + totals.recovered) / totals.total) * 100 : 100;
     document.querySelector('#coverageValue').textContent = `${coverage.toFixed(1)}%`;
@@ -928,6 +976,11 @@
     document.querySelector('#protocolEchoesValue').textContent = String(totals.protocolEchoes);
     document.querySelector('#invalidRecognitionValue').textContent = String(totals.invalidRecognition);
     document.querySelector('#recognitionErrorsValue').textContent = String(totals.recognitionErrors);
+    document.querySelector('#recognitionRebatchesValue').textContent = String(totals.recognitionRebatches);
+    document.querySelector('#recoveryTablesValue').textContent = String(totals.recoveryTables);
+    document.querySelector('#recoveryAddedValue').textContent = String(totals.recoveryAdded);
+    document.querySelector('#recoveryAdjustedValue').textContent = String(totals.recoveryAdjusted);
+    document.querySelector('#recoveryRejectedValue').textContent = String(totals.recoveryRejected);
     coverageSummary.classList.add('visible');
   }
 
@@ -997,6 +1050,7 @@
     try {
       const health = await jsonResponse(await fetch('/api/health'));
       applyParameterDefaults(health.task_parameter_defaults);
+      syncRecoveryControls();
       serviceOnline = true;
       serverStatus.className = 'service-status online';
       serverStatus.lastElementChild.textContent = 'Remote service online';
@@ -1040,6 +1094,9 @@
       seed: seedInput.value,
       max_tokens: maxTokensInput.value,
       repetition_penalty: repetitionPenaltyInput.value,
+      recovery_max_tables: extractionModeInput.value === 'bbox_vlm_recovery' ? recoveryMaxTablesInput.value : '',
+      recovery_max_proposals: extractionModeInput.value === 'bbox_vlm_recovery' ? recoveryMaxProposalsInput.value : '',
+      recovery_min_confidence: extractionModeInput.value === 'bbox_vlm_recovery' ? recoveryMinConfidenceInput.value : '',
     };
     Object.entries(taskParameters).forEach(([name, value]) => {
       if (value !== '') form.append(name, value);
@@ -1061,6 +1118,7 @@
 
   resetResults();
   renderOriginalPreview();
+  syncRecoveryControls();
   checkHealth();
 </script>
 </body>

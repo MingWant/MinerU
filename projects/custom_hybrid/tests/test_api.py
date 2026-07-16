@@ -19,7 +19,7 @@ REPOSITORY_ROOT = Path(__file__).parents[3]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from projects.custom_hybrid.api import create_app
+from projects.custom_hybrid.api import _normalize_task_parameters, create_app
 from projects.custom_hybrid.api_client import build_parser, collect_inputs
 
 
@@ -453,13 +453,48 @@ class CustomHybridApiTests(unittest.TestCase):
             "vlm_primary",
         )
         self.assertTrue(fusion["recognizer"]["include_row_image"])
-        self.assertTrue(fusion["recognizer"]["include_table_image"])
+        self.assertFalse(fusion["recognizer"]["include_table_image"])
+        self.assertEqual(fusion["recognizer"]["max_images_per_request"], 8)
+        self.assertEqual(fusion["recognizer"]["max_image_limit_retries"], 2)
         self.assertEqual(fusion["recognizer"]["temperature"], 0.2)
         self.assertEqual(fusion["recognizer"]["top_p"], 0.9)
         self.assertEqual(fusion["recognizer"]["seed"], 123)
         self.assertEqual(fusion["recognizer"]["max_tokens"], 768)
         self.assertFalse(fusion["verifier"]["enabled"])
         self.assertFalse(fusion["reconciliation"]["enabled"])
+
+        quality = _normalize_task_parameters(
+            cost_profile="quality",
+            extraction_mode="bbox_vlm",
+        )
+        self.assertTrue(
+            quality["fusion"]["recognizer"]["include_table_image"]
+        )
+        recovery = _normalize_task_parameters(
+            cost_profile="balanced",
+            extraction_mode="bbox_vlm_recovery",
+            temperature=0.1,
+            seed=7,
+            recovery_max_tables=4,
+            recovery_max_proposals=40,
+            recovery_min_confidence=0.9,
+        )
+        self.assertEqual(recovery["fusion"]["mode"], "bbox_vlm_recovery")
+        self.assertTrue(recovery["fusion"]["recovery"]["enabled"])
+        self.assertEqual(
+            recovery["fusion"]["recovery"]["max_tables_per_document"],
+            4,
+        )
+        self.assertEqual(
+            recovery["fusion"]["recovery"]["max_proposals_per_document"],
+            40,
+        )
+        self.assertEqual(
+            recovery["fusion"]["recovery"]["min_confidence"],
+            0.9,
+        )
+        self.assertEqual(recovery["fusion"]["recovery"]["temperature"], 0.1)
+        self.assertEqual(recovery["fusion"]["recovery"]["seed"], 7)
 
     def test_task_parameter_validation_rejects_out_of_range_values(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -491,6 +526,13 @@ class CustomHybridApiTests(unittest.TestCase):
                 )
                 self.assertEqual(response.status_code, 400)
                 self.assertIn("extraction_mode", response.json()["detail"])
+                response = client.post(
+                    "/tasks",
+                    files={"files": ("invoice.pdf", b"pdf")},
+                    data={"recovery_min_confidence": "1.2"},
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("recovery_min_confidence", response.json()["detail"])
 
     def test_client_collects_supported_inputs_only(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -517,6 +559,26 @@ class CustomHybridApiTests(unittest.TestCase):
 
         self.assertEqual(args.cost_profile, "balanced")
         self.assertEqual(args.extraction_mode, "bbox_vlm")
+
+        recovery_args = build_parser().parse_args(
+            [
+                "--url",
+                "http://127.0.0.1:6108",
+                "--input",
+                "invoice.pdf",
+                "--output",
+                "result.zip",
+                "--extraction-mode",
+                "bbox_vlm_recovery",
+                "--recovery-max-tables",
+                "4",
+                "--recovery-min-confidence",
+                "0.9",
+            ]
+        )
+        self.assertEqual(recovery_args.extraction_mode, "bbox_vlm_recovery")
+        self.assertEqual(recovery_args.recovery_max_tables, 4)
+        self.assertEqual(recovery_args.recovery_min_confidence, 0.9)
 
 
 if __name__ == "__main__":

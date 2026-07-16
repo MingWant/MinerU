@@ -48,6 +48,9 @@ def parse_remote(
     jupyter_token: str | None = None,
     cost_profile: str | None = None,
     extraction_mode: str | None = None,
+    recovery_max_tables: int | None = None,
+    recovery_max_proposals: int | None = None,
+    recovery_min_confidence: float | None = None,
     timeout_seconds: float = 3600,
 ) -> Path:
     inputs = collect_inputs(input_path)
@@ -59,6 +62,9 @@ def parse_remote(
         for name, value in {
             "cost_profile": cost_profile,
             "extraction_mode": extraction_mode,
+            "recovery_max_tables": recovery_max_tables,
+            "recovery_max_proposals": recovery_max_proposals,
+            "recovery_min_confidence": recovery_min_confidence,
         }.items()
         if value is not None
     }
@@ -104,8 +110,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cost-profile", choices=("balanced", "quality"))
     parser.add_argument(
         "--extraction-mode",
-        choices=("hybrid_fusion", "bbox_vlm"),
+        choices=("hybrid_fusion", "bbox_vlm", "bbox_vlm_recovery"),
     )
+    parser.add_argument("--recovery-max-tables", type=int)
+    parser.add_argument("--recovery-max-proposals", type=int)
+    parser.add_argument("--recovery-min-confidence", type=float)
     parser.add_argument("--timeout-seconds", type=float, default=3600)
     return parser
 
@@ -124,6 +133,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         jupyter_token=jupyter_token,
         cost_profile=args.cost_profile,
         extraction_mode=args.extraction_mode,
+        recovery_max_tables=args.recovery_max_tables,
+        recovery_max_proposals=args.recovery_max_proposals,
+        recovery_min_confidence=args.recovery_min_confidence,
         timeout_seconds=args.timeout_seconds,
     )
     print(destination)

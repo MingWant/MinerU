@@ -11,7 +11,7 @@ import math
 import os
 import re
 import unicodedata
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from html import escape, unescape
 from pathlib import Path
@@ -35,7 +35,7 @@ from projects.custom_hybrid.table_fusion import (
 
 
 TEXT_SPAN_TYPES = {"text", "hyperlink"}
-FUSION_MODES = {"hybrid_fusion", "bbox_vlm"}
+FUSION_MODES = {"hybrid_fusion", "bbox_vlm", "bbox_vlm_recovery"}
 RECOGNITION_SELECTION_POLICIES = {"conservative", "vlm_primary"}
 TEXT_BLOCK_TYPES = {
     "text",
@@ -123,6 +123,16 @@ class FusionSettings:
     bbox_recognition_empty_ocr_enabled: bool = True
     bbox_recognition_selection_policy: str = "conservative"
     bbox_recognition_vlm_primary_min_quality: float = 0.5
+    bbox_recognition_recovered_empty_min_confidence: float = 0.9
+    bbox_recovery_enabled: bool = False
+    bbox_recovery_min_confidence: float = 0.85
+    bbox_recovery_min_area_ratio: float = 0.001
+    bbox_recovery_max_area_ratio: float = 0.95
+    bbox_recovery_duplicate_iou: float = 0.6
+    bbox_recovery_adjust_min_iou: float = 0.05
+    bbox_recovery_max_tables_per_document: int = 10
+    bbox_recovery_max_proposals_per_document: int = 100
+    bbox_recovery_max_proposals_per_table: int = 30
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "FusionSettings":
@@ -137,10 +147,13 @@ class FusionSettings:
         recognizer = value.get("recognizer", {})
         if not isinstance(recognizer, Mapping):
             recognizer = {}
+        recovery = value.get("recovery", {})
+        if not isinstance(recovery, Mapping):
+            recovery = {}
         selection_policy = str(
             recognizer.get("selection_policy", "conservative")
         )
-        if mode == "bbox_vlm":
+        if mode in {"bbox_vlm", "bbox_vlm_recovery"}:
             selection_policy = "vlm_primary"
         if selection_policy not in RECOGNITION_SELECTION_POLICIES:
             raise ValueError(
@@ -238,16 +251,17 @@ class FusionSettings:
                 reconciliation.get("max_candidates_per_page", 120)
             ),
             bbox_recognition_enabled=(
-                mode == "bbox_vlm" or bool(recognizer.get("enabled", False))
+                mode in {"bbox_vlm", "bbox_vlm_recovery"}
+                or bool(recognizer.get("enabled", False))
             ),
             bbox_recognition_normal_ocr_enabled=bool(
                 False
-                if mode == "bbox_vlm"
+                if mode in {"bbox_vlm", "bbox_vlm_recovery"}
                 else recognizer.get("normal_ocr_enabled", True)
             ),
             bbox_recognition_table_ocr_enabled=bool(
                 True
-                if mode == "bbox_vlm"
+                if mode in {"bbox_vlm", "bbox_vlm_recovery"}
                 else recognizer.get("table_ocr_enabled", True)
             ),
             bbox_recognition_prefer_vlm_for_unscored=bool(
@@ -290,6 +304,37 @@ class FusionSettings:
             bbox_recognition_vlm_primary_min_quality=float(
                 recognizer.get("vlm_primary_min_quality", 0.5)
             ),
+            bbox_recognition_recovered_empty_min_confidence=float(
+                recognizer.get("recovered_empty_min_confidence", 0.9)
+            ),
+            bbox_recovery_enabled=(
+                mode == "bbox_vlm_recovery"
+                or bool(recovery.get("enabled", False))
+            ),
+            bbox_recovery_min_confidence=float(
+                recovery.get("min_confidence", 0.85)
+            ),
+            bbox_recovery_min_area_ratio=float(
+                recovery.get("min_area_ratio", 0.001)
+            ),
+            bbox_recovery_max_area_ratio=float(
+                recovery.get("max_area_ratio", 0.95)
+            ),
+            bbox_recovery_duplicate_iou=float(
+                recovery.get("duplicate_iou", 0.6)
+            ),
+            bbox_recovery_adjust_min_iou=float(
+                recovery.get("adjust_min_iou", 0.05)
+            ),
+            bbox_recovery_max_tables_per_document=int(
+                recovery.get("max_tables_per_document", 10)
+            ),
+            bbox_recovery_max_proposals_per_document=int(
+                recovery.get("max_proposals_per_document", 100)
+            ),
+            bbox_recovery_max_proposals_per_table=int(
+                recovery.get("max_proposals_per_table", 30)
+            ),
         )
 
 
@@ -313,6 +358,10 @@ PageReconciler = Callable[
     Sequence[str] | None,
 ]
 BBoxRecognizer = Callable[
+    [int, Sequence[float], Sequence[Mapping[str, Any]]],
+    Mapping[str, Any] | None,
+]
+BBoxRecoveryReviewer = Callable[
     [int, Sequence[float], Sequence[Mapping[str, Any]]],
     Mapping[str, Any] | None,
 ]
@@ -721,6 +770,357 @@ def collect_unreliable_table_ocr_lines(
     )
     pair_key_value_fields(result)
     return result
+
+
+def _bbox_iou(left: Sequence[float], right: Sequence[float]) -> float:
+    intersection = _intersection_area(left, right)
+    left_area = max(0.0, left[2] - left[0]) * max(0.0, left[3] - left[1])
+    right_area = max(0.0, right[2] - right[0]) * max(0.0, right[3] - right[1])
+    union = left_area + right_area - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def _clip_bbox_to_outer(
+    bbox: Sequence[float],
+    outer: Sequence[float],
+) -> tuple[float, float, float, float] | None:
+    return _valid_bbox(
+        (
+            max(float(bbox[0]), float(outer[0])),
+            max(float(bbox[1]), float(outer[1])),
+            min(float(bbox[2]), float(outer[2])),
+            min(float(bbox[3]), float(outer[3])),
+        )
+    )
+
+
+def build_bbox_recovery_manifest(
+    page: Mapping[str, Any],
+    page_index: int,
+) -> list[dict[str, Any]]:
+    """Describe Pipeline Table/Cell geometry without granting mutation authority."""
+    manifest: list[dict[str, Any]] = []
+    for table_index, table in enumerate(
+        collect_structured_spans(page, page_index, {"table"})
+    ):
+        raw_cells = table.span.get("table_cells", [])
+        if not isinstance(raw_cells, list):
+            continue
+        cells = []
+        for cell_index, cell in enumerate(raw_cells):
+            if not isinstance(cell, Mapping):
+                continue
+            cell_bbox = _valid_bbox(cell.get("bbox"))
+            if cell_bbox is None or not _center_inside(cell_bbox, table.bbox):
+                continue
+            existing = []
+            raw_spans = cell.get("content_spans", [])
+            if isinstance(raw_spans, list):
+                for span_index, span in enumerate(raw_spans):
+                    if not isinstance(span, Mapping):
+                        continue
+                    bbox = _valid_bbox(span.get("bbox"))
+                    if bbox is None:
+                        continue
+                    existing.append(
+                        {
+                            "id": f"p{page_index}-t{table_index}-c{cell_index}-b{span_index}",
+                            "bbox": list(bbox),
+                            "text": _content_span_text(span),
+                            "source": "content_span",
+                        }
+                    )
+            if not existing:
+                content_bbox = _valid_bbox(cell.get("content_bbox"))
+                if content_bbox is not None:
+                    existing.append(
+                        {
+                            "id": f"p{page_index}-t{table_index}-c{cell_index}-content",
+                            "bbox": list(content_bbox),
+                            "text": str(cell.get("text", "")),
+                            "source": "content_bbox",
+                        }
+                    )
+            reasons = []
+            if not existing:
+                reasons.append("missing_content_bbox")
+            if isinstance(cell.get("text"), str) and cell["text"].strip() and not existing:
+                reasons.append("metadata_text_without_bbox")
+            if any(not _center_inside(item["bbox"], cell_bbox) for item in existing):
+                reasons.append("content_bbox_outside_cell")
+            cells.append(
+                {
+                    "id": f"p{page_index}-t{table_index}-c{cell_index}",
+                    "bbox": list(cell_bbox),
+                    "row_start": cell.get("row_start"),
+                    "row_end": cell.get("row_end"),
+                    "col_start": cell.get("col_start"),
+                    "col_end": cell.get("col_end"),
+                    "text": str(cell.get("text", "")),
+                    "existing": existing,
+                    "reasons": reasons,
+                }
+            )
+        if cells:
+            manifest.append(
+                {
+                    "id": f"p{page_index}-table-{table_index}",
+                    "bbox": list(table.bbox),
+                    "cells": cells,
+                }
+            )
+    return manifest
+
+
+def _bbox_recovery_lookup(
+    page: Mapping[str, Any],
+    page_index: int,
+) -> tuple[dict[str, dict[str, Any]], dict[str, tuple[dict[str, Any], str]]]:
+    cells: dict[str, dict[str, Any]] = {}
+    boxes: dict[str, tuple[dict[str, Any], str]] = {}
+    for table_index, table in enumerate(
+        collect_structured_spans(page, page_index, {"table"})
+    ):
+        raw_cells = table.span.get("table_cells", [])
+        if not isinstance(raw_cells, list):
+            continue
+        for cell_index, cell in enumerate(raw_cells):
+            if not isinstance(cell, dict):
+                continue
+            cell_id = f"p{page_index}-t{table_index}-c{cell_index}"
+            cells[cell_id] = cell
+            raw_spans = cell.get("content_spans", [])
+            if isinstance(raw_spans, list):
+                for span_index, span in enumerate(raw_spans):
+                    if isinstance(span, dict):
+                        boxes[
+                            f"{cell_id}-b{span_index}"
+                        ] = (span, "content_span")
+            if _valid_bbox(cell.get("content_bbox")) is not None:
+                boxes[f"{cell_id}-content"] = (cell, "content_bbox")
+    return cells, boxes
+
+
+def _page_recovery_invariant_snapshot(
+    page: Mapping[str, Any],
+) -> tuple[Any, ...]:
+    records = []
+    for table_index, table in enumerate(
+        collect_structured_spans(page, 0, {"table"})
+    ):
+        raw_cells = table.span.get("table_cells", [])
+        cell_records = []
+        if isinstance(raw_cells, list):
+            for cell_index, cell in enumerate(raw_cells):
+                if not isinstance(cell, Mapping):
+                    continue
+                cell_records.append(
+                    (
+                        cell_index,
+                        _valid_bbox(cell.get("bbox")),
+                        tuple(
+                            cell.get(key)
+                            for key in (
+                                "row_start",
+                                "row_end",
+                                "col_start",
+                                "col_end",
+                            )
+                        ),
+                    )
+                )
+        html = table.span.get("html")
+        parsed = parse_table_html(html) if isinstance(html, str) else None
+        records.append(
+            (
+                table_index,
+                table.bbox,
+                parsed.structure_signature if parsed is not None else None,
+                tuple(cell_records),
+            )
+        )
+    return tuple(records)
+
+
+def apply_bbox_recovery_proposals(
+    page: dict[str, Any],
+    page_index: int,
+    response: Mapping[str, Any] | None,
+    settings: FusionSettings,
+    remaining_document_budget: int,
+) -> tuple[dict[str, int], list[dict[str, Any]], list[dict[str, Any]], bool]:
+    """Apply only bounded content-box mutations; Table and Cell geometry stay fixed."""
+    stats = {
+        "proposals": 0,
+        "accepted": 0,
+        "added": 0,
+        "adjusted": 0,
+        "rejected": 0,
+        "errors": 0,
+    }
+    decisions: list[dict[str, Any]] = []
+    batches = []
+    original_page = copy.deepcopy(page)
+    before = _page_recovery_invariant_snapshot(page)
+    if not isinstance(response, Mapping):
+        stats["errors"] = 1
+        return stats, decisions, batches, True
+    raw_batches = response.get("batches", [])
+    if isinstance(raw_batches, list):
+        batches.extend(item for item in raw_batches if isinstance(item, dict))
+    raw_items = response.get("items", [])
+    if not isinstance(raw_items, list):
+        stats["errors"] = 1
+        return stats, decisions, batches, True
+    cells, boxes = _bbox_recovery_lookup(page, page_index)
+    table_counts: Counter[str] = Counter()
+    accepted_count = 0
+    for item in raw_items:
+        if not isinstance(item, Mapping):
+            stats["rejected"] += 1
+            continue
+        stats["proposals"] += 1
+        action = str(item.get("action", ""))
+        cell_id = item.get("cell_id")
+        target_id = item.get("target_id")
+        confidence = item.get("confidence")
+        bbox = _valid_bbox(item.get("bbox"))
+        decision = {
+            "kind": "bbox_recovery",
+            "page": page_index,
+            "action": action,
+            "cell_id": cell_id,
+            "target_id": target_id,
+            "bbox": list(bbox) if bbox is not None else item.get("bbox"),
+            "confidence": confidence,
+        }
+        reason = None
+        cell = cells.get(cell_id) if isinstance(cell_id, str) else None
+        cell_bbox = _valid_bbox(cell.get("bbox")) if cell is not None else None
+        table_key = cell_id.rsplit("-c", 1)[0] if isinstance(cell_id, str) else ""
+        if action not in {"add", "adjust"}:
+            reason = "unsupported_action"
+        elif cell is None or cell_bbox is None:
+            reason = "unknown_cell"
+        elif not isinstance(confidence, (int, float)) or float(confidence) < settings.bbox_recovery_min_confidence:
+            reason = "low_confidence"
+        elif bbox is None:
+            reason = "invalid_bbox"
+        elif accepted_count >= remaining_document_budget:
+            reason = "document_budget"
+        elif table_counts[table_key] >= settings.bbox_recovery_max_proposals_per_table:
+            reason = "table_budget"
+        if reason is None:
+            bbox = _clip_bbox_to_outer(bbox, cell_bbox)
+            if bbox is None:
+                reason = "bbox_outside_cell"
+        if reason is None:
+            cell_area = (cell_bbox[2] - cell_bbox[0]) * (cell_bbox[3] - cell_bbox[1])
+            bbox_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+            area_ratio = bbox_area / cell_area if cell_area > 0 else 0.0
+            if not settings.bbox_recovery_min_area_ratio <= area_ratio <= settings.bbox_recovery_max_area_ratio:
+                reason = "area_ratio_guard"
+        existing_bboxes = []
+        if cell is not None:
+            raw_spans = cell.get("content_spans", [])
+            if isinstance(raw_spans, list):
+                existing_bboxes.extend(
+                    valid
+                    for span in raw_spans
+                    if isinstance(span, Mapping)
+                    for valid in [_valid_bbox(span.get("bbox"))]
+                    if valid is not None
+                )
+            content_bbox = _valid_bbox(cell.get("content_bbox"))
+            if content_bbox is not None:
+                existing_bboxes.append(content_bbox)
+        target = boxes.get(target_id) if isinstance(target_id, str) else None
+        if reason is None and action == "add" and any(
+            _bbox_iou(bbox, existing) >= settings.bbox_recovery_duplicate_iou
+            for existing in existing_bboxes
+        ):
+            reason = "duplicate_bbox"
+        if reason is None and action == "add" and target_id not in {"", None}:
+            reason = "unexpected_add_target"
+        if reason is None and action == "adjust":
+            if (
+                target is None
+                or not isinstance(target_id, str)
+                or not isinstance(cell_id, str)
+                or not target_id.startswith(cell_id + "-")
+            ):
+                reason = "unknown_target"
+            else:
+                raw_target, target_source = target
+                original_bbox = _valid_bbox(
+                    raw_target.get("bbox")
+                    if target_source == "content_span"
+                    else raw_target.get("content_bbox")
+                )
+                if original_bbox is None:
+                    reason = "invalid_target_bbox"
+                elif _bbox_iou(bbox, original_bbox) < settings.bbox_recovery_adjust_min_iou:
+                    reason = "adjust_iou_guard"
+        if reason is not None:
+            stats["rejected"] += 1
+            decision.update(result="rejected", reason=reason)
+            decisions.append(decision)
+            continue
+        recovery_metadata = {
+            "fusion_recovery_source": "vlm_geometry_reviewer",
+            "fusion_recovery_confidence": float(confidence),
+            "fusion_recovery_action": action,
+        }
+        if action == "add":
+            raw_spans = cell.setdefault("content_spans", [])
+            if not isinstance(raw_spans, list):
+                raw_spans = []
+                cell["content_spans"] = raw_spans
+            raw_spans.append(
+                {
+                    "bbox": list(bbox),
+                    "text": "",
+                    **recovery_metadata,
+                }
+            )
+            stats["added"] += 1
+        else:
+            raw_target, target_source = target
+            if target_source == "content_span":
+                raw_target["fusion_recovery_original_bbox"] = copy.deepcopy(
+                    raw_target.get("bbox")
+                )
+                raw_target["bbox"] = list(bbox)
+                raw_target.update(recovery_metadata)
+            else:
+                raw_target["fusion_recovery_original_content_bbox"] = copy.deepcopy(
+                    raw_target.get("content_bbox")
+                )
+                raw_target["content_bbox"] = list(bbox)
+                raw_target.update(recovery_metadata)
+            stats["adjusted"] += 1
+        accepted_count += 1
+        table_counts[table_key] += 1
+        stats["accepted"] += 1
+        decision.update(result="accepted", bbox=list(bbox))
+        decisions.append(decision)
+    unchanged = before == _page_recovery_invariant_snapshot(page)
+    if not unchanged:
+        page.clear()
+        page.update(original_page)
+        rolled_back = stats["accepted"]
+        stats["accepted"] = 0
+        stats["added"] = 0
+        stats["adjusted"] = 0
+        stats["rejected"] += rolled_back
+        stats["errors"] += 1
+        for decision in decisions:
+            if decision.get("result") == "accepted":
+                decision.update(
+                    result="rejected",
+                    reason="table_geometry_invariant_rollback",
+                )
+    return stats, decisions, batches, unchanged
 
 
 def _recognition_context_bbox(
@@ -1287,6 +1687,7 @@ def apply_bbox_recognition(
         "ocr_kept": 0,
         "invalid_outputs": 0,
         "errors": 0,
+        "rebatches": 0,
         "high_risk_fallbacks": 0,
         "protocol_echoes": 0,
         "batch_quality_fallbacks": 0,
@@ -1305,7 +1706,7 @@ def apply_bbox_recognition(
         batches.append({"page": page_index, "status": "error", "error": type(exc).__name__})
     if not isinstance(response, Mapping):
         response = {}
-    for key in ("requests", "invalid_outputs", "errors"):
+    for key in ("requests", "invalid_outputs", "errors", "rebatches"):
         value = response.get(key)
         if isinstance(value, int) and value > 0:
             stats[key] += value
@@ -1355,6 +1756,14 @@ def apply_bbox_recognition(
         elif (
             candidate_reason == "empty_ocr_vlm_recovery"
             and candidate_id not in quality_passed_ids
+            and not (
+                isinstance(
+                    line.spans[0].get("fusion_recovery_confidence"),
+                    (int, float),
+                )
+                and float(line.spans[0]["fusion_recovery_confidence"])
+                >= settings.bbox_recognition_recovered_empty_min_confidence
+            )
         ):
             source = "ocr"
             reason = "empty_ocr_context_guard"
@@ -2601,6 +3010,7 @@ def fuse_middle_json(
     table_cell_candidate_chooser: TableCellCandidateChooser | None = None,
     page_reconciler: PageReconciler | None = None,
     bbox_recognizer: BBoxRecognizer | None = None,
+    bbox_recovery_reviewer: BBoxRecoveryReviewer | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Fuse OCR evidence into Hybrid preproc blocks and return a detailed audit report."""
     fused = copy.deepcopy(hybrid_middle)
@@ -2649,6 +3059,7 @@ def fuse_middle_json(
         "bbox_recognition_ocr_kept": 0,
         "bbox_recognition_invalid_outputs": 0,
         "bbox_recognition_errors": 0,
+        "bbox_recognition_rebatches": 0,
         "bbox_recognition_high_risk_fallbacks": 0,
         "bbox_recognition_protocol_echoes": 0,
         "bbox_recognition_batch_quality_fallbacks": 0,
@@ -2657,6 +3068,17 @@ def fuse_middle_json(
         "bbox_recognition_candidate_limit": 0,
         "bbox_recognition_tables_rebuilt": 0,
         "bbox_recognition_table_rebuild_rejections": 0,
+        "bbox_recovery_table_candidates": 0,
+        "bbox_recovery_tables_reviewed": 0,
+        "bbox_recovery_table_budget_skips": 0,
+        "bbox_recovery_proposal_budget_skips": 0,
+        "bbox_recovery_requests": 0,
+        "bbox_recovery_proposals": 0,
+        "bbox_recovery_accepted": 0,
+        "bbox_recovery_added": 0,
+        "bbox_recovery_adjusted": 0,
+        "bbox_recovery_rejected": 0,
+        "bbox_recovery_errors": 0,
         "table_targets": 0,
         "table_fallback_replacements": 0,
         "table_conflicts": 0,
@@ -2705,8 +3127,97 @@ def fuse_middle_json(
     recognition_candidate_count = 0
     recognition_bbox_unchanged = True
     recognition_table_structure_unchanged = True
+    recovery_structure_unchanged = True
+    recovery_proposals_accepted = 0
+    recovery_batches: list[dict[str, Any]] = []
     for page_index, (hybrid_page, ocr_page) in enumerate(zip(hybrid_pages, ocr_pages)):
         page_size = hybrid_page.get("page_size", [0, 0])
+        if settings.bbox_recovery_enabled:
+            recovery_manifest = build_bbox_recovery_manifest(ocr_page, page_index)
+            counts["bbox_recovery_table_candidates"] += len(recovery_manifest)
+            if recovery_manifest and bbox_recovery_reviewer is None:
+                counts["bbox_recovery_errors"] += 1
+                recovery_batches.append(
+                    {
+                        "page": page_index,
+                        "status": "reviewer_unavailable",
+                        "tables": len(recovery_manifest),
+                    }
+                )
+            elif recovery_manifest:
+                try:
+                    recovery_response = bbox_recovery_reviewer(
+                        page_index,
+                        page_size,
+                        recovery_manifest,
+                    )
+                except Exception as exc:
+                    recovery_response = None
+                    counts["bbox_recovery_errors"] += 1
+                    recovery_batches.append(
+                        {
+                            "page": page_index,
+                            "status": "error",
+                            "error": type(exc).__name__,
+                        }
+                    )
+                if isinstance(recovery_response, Mapping):
+                    reviewed = recovery_response.get("tables_reviewed")
+                    reviewed_count = (
+                        int(reviewed)
+                        if isinstance(reviewed, int) and reviewed >= 0
+                        else len(recovery_manifest)
+                    )
+                    counts["bbox_recovery_tables_reviewed"] += reviewed_count
+                    table_budget_skips = recovery_response.get("table_budget_skips")
+                    if isinstance(table_budget_skips, int) and table_budget_skips > 0:
+                        counts["bbox_recovery_table_budget_skips"] += table_budget_skips
+                    proposal_budget_skips = recovery_response.get(
+                        "proposal_budget_skips"
+                    )
+                    if (
+                        isinstance(proposal_budget_skips, int)
+                        and proposal_budget_skips > 0
+                    ):
+                        counts[
+                            "bbox_recovery_proposal_budget_skips"
+                        ] += proposal_budget_skips
+                    requests = recovery_response.get("requests")
+                    if isinstance(requests, int) and requests > 0:
+                        counts["bbox_recovery_requests"] += requests
+                    response_errors = recovery_response.get("errors")
+                    if isinstance(response_errors, int) and response_errors > 0:
+                        counts["bbox_recovery_errors"] += response_errors
+                    remaining_proposals = max(
+                        settings.bbox_recovery_max_proposals_per_document
+                        - recovery_proposals_accepted,
+                        0,
+                    )
+                    (
+                        recovery_stats,
+                        recovery_decisions,
+                        page_recovery_batches,
+                        page_recovery_unchanged,
+                    ) = apply_bbox_recovery_proposals(
+                        ocr_page,
+                        page_index,
+                        recovery_response,
+                        settings,
+                        remaining_proposals,
+                    )
+                    for key in (
+                        "proposals",
+                        "accepted",
+                        "added",
+                        "adjusted",
+                        "rejected",
+                        "errors",
+                    ):
+                        counts[f"bbox_recovery_{key}"] += recovery_stats[key]
+                    recovery_proposals_accepted += recovery_stats["accepted"]
+                    recovery_structure_unchanged &= page_recovery_unchanged
+                    decisions.extend(recovery_decisions)
+                    recovery_batches.extend(page_recovery_batches)
         recognition_invariant_before = (
             _page_recognition_invariant_snapshot(ocr_page)
             if settings.bbox_recognition_enabled
@@ -2792,6 +3303,7 @@ def fuse_middle_json(
                     "ocr_kept",
                     "invalid_outputs",
                     "errors",
+                    "rebatches",
                     "high_risk_fallbacks",
                     "protocol_echoes",
                     "batch_quality_fallbacks",
@@ -2817,7 +3329,7 @@ def fuse_middle_json(
             recognition_table_structure_unchanged &= (
                 recognition_invariant_before[1] == recognition_invariant_after[1]
             )
-        if settings.mode == "bbox_vlm":
+        if settings.mode in {"bbox_vlm", "bbox_vlm_recovery"}:
             # This mode deliberately bypasses the normal Hybrid/OCR fusion stages.
             # The recognized Pipeline page already contains the selected text while
             # retaining every Pipeline-owned bbox and Table grid coordinate.
@@ -3180,10 +3692,15 @@ def fuse_middle_json(
             "bbox_unchanged": recognition_bbox_unchanged,
             "table_structure_unchanged": recognition_table_structure_unchanged,
         },
+        "recovery_invariants": {
+            "enabled": settings.bbox_recovery_enabled,
+            "table_and_cell_geometry_unchanged": recovery_structure_unchanged,
+        },
         "coverage": coverage,
         "table_quality": table_quality,
         "key_value_pairs": key_value_pairs,
         "recognition_batches": recognition_batches,
+        "recovery_batches": recovery_batches,
         "decisions": decisions,
     }
     return fused, report

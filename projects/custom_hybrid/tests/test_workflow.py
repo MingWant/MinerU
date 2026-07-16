@@ -562,6 +562,7 @@ class WorkflowTests(unittest.TestCase):
             ("context_reserve_tokens", 0, "context_reserve_tokens"),
             ("min_batch_acceptable_ratio", 1.1, "min_batch_acceptable_ratio"),
             ("batch_guard_min_candidates", 0, "batch_guard_min_candidates"),
+            ("max_image_limit_retries", -1, "max_image_limit_retries"),
         ):
             with self.subTest(key=key), tempfile.TemporaryDirectory() as temp_dir:
                 config = json.loads(source.read_text(encoding="utf-8"))
@@ -609,6 +610,16 @@ class WorkflowTests(unittest.TestCase):
                 ("fusion", "recognizer", "vlm_primary_min_quality"),
                 1.1,
                 "vlm_primary_min_quality",
+            ),
+            (
+                ("fusion", "recovery", "min_confidence"),
+                1.1,
+                "fusion.recovery.min_confidence",
+            ),
+            (
+                ("fusion", "recovery", "max_tables_per_document"),
+                -1,
+                "max_tables_per_document",
             ),
         )
         for path_parts, value, message in cases:
@@ -773,6 +784,44 @@ class WorkflowTests(unittest.TestCase):
         )
         stop_proxy.assert_called_once_with(server, thread)
 
+    def test_bbox_vlm_recovery_extract_uses_pipeline_only(self):
+        config = load_config(Path(__file__).parents[1] / "workflow.example.json")
+        config["fusion"]["mode"] = "bbox_vlm_recovery"
+        config["fusion"]["recovery"]["enabled"] = True
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "input.pdf"
+            input_path.write_bytes(b"pdf")
+            output_path = root / "output"
+            with (
+                mock.patch(
+                    "projects.custom_hybrid.workflow._start_parameter_proxy",
+                    return_value=(object(), object(), "http://127.0.0.1:32100"),
+                ),
+                mock.patch("projects.custom_hybrid.workflow._stop_parameter_proxy"),
+                mock.patch(
+                    "projects.custom_hybrid.workflow.build_pipeline_command",
+                    return_value=["pipeline-command"],
+                ) as build_pipeline,
+                mock.patch(
+                    "projects.custom_hybrid.workflow.build_mineru_command"
+                ) as build_hybrid,
+                mock.patch("projects.custom_hybrid.workflow._run_mineru_command"),
+                mock.patch(
+                    "projects.custom_hybrid.workflow.fuse_output_trees",
+                    return_value={"documents": {}, "failed": {}},
+                ) as fuse_trees,
+            ):
+                result = run_extract(config, input_path, output_path)
+
+        self.assertEqual(result, 0)
+        build_hybrid.assert_not_called()
+        build_pipeline.assert_called_once()
+        self.assertEqual(
+            fuse_trees.call_args.args[2:4],
+            (output_path.resolve() / "ocr", output_path.resolve() / "ocr"),
+        )
+
     def test_vllm_server_command_encodes_object_arguments_as_json(self):
         config = load_config(Path(__file__).parents[1] / "workflow.example.json")
         config["vllm"]["server_args"]["compilation_config"] = {"level": 2}
@@ -797,6 +846,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(report["upstream"]["reachable"])
         self.assertFalse(report["recognizer"]["enabled"])
         self.assertTrue(report["recognizer"]["ready"])
+        self.assertFalse(report["recovery"]["enabled"])
+        self.assertTrue(report["recovery"]["ready"])
 
     def test_doctor_checks_bbox_vlm_recognizer_model_and_structured_output(self):
         class Response:
@@ -854,6 +905,69 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(report["recognizer"]["structured_output_supported"])
         self.assertEqual(report["recognizer"]["max_model_len"], 8192)
         self.assertTrue(report["recognizer"]["capability_trial_required"])
+
+    def test_doctor_checks_recovery_endpoint_model_and_json_schema(self):
+        class Response:
+            def __init__(self, payload):
+                self.status_code = 200
+                self.is_success = True
+                self.payload = payload
+
+            def json(self):
+                return self.payload
+
+        config = load_config(Path(__file__).parents[1] / "workflow.example.json")
+        config["vllm"]["upstream_url"] = "http://vision.test"
+        config["fusion"]["mode"] = "bbox_vlm_recovery"
+        config["fusion"]["recognizer"]["model"] = "document-vision"
+        recovery = config["fusion"]["recovery"]
+        recovery["base_url"] = "http://recovery.test"
+        recovery["model"] = "geometry-reviewer"
+        models = Response(
+            {
+                "data": [
+                    {"id": "document-vision", "max_model_len": 8192},
+                ]
+            }
+        )
+        recovery_models = Response(
+            {
+                "data": [
+                    {"id": "geometry-reviewer", "max_model_len": 4096},
+                ]
+            }
+        )
+        openapi = Response(
+            {
+                "components": {
+                    "schemas": {
+                        "ChatCompletionRequest": {
+                            "properties": {"response_format": {}}
+                        },
+                        "ResponseFormat": {
+                            "properties": {
+                                "type": {
+                                    "enum": ["text", "json_object", "json_schema"]
+                                }
+                            }
+                        },
+                    }
+                }
+            }
+        )
+
+        with mock.patch(
+            "httpx.get",
+            side_effect=[models, models, openapi, recovery_models, openapi],
+        ):
+            report = run_doctor(config)
+
+        self.assertTrue(report["recovery"]["enabled"])
+        self.assertTrue(report["recovery"]["ready"])
+        self.assertEqual(report["recovery"]["url"], "http://recovery.test")
+        self.assertTrue(report["recovery"]["model_available"])
+        self.assertTrue(report["recovery"]["structured_output_supported"])
+        self.assertEqual(report["recovery"]["max_model_len"], 4096)
 
     def test_benchmark_ranks_runs_and_groups_tags(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1139,6 +1253,119 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(
             summary["documents"]["sample"]["counts"][
                 "bbox_recognition_requests"
+            ],
+            1,
+        )
+
+    def test_fuse_output_trees_wires_bbox_recovery_reviewer(self):
+        def build_table_middle():
+            return {
+                "pdf_info": [
+                    {
+                        "page_size": [200, 100],
+                        "preproc_blocks": [
+                            {
+                                "type": "table_body",
+                                "lines": [
+                                    {
+                                        "bbox": [10, 10, 190, 80],
+                                        "spans": [
+                                            {
+                                                "type": "table",
+                                                "bbox": [10, 10, 190, 80],
+                                                "html": "<table><tr><td>Value</td></tr></table>",
+                                                "table_cells": [
+                                                    {
+                                                        "bbox": [10, 10, 190, 80],
+                                                        "content_spans": [
+                                                            {
+                                                                "bbox": [20, 20, 170, 40],
+                                                                "text": "Value",
+                                                            }
+                                                        ],
+                                                        "text": "Value",
+                                                        "row_start": 0,
+                                                        "row_end": 0,
+                                                        "col_start": 0,
+                                                        "col_end": 0,
+                                                    }
+                                                ],
+                                            }
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            }
+
+        config = load_config(Path(__file__).parents[1] / "workflow.example.json")
+        config["fusion"]["mode"] = "bbox_vlm_recovery"
+        config["fusion"]["recognizer"]["base_url"] = "http://vision.test"
+        config["fusion"]["recovery"].update(
+            {
+                "enabled": True,
+                "base_url": "http://recovery.test",
+                "model": "geometry-reviewer",
+            }
+        )
+        recognizer = mock.Mock(
+            return_value={"items": [], "requests": 0, "errors": 0}
+        )
+        reviewer = mock.Mock(
+            return_value={
+                "items": [],
+                "tables_reviewed": 1,
+                "requests": 1,
+                "errors": 0,
+            }
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_pdf = root / "sample.pdf"
+            input_pdf.write_bytes(b"pdf")
+            ocr_dir = root / "ocr" / "sample" / "ocr"
+            ocr_dir.mkdir(parents=True)
+            (ocr_dir / "sample_middle.json").write_text(
+                json.dumps(build_table_middle()),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch(
+                    "projects.custom_hybrid.workflow.OpenAIBBoxRecognizer",
+                    return_value=recognizer,
+                ),
+                mock.patch(
+                    "projects.custom_hybrid.workflow.OpenAIBBoxRecoveryReviewer",
+                    return_value=reviewer,
+                ) as reviewer_class,
+                mock.patch(
+                    "projects.custom_hybrid.workflow._regenerate_fused_outputs"
+                ),
+            ):
+                summary = fuse_output_trees(
+                    config,
+                    input_pdf,
+                    root / "ocr",
+                    root / "ocr",
+                    root / "fused",
+                    "http://127.0.0.1:30001",
+                )
+
+        effective = dict(config["fusion"]["recognizer"])
+        effective.update(config["fusion"]["recovery"])
+        reviewer_class.assert_called_once_with(
+            "http://recovery.test",
+            input_pdf.resolve(),
+            effective,
+        )
+        reviewer.assert_called_once()
+        reviewer.close.assert_called_once_with()
+        self.assertFalse(summary["failed"])
+        self.assertEqual(
+            summary["documents"]["sample"]["counts"][
+                "bbox_recovery_tables_reviewed"
             ],
             1,
         )

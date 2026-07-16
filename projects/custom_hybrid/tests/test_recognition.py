@@ -30,6 +30,19 @@ class Response:
         return self.payload
 
 
+class ImageLimitError(Exception):
+    def __init__(self, response):
+        self.response = response
+        super().__init__("400 Bad Request")
+
+
+class ImageLimitResponse(Response):
+    text = "At most 8 image(s) may be provided in one prompt."
+
+    def raise_for_status(self):
+        raise ImageLimitError(self)
+
+
 class FakeHttpx:
     def __init__(self):
         self.requests = []
@@ -122,6 +135,15 @@ class StrictFakeHttpx(FakeHttpx):
                 "usage": {"prompt_tokens": 100, "completion_tokens": 20},
             }
         )
+
+
+class ImageLimitFakeHttpx(FakeHttpx):
+    def post(self, *_args, json=None, **kwargs):
+        image_count = len(json["messages"][0]["content"]) - 1
+        if image_count > 8:
+            self.requests.append(json)
+            return ImageLimitResponse({"detail": ImageLimitResponse.text})
+        return super().post(*_args, json=json, **kwargs)
 
 
 json_module = json
@@ -462,6 +484,126 @@ class BBoxRecognitionTests(unittest.TestCase):
             [item["id"] for item in result["items"]],
             ["p0-bbox-0", "p0-bbox-1", "p0-bbox-2"],
         )
+
+    def test_context_aware_packing_keeps_row_and_table_images_under_limit(self):
+        from PIL import Image
+
+        fake_httpx = FakeHttpx()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            Image.new("RGB", (400, 300), "white").save(image_path)
+            recognizer = OpenAIBBoxRecognizer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "vision-recognizer",
+                    "max_context_tokens": 8192,
+                    "max_batch_size": 8,
+                    "max_images_per_request": 8,
+                    "include_row_image": True,
+                    "include_table_image": True,
+                    "target_render_scale": 1.0,
+                    "context_render_scale": 1.0,
+                },
+            )
+            recognizer.httpx = fake_httpx
+            candidates = [
+                {
+                    "id": f"p0-bbox-{index}",
+                    "bbox": [10, 10 + index * 30, 100, 30 + index * 30],
+                    "ocr_text": f"Value {index}",
+                    "type": "table_ocr",
+                    "contexts": {
+                        "target": [10, 10 + index * 30, 100, 30 + index * 30],
+                        "row": [5, 5 + index * 30, 200, 35 + index * 30],
+                        "table": [0, 0, 220, 180],
+                    },
+                }
+                for index in range(4)
+            ]
+            try:
+                result = recognizer(0, [400, 300], candidates)
+            finally:
+                recognizer.close()
+
+        self.assertEqual(len(fake_httpx.requests), 2)
+        self.assertEqual(
+            [len(request["messages"][0]["content"]) - 1 for request in fake_httpx.requests],
+            [7, 3],
+        )
+        self.assertTrue(
+            all(batch["contexts_dropped"] == [] for batch in result["batches"])
+        )
+        for request in fake_httpx.requests:
+            prompt = request["messages"][0]["content"][0]["text"]
+            self.assertIn('"row": "image-', prompt)
+            self.assertIn('"table": "image-', prompt)
+
+    def test_server_image_limit_error_rebatches_and_retries(self):
+        from PIL import Image
+
+        fake_httpx = ImageLimitFakeHttpx()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            Image.new("RGB", (400, 300), "white").save(image_path)
+            recognizer = OpenAIBBoxRecognizer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "vision-recognizer",
+                    "max_context_tokens": 8192,
+                    "max_batch_size": 8,
+                    "max_images_per_request": 24,
+                    "max_image_limit_retries": 2,
+                    "include_row_image": True,
+                    "include_table_image": True,
+                    "target_render_scale": 1.0,
+                    "context_render_scale": 1.0,
+                },
+            )
+            recognizer.httpx = fake_httpx
+            candidates = [
+                {
+                    "id": f"p0-bbox-{index}",
+                    "bbox": [10, 10 + index * 30, 100, 30 + index * 30],
+                    "ocr_text": f"Value {index}",
+                    "type": "table_ocr",
+                    "contexts": {
+                        "target": [10, 10 + index * 30, 100, 30 + index * 30],
+                        "row": [5, 5 + index * 30, 200, 35 + index * 30],
+                        "table": [0, 0, 220, 180],
+                    },
+                }
+                for index in range(4)
+            ]
+            try:
+                result = recognizer(0, [400, 300], candidates)
+            finally:
+                recognizer.close()
+
+        self.assertEqual(len(fake_httpx.requests), 3)
+        self.assertGreater(
+            len(fake_httpx.requests[0]["messages"][0]["content"]) - 1,
+            8,
+        )
+        self.assertTrue(
+            all(
+                len(request["messages"][0]["content"]) - 1 <= 8
+                for request in fake_httpx.requests[1:]
+            )
+        )
+        self.assertEqual(result["requests"], 3)
+        self.assertEqual(result["rebatches"], 1)
+        self.assertEqual(result["errors"], 0)
+        rebatch = next(
+            batch
+            for batch in result["batches"]
+            if batch["status"] == "image_limit_rebatch"
+        )
+        self.assertEqual(rebatch["attempted_images"], 9)
+        self.assertEqual(rebatch["server_image_limit"], 8)
+        successful = [batch for batch in result["batches"] if "ids" in batch]
+        self.assertTrue(all(batch["contexts_dropped"] == [] for batch in successful))
 
 
 if __name__ == "__main__":

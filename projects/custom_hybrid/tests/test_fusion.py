@@ -14,7 +14,9 @@ from projects.custom_hybrid.fusion import (
     _parse_verifier_text,
     _parse_reconciliation_ids,
     apply_bbox_recognition,
+    apply_bbox_recovery_proposals,
     build_bbox_recognition_manifest,
+    build_bbox_recovery_manifest,
     assign_ocr_lines,
     collect_table_geometry_quality,
     collect_table_ocr_lines,
@@ -94,6 +96,225 @@ def structured_middle(
 
 
 class FusionTests(unittest.TestCase):
+    def test_bbox_vlm_recovery_settings_enable_reviewer_and_table_recognizer(self):
+        settings = FusionSettings.from_mapping(
+            {
+                "mode": "bbox_vlm_recovery",
+                "recognizer": {"enabled": False, "normal_ocr_enabled": True},
+                "recovery": {"enabled": False},
+            }
+        )
+
+        self.assertTrue(settings.bbox_recovery_enabled)
+        self.assertTrue(settings.bbox_recognition_enabled)
+        self.assertFalse(settings.bbox_recognition_normal_ocr_enabled)
+        self.assertTrue(settings.bbox_recognition_table_ocr_enabled)
+        self.assertEqual(settings.bbox_recognition_selection_policy, "vlm_primary")
+
+    def test_bbox_recovery_manifest_and_safety_gate_preserve_table_grid(self):
+        cells = [
+            {
+                "bbox": [10, 10, 100, 40],
+                "text": "Missing",
+                "row_start": 0,
+                "row_end": 0,
+                "col_start": 0,
+                "col_end": 0,
+            },
+            {
+                "bbox": [100, 10, 190, 40],
+                "content_spans": [
+                    {"bbox": [110, 18, 175, 32], "text": "Existing"}
+                ],
+                "text": "Existing",
+                "row_start": 0,
+                "row_end": 0,
+                "col_start": 1,
+                "col_end": 1,
+            },
+        ]
+        page = structured_middle(
+            "table",
+            html="<table><tr><td>Missing</td><td>Existing</td></tr></table>",
+            table_cells=cells,
+        )["pdf_info"][0]
+        manifest = build_bbox_recovery_manifest(page, 0)
+
+        self.assertEqual(manifest[0]["cells"][0]["reasons"], [
+            "missing_content_bbox",
+            "metadata_text_without_bbox",
+        ])
+        settings = FusionSettings.from_mapping({"mode": "bbox_vlm_recovery"})
+        stats, decisions, _batches, unchanged = apply_bbox_recovery_proposals(
+            page,
+            0,
+            {
+                "items": [
+                    {
+                        "action": "add",
+                        "cell_id": "p0-t0-c0",
+                        "target_id": "",
+                        "bbox": [20, 18, 85, 32],
+                        "confidence": 0.95,
+                    },
+                    {
+                        "action": "add",
+                        "cell_id": "p0-t0-c1",
+                        "target_id": "",
+                        "bbox": [110, 18, 175, 32],
+                        "confidence": 0.99,
+                    },
+                    {
+                        "action": "adjust",
+                        "cell_id": "p0-t0-c1",
+                        "target_id": "p0-t0-c1-b0",
+                        "bbox": [105, 16, 180, 34],
+                        "confidence": 0.95,
+                    },
+                ]
+            },
+            settings,
+            remaining_document_budget=10,
+        )
+
+        self.assertEqual(stats["added"], 1)
+        self.assertEqual(stats["adjusted"], 1)
+        self.assertEqual(stats["rejected"], 1)
+        self.assertEqual(decisions[1]["reason"], "duplicate_bbox")
+        self.assertTrue(unchanged)
+        recovered = page["preproc_blocks"][0]["lines"][0]["spans"][0][
+            "table_cells"
+        ][0]["content_spans"][0]
+        self.assertEqual(recovered["bbox"], [20.0, 18.0, 85.0, 32.0])
+        self.assertEqual(recovered["fusion_recovery_confidence"], 0.95)
+        adjusted = page["preproc_blocks"][0]["lines"][0]["spans"][0][
+            "table_cells"
+        ][1]["content_spans"][0]
+        self.assertEqual(adjusted["bbox"], [105.0, 16.0, 180.0, 34.0])
+        self.assertEqual(
+            adjusted["fusion_recovery_original_bbox"],
+            [110, 18, 175, 32],
+        )
+
+    def test_bbox_vlm_recovery_adds_box_then_transcribes_isolated_empty_crop(self):
+        pipeline = structured_middle(
+            "table",
+            html="<table><tr><td></td></tr></table>",
+            table_cells=[
+                {
+                    "bbox": [10, 10, 190, 40],
+                    "text": "",
+                    "row_start": 0,
+                    "row_end": 0,
+                    "col_start": 0,
+                    "col_end": 0,
+                }
+            ],
+        )
+
+        def review(_page, _size, manifest):
+            self.assertEqual(manifest[0]["cells"][0]["existing"], [])
+            return {
+                "tables_reviewed": 1,
+                "requests": 1,
+                "items": [
+                    {
+                        "action": "add",
+                        "cell_id": "p0-t0-c0",
+                        "target_id": "",
+                        "bbox": [20, 18, 170, 32],
+                        "confidence": 0.96,
+                    }
+                ],
+                "batches": [{"status": "ok", "table_id": "p0-table-0"}],
+            }
+
+        def recognize(_page, _size, candidates):
+            self.assertEqual(len(candidates), 1)
+            self.assertEqual(candidates[0]["bbox"], [20.0, 18.0, 170.0, 32.0])
+            return {
+                "items": [{"id": candidates[0]["id"], "text": "Recovered Value"}]
+            }
+
+        fused, report = fuse_middle_json(
+            pipeline,
+            pipeline,
+            FusionSettings.from_mapping({"mode": "bbox_vlm_recovery"}),
+            bbox_recovery_reviewer=review,
+            bbox_recognizer=recognize,
+        )
+
+        span = fused["pdf_info"][0]["preproc_blocks"][0]["lines"][0]["spans"][0]
+        self.assertIn("<td>Recovered Value</td>", span["html"])
+        self.assertEqual(report["counts"]["bbox_recovery_added"], 1)
+        self.assertEqual(report["counts"]["bbox_recognition_vlm_selected"], 1)
+        self.assertTrue(
+            report["recovery_invariants"]["table_and_cell_geometry_unchanged"]
+        )
+
+    def test_bbox_recovery_enforces_confidence_area_and_document_budgets(self):
+        page = structured_middle(
+            "table",
+            html="<table><tr><td></td></tr></table>",
+            table_cells=[
+                {
+                    "bbox": [10, 10, 190, 80],
+                    "text": "",
+                    "row_start": 0,
+                    "row_end": 0,
+                    "col_start": 0,
+                    "col_end": 0,
+                }
+            ],
+        )["pdf_info"][0]
+        settings = FusionSettings.from_mapping({"mode": "bbox_vlm_recovery"})
+        stats, decisions, _batches, unchanged = apply_bbox_recovery_proposals(
+            page,
+            0,
+            {
+                "items": [
+                    {
+                        "action": "add",
+                        "cell_id": "p0-t0-c0",
+                        "target_id": "",
+                        "bbox": [20, 20, 80, 35],
+                        "confidence": 0.5,
+                    },
+                    {
+                        "action": "add",
+                        "cell_id": "p0-t0-c0",
+                        "target_id": "",
+                        "bbox": [10, 10, 190, 80],
+                        "confidence": 0.99,
+                    },
+                    {
+                        "action": "add",
+                        "cell_id": "p0-t0-c0",
+                        "target_id": "",
+                        "bbox": [20, 20, 80, 35],
+                        "confidence": 0.99,
+                    },
+                    {
+                        "action": "add",
+                        "cell_id": "p0-t0-c0",
+                        "target_id": "",
+                        "bbox": [100, 20, 160, 35],
+                        "confidence": 0.99,
+                    },
+                ]
+            },
+            settings,
+            remaining_document_budget=1,
+        )
+
+        self.assertEqual(stats["accepted"], 1)
+        self.assertEqual(stats["rejected"], 3)
+        self.assertEqual(
+            [decision.get("reason") for decision in decisions],
+            ["low_confidence", "area_ratio_guard", None, "document_budget"],
+        )
+        self.assertTrue(unchanged)
+
     def test_bbox_vlm_settings_force_table_only_vlm_primary_recognition(self):
         settings = FusionSettings.from_mapping(
             {
@@ -987,6 +1208,7 @@ class FusionTests(unittest.TestCase):
                 "requests": 2,
                 "invalid_outputs": 2,
                 "errors": 1,
+                "rebatches": 1,
             }
 
         _fused, report = fuse_middle_json(
@@ -1000,6 +1222,7 @@ class FusionTests(unittest.TestCase):
         self.assertEqual(counts["bbox_recognition_requests"], 2)
         self.assertEqual(counts["bbox_recognition_invalid_outputs"], 2)
         self.assertEqual(counts["bbox_recognition_errors"], 1)
+        self.assertEqual(counts["bbox_recognition_rebatches"], 1)
         self.assertEqual(counts["bbox_recognition_ocr_kept"], 1)
         self.assertEqual(len(report["recognition_batches"]), 2)
 
