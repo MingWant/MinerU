@@ -13,7 +13,7 @@ import re
 import unicodedata
 from collections import OrderedDict
 from dataclasses import dataclass
-from html import unescape
+from html import escape, unescape
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -35,6 +35,8 @@ from projects.custom_hybrid.table_fusion import (
 
 
 TEXT_SPAN_TYPES = {"text", "hyperlink"}
+FUSION_MODES = {"hybrid_fusion", "bbox_vlm"}
+RECOGNITION_SELECTION_POLICIES = {"conservative", "vlm_primary"}
 TEXT_BLOCK_TYPES = {
     "text",
     "title",
@@ -66,10 +68,13 @@ class TextLine:
     spans: list[dict[str, Any]]
     block_type: str
     sequence_index: int = 0
+    source_span: dict[str, Any] | None = None
+    source_cell: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
 class FusionSettings:
+    mode: str = "hybrid_fusion"
     min_overlap: float = 0.5
     min_ocr_confidence: float = 0.82
     consensus_similarity: float = 0.94
@@ -101,13 +106,49 @@ class FusionSettings:
     page_reconciliation_enabled: bool = False
     max_page_reconciliations_per_document: int = 20
     max_page_reconciliation_candidates: int = 120
+    bbox_recognition_enabled: bool = False
+    bbox_recognition_normal_ocr_enabled: bool = True
+    bbox_recognition_table_ocr_enabled: bool = True
+    bbox_recognition_prefer_vlm_for_unscored: bool = True
+    bbox_recognition_min_similarity: float = 0.35
+    bbox_recognition_min_length_ratio: float = 0.4
+    bbox_recognition_max_length_ratio: float = 2.5
+    bbox_recognition_high_confidence_threshold: float = 0.95
+    bbox_recognition_assumed_confidence: float = 0.9
+    bbox_recognition_max_candidates_per_document: int = 1000
+    bbox_recognition_max_text_chars: int = 512
+    bbox_recognition_batch_guard_enabled: bool = True
+    bbox_recognition_min_batch_acceptable_ratio: float = 0.5
+    bbox_recognition_batch_guard_min_candidates: int = 3
+    bbox_recognition_empty_ocr_enabled: bool = True
+    bbox_recognition_selection_policy: str = "conservative"
+    bbox_recognition_vlm_primary_min_quality: float = 0.5
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "FusionSettings":
+        mode = str(value.get("mode", cls.mode))
+        if mode not in FUSION_MODES:
+            raise ValueError(
+                f"fusion.mode must be one of {', '.join(sorted(FUSION_MODES))}"
+            )
         reconciliation = value.get("reconciliation", {})
         if not isinstance(reconciliation, Mapping):
             reconciliation = {}
+        recognizer = value.get("recognizer", {})
+        if not isinstance(recognizer, Mapping):
+            recognizer = {}
+        selection_policy = str(
+            recognizer.get("selection_policy", "conservative")
+        )
+        if mode == "bbox_vlm":
+            selection_policy = "vlm_primary"
+        if selection_policy not in RECOGNITION_SELECTION_POLICIES:
+            raise ValueError(
+                "fusion.recognizer.selection_policy must be conservative or "
+                "vlm_primary"
+            )
         return cls(
+            mode=mode,
             min_overlap=float(value.get("min_overlap", cls.min_overlap)),
             min_ocr_confidence=float(
                 value.get("min_ocr_confidence", cls.min_ocr_confidence)
@@ -196,6 +237,59 @@ class FusionSettings:
             max_page_reconciliation_candidates=int(
                 reconciliation.get("max_candidates_per_page", 120)
             ),
+            bbox_recognition_enabled=(
+                mode == "bbox_vlm" or bool(recognizer.get("enabled", False))
+            ),
+            bbox_recognition_normal_ocr_enabled=bool(
+                False
+                if mode == "bbox_vlm"
+                else recognizer.get("normal_ocr_enabled", True)
+            ),
+            bbox_recognition_table_ocr_enabled=bool(
+                True
+                if mode == "bbox_vlm"
+                else recognizer.get("table_ocr_enabled", True)
+            ),
+            bbox_recognition_prefer_vlm_for_unscored=bool(
+                recognizer.get("prefer_vlm_for_unscored", True)
+            ),
+            bbox_recognition_min_similarity=float(
+                recognizer.get("min_similarity", 0.35)
+            ),
+            bbox_recognition_min_length_ratio=float(
+                recognizer.get("min_length_ratio", 0.4)
+            ),
+            bbox_recognition_max_length_ratio=float(
+                recognizer.get("max_length_ratio", 2.5)
+            ),
+            bbox_recognition_high_confidence_threshold=float(
+                recognizer.get("high_confidence_threshold", 0.95)
+            ),
+            bbox_recognition_assumed_confidence=float(
+                recognizer.get("assumed_vlm_confidence", 0.9)
+            ),
+            bbox_recognition_max_candidates_per_document=int(
+                recognizer.get("max_candidates_per_document", 1000)
+            ),
+            bbox_recognition_max_text_chars=int(
+                recognizer.get("max_text_chars", 512)
+            ),
+            bbox_recognition_batch_guard_enabled=bool(
+                recognizer.get("batch_guard_enabled", True)
+            ),
+            bbox_recognition_min_batch_acceptable_ratio=float(
+                recognizer.get("min_batch_acceptable_ratio", 0.5)
+            ),
+            bbox_recognition_batch_guard_min_candidates=int(
+                recognizer.get("batch_guard_min_candidates", 3)
+            ),
+            bbox_recognition_empty_ocr_enabled=bool(
+                recognizer.get("empty_ocr_enabled", True)
+            ),
+            bbox_recognition_selection_policy=selection_policy,
+            bbox_recognition_vlm_primary_min_quality=float(
+                recognizer.get("vlm_primary_min_quality", 0.5)
+            ),
         )
 
 
@@ -217,6 +311,10 @@ TableCellCandidateChooser = Callable[
 PageReconciler = Callable[
     [int, Sequence[float], str, Sequence[Mapping[str, Any]], Sequence[str]],
     Sequence[str] | None,
+]
+BBoxRecognizer = Callable[
+    [int, Sequence[float], Sequence[Mapping[str, Any]]],
+    Mapping[str, Any] | None,
 ]
 
 
@@ -516,17 +614,19 @@ def pair_key_value_fields(lines: Sequence[TextLine]) -> list[dict[str, Any]]:
     return pairs
 
 
-def collect_unreliable_table_ocr_lines(
+def collect_table_ocr_lines(
     page: Mapping[str, Any],
     page_index: int,
+    *,
+    unreliable_only: bool = False,
 ) -> list[TextLine]:
-    """Expose OCR content boxes from geometrically unreliable Tables as recall evidence."""
+    """Collect content-tight OCR lines while preserving their Table/Cell source."""
     result: list[TextLine] = []
     seen: set[tuple[str, tuple[float, float, float, float]]] = set()
     for table_index, assessment in enumerate(
         collect_table_geometry_quality(page, page_index)
     ):
-        if assessment.quality.reliable:
+        if unreliable_only and assessment.quality.reliable:
             continue
         raw_cells = assessment.span.get("table_cells", [])
         if not isinstance(raw_cells, list):
@@ -540,13 +640,16 @@ def collect_unreliable_table_ocr_lines(
                 if isinstance(raw_content_spans, list)
                 else []
             )
-            candidates: list[tuple[Mapping[str, Any], str, Any]] = []
+            candidates: list[
+                tuple[Mapping[str, Any], str, Any, dict[str, Any] | None]
+            ] = []
             for content_span in content_spans:
                 candidates.append(
                     (
                         content_span,
                         _content_span_text(content_span),
                         content_span.get("bbox"),
+                        content_span if isinstance(content_span, dict) else None,
                     )
                 )
             if not candidates:
@@ -556,14 +659,15 @@ def collect_unreliable_table_ocr_lines(
                         cell,
                         cell_text.strip() if isinstance(cell_text, str) else "",
                         cell.get("content_bbox"),
+                        None,
                     )
                 )
-            for content_span, text, raw_bbox in candidates:
+            for content_span, text, raw_bbox, source_span in candidates:
                 bbox = _valid_bbox(raw_bbox)
-                if not text or bbox is None or not _center_inside(bbox, assessment.bbox):
+                if bbox is None or not _center_inside(bbox, assessment.bbox):
                     continue
                 key = (normalize_for_comparison(text), bbox)
-                if not key[0] or key in seen:
+                if key in seen:
                     continue
                 seen.add(key)
                 score = _numeric_score(content_span.get("score"), cell.get("score"))
@@ -573,11 +677,17 @@ def collect_unreliable_table_ocr_lines(
                         "type": "text",
                         "content": text,
                         "bbox": list(bbox),
-                        "fusion_source": "unreliable_table_ocr",
+                        "fusion_source": "table_ocr",
                         "fusion_table_index": table_index,
                         "fusion_cell_index": cell_index,
+                        "fusion_table_bbox": list(assessment.bbox),
+                        "fusion_cell_bbox": list(_valid_bbox(cell.get("bbox")) or bbox),
+                        "fusion_table_geometry_reliable": assessment.quality.reliable,
                     }
                 )
+                for field in ("row_start", "row_end", "col_start", "col_end"):
+                    if isinstance(cell.get(field), int):
+                        span[f"fusion_{field}"] = int(cell[field])
                 if score is not None:
                     span["score"] = score
                 result.append(
@@ -589,13 +699,703 @@ def collect_unreliable_table_ocr_lines(
                         spans=[span],
                         block_type="table_ocr",
                         sequence_index=len(result),
+                        source_span=source_span,
+                        source_cell=cell if isinstance(cell, dict) else None,
                     )
                 )
     result.sort(key=lambda line: (line.bbox[1], line.bbox[0], line.bbox[3], line.bbox[2]))
     for sequence_index, line in enumerate(result):
         line.sequence_index = sequence_index
+    return result
+
+
+def collect_unreliable_table_ocr_lines(
+    page: Mapping[str, Any],
+    page_index: int,
+) -> list[TextLine]:
+    """Expose OCR content boxes from geometrically unreliable Tables as recall evidence."""
+    result = collect_table_ocr_lines(
+        page,
+        page_index,
+        unreliable_only=True,
+    )
     pair_key_value_fields(result)
     return result
+
+
+def _recognition_context_bbox(
+    target: TextLine,
+    lines: Sequence[TextLine],
+    axis: str,
+) -> tuple[float, float, float, float] | None:
+    metadata = target.spans[0]
+    table_index = metadata.get("fusion_table_index")
+    if not isinstance(table_index, int):
+        return None
+    field = "fusion_row_start" if axis == "row" else "fusion_col_start"
+    coordinate = metadata.get(field)
+    related = []
+    for line in lines:
+        other = line.spans[0]
+        if other.get("fusion_table_index") != table_index:
+            continue
+        if isinstance(coordinate, int) and other.get(field) == coordinate:
+            related.append(line.bbox)
+            continue
+        if isinstance(coordinate, int):
+            continue
+        if axis == "row":
+            target_center = (target.bbox[1] + target.bbox[3]) / 2
+            other_center = (line.bbox[1] + line.bbox[3]) / 2
+            tolerance = max(
+                target.bbox[3] - target.bbox[1],
+                line.bbox[3] - line.bbox[1],
+            )
+        else:
+            target_center = (target.bbox[0] + target.bbox[2]) / 2
+            other_center = (line.bbox[0] + line.bbox[2]) / 2
+            tolerance = max(
+                target.bbox[2] - target.bbox[0],
+                line.bbox[2] - line.bbox[0],
+            ) * 0.5
+        if abs(target_center - other_center) <= max(tolerance, 2.0):
+            related.append(line.bbox)
+    return _union_bbox(related)
+
+
+def build_bbox_recognition_manifest(
+    page_index: int,
+    lines: Sequence[TextLine],
+) -> tuple[list[dict[str, Any]], dict[str, TextLine]]:
+    """Build an immutable-bbox candidate manifest for the external recognizer."""
+    ordered = sorted(
+        lines,
+        key=lambda line: (line.bbox[1], line.bbox[0], line.bbox[3], line.bbox[2]),
+    )
+    manifest = []
+    by_id = {}
+    seen = set()
+    for line in ordered:
+        key = (line.bbox, normalize_for_comparison(line.text), line.block_type)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidate_id = f"p{page_index}-bbox-{len(manifest)}"
+        metadata = line.spans[0]
+        candidate = {
+            "id": candidate_id,
+            "bbox": [round(value, 3) for value in line.bbox],
+            "ocr_text": line.text,
+            "ocr_confidence": round(line.confidence, 6)
+            if line.confidence is not None
+            else None,
+            "type": line.block_type,
+            "contexts": {
+                "target": [round(value, 3) for value in line.bbox],
+            },
+        }
+        for name, bbox in (
+            ("cell", _valid_bbox(metadata.get("fusion_cell_bbox"))),
+            ("row", _recognition_context_bbox(line, ordered, "row")),
+            ("column", _recognition_context_bbox(line, ordered, "column")),
+            ("table", _valid_bbox(metadata.get("fusion_table_bbox"))),
+        ):
+            if bbox is not None:
+                candidate["contexts"][name] = [round(value, 3) for value in bbox]
+        manifest.append(candidate)
+        by_id[candidate_id] = line
+    return manifest, by_id
+
+
+def _page_recognition_invariant_snapshot(
+    page: Mapping[str, Any],
+) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+    """Snapshot geometry and Table grid structure while excluding recognized text."""
+    bbox_records: list[Any] = []
+
+    def visit(value: Any, path: tuple[Any, ...]) -> None:
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                child_path = path + (key,)
+                if isinstance(key, str) and (
+                    key == "bbox" or key.endswith("_bbox")
+                ):
+                    try:
+                        normalized = tuple(round(float(item), 6) for item in child)
+                    except (TypeError, ValueError):
+                        normalized = repr(child)
+                    bbox_records.append((child_path, normalized))
+                visit(child, child_path)
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                visit(child, path + (index,))
+
+    visit(page, ())
+    table_records = []
+    for index, table in enumerate(collect_structured_spans(page, 0, {"table"})):
+        html = table.span.get("html")
+        parsed = parse_table_html(html) if isinstance(html, str) else None
+        raw_cells = table.span.get("table_cells", [])
+        cell_grid = []
+        if isinstance(raw_cells, list):
+            for cell in raw_cells:
+                if not isinstance(cell, Mapping):
+                    continue
+                try:
+                    cell_grid.append(
+                        tuple(
+                            int(cell[key])
+                            for key in (
+                                "row_start",
+                                "row_end",
+                                "col_start",
+                                "col_end",
+                            )
+                        )
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+        table_records.append(
+            (
+                index,
+                parsed.valid if parsed is not None else False,
+                parsed.structure_signature if parsed is not None else None,
+                tuple(sorted(cell_grid)),
+            )
+        )
+    return tuple(bbox_records), tuple(table_records)
+
+
+_NUMERIC_DATE_RE = re.compile(
+    r"^\s*(\d{1,4})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1,4})"
+    r"(?:\s+\d{1,2}:\d{2})?\s*$"
+)
+_WORD_DATE_RE = re.compile(
+    r"^\s*(\d{1,2})\s+(JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|"
+    r"MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:TEMBER)?|OCT(?:OBER)?|"
+    r"NOV(?:EMBER)?|DEC(?:EMBER)?)\s+(\d{2}|\d{4})(?:\s+\d{1,2}:\d{2})?\s*$",
+    flags=re.IGNORECASE,
+)
+_AMOUNT_RE = re.compile(
+    r"^\s*[($€£¥]?\s*-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?\s*\)?\s*$"
+)
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9./_-]{2,63}$")
+_DATE_LIKE_RE = re.compile(
+    r"(?:\d{1,4}\s*[-/]\s*[A-Za-z0-9]{1,2}\s*[-/]\s*\d{1,4}|"
+    r"\d{1,2}\s+[A-Za-z0-9]{3,9}\s+[A-Za-z0-9]{2,4})",
+    flags=re.IGNORECASE,
+)
+_BBOX_PROTOCOL_ID_RE = re.compile(
+    r"^(?:p\d+(?:-bbox)?-\d+|(?:slot|image)[-_]?\d+)\W*$",
+    flags=re.IGNORECASE,
+)
+
+
+def _valid_date_candidate(text: str) -> bool:
+    word = _WORD_DATE_RE.fullmatch(text)
+    if word:
+        return 1 <= int(word.group(1)) <= 31
+    numeric = _NUMERIC_DATE_RE.fullmatch(text)
+    if not numeric:
+        return False
+    first, second, third = (int(item) for item in numeric.groups())
+    if len(numeric.group(1)) == 4:
+        year, month, day = first, second, third
+    else:
+        day, month, year = first, second, third
+    return 1 <= day <= 31 and 1 <= month <= 12 and 0 <= year <= 9999
+
+
+def _valid_amount_candidate(text: str) -> bool:
+    return bool(_AMOUNT_RE.fullmatch(text))
+
+
+def _valid_identifier_candidate(text: str) -> bool:
+    stripped = text.strip()
+    return bool(
+        _IDENTIFIER_RE.fullmatch(stripped)
+        and any(character.isdigit() for character in stripped)
+    )
+
+
+def _looks_like_identifier_field(text: str) -> bool:
+    stripped = text.strip()
+    if not _valid_identifier_candidate(stripped):
+        return False
+    digit_count = sum(character.isdigit() for character in stripped)
+    letter_count = sum(character.isalpha() for character in stripped)
+    return bool(
+        digit_count >= 2
+        or letter_count == 0
+        or any(separator in stripped for separator in ("/", ".", "_", "-"))
+        or (letter_count > 0 and stripped.upper() == stripped)
+    )
+
+
+def _recognition_field_type(ocr_text: str) -> str:
+    if len(ocr_text) <= 40 and (
+        _valid_date_candidate(ocr_text) or _DATE_LIKE_RE.search(ocr_text)
+    ):
+        return "date"
+    if len(ocr_text) <= 40 and re.search(
+        r"[$€£¥]|\d[,.][A-Za-z0-9]{1,2}\s*\)?\s*$",
+        ocr_text,
+    ):
+        return "amount"
+    if len(ocr_text.strip()) <= 64 and _looks_like_identifier_field(ocr_text):
+        return "identifier"
+    return "general"
+
+
+def _recognition_candidate_quality(text: str) -> float:
+    if not text.strip():
+        return 0.0
+    score = 1.0
+    if "\ufffd" in text:
+        score -= 0.6
+    if any(unicodedata.category(character) == "Cc" for character in text):
+        score -= 0.5
+    if re.search(r"(.{3,24})\1\1", normalize_for_comparison(text)):
+        score -= 0.35
+    if text.count("[") != text.count("]") or text.count("(") != text.count(")"):
+        score -= 0.15
+    return max(score, 0.0)
+
+
+def select_bbox_recognition_candidate(
+    line: TextLine,
+    vlm_text: str,
+    settings: FusionSettings,
+) -> tuple[str, str, str, float, float]:
+    """Select OCR or VLM without allowing a third candidate to be invented."""
+    ocr_text = line.text
+    vlm_text = vlm_text.strip()
+    similarity = text_similarity(ocr_text, vlm_text)
+    normalized_ocr = normalize_for_comparison(ocr_text)
+    normalized_vlm = normalize_for_comparison(vlm_text)
+    length_ratio = len(normalized_vlm) / max(len(normalized_ocr), 1)
+    field_type = _recognition_field_type(ocr_text)
+    if not vlm_text:
+        return "ocr", "empty_vlm_candidate", field_type, similarity, length_ratio
+    if _BBOX_PROTOCOL_ID_RE.fullmatch(vlm_text):
+        return "ocr", "bbox_protocol_id_echo", field_type, similarity, length_ratio
+    if len(vlm_text) > settings.bbox_recognition_max_text_chars:
+        return "ocr", "vlm_candidate_too_long", field_type, similarity, length_ratio
+    if not normalized_ocr:
+        if settings.bbox_recognition_empty_ocr_enabled:
+            return (
+                "vlm",
+                "empty_ocr_vlm_recovery",
+                "general",
+                similarity,
+                length_ratio,
+            )
+        return "ocr", "empty_ocr_disabled", "general", similarity, length_ratio
+    if normalized_ocr == normalized_vlm:
+        return "ocr", "recognition_consensus", field_type, similarity, length_ratio
+    validators = {
+        "date": _valid_date_candidate,
+        "amount": _valid_amount_candidate,
+        "identifier": _valid_identifier_candidate,
+    }
+    validator = validators.get(field_type)
+    if settings.bbox_recognition_selection_policy == "vlm_primary":
+        if not (
+            settings.bbox_recognition_min_length_ratio
+            <= length_ratio
+            <= settings.bbox_recognition_max_length_ratio
+        ):
+            return "ocr", "candidate_length_guard", field_type, similarity, length_ratio
+        if (
+            _recognition_candidate_quality(vlm_text)
+            < settings.bbox_recognition_vlm_primary_min_quality
+        ):
+            return (
+                "ocr",
+                "vlm_primary_quality_guard",
+                field_type,
+                similarity,
+                length_ratio,
+            )
+        if validator is not None and not validator(vlm_text):
+            return (
+                "ocr",
+                f"invalid_vlm_{field_type}",
+                field_type,
+                similarity,
+                length_ratio,
+            )
+        return "vlm", "bbox_vlm_primary", field_type, similarity, length_ratio
+    if validator is not None:
+        ocr_valid = validator(ocr_text)
+        vlm_valid = validator(vlm_text)
+        if field_type == "identifier":
+            return (
+                "ocr",
+                "high_risk_identifier_conflict",
+                field_type,
+                similarity,
+                length_ratio,
+            )
+        if not ocr_valid and vlm_valid:
+            if similarity < settings.bbox_recognition_min_similarity or not (
+                settings.bbox_recognition_min_length_ratio
+                <= length_ratio
+                <= settings.bbox_recognition_max_length_ratio
+            ):
+                return (
+                    "ocr",
+                    f"high_risk_{field_type}_repair_guard",
+                    field_type,
+                    similarity,
+                    length_ratio,
+                )
+            return (
+                "vlm",
+                f"validated_{field_type}_repair",
+                field_type,
+                similarity,
+                length_ratio,
+            )
+        if not vlm_valid:
+            return "ocr", f"invalid_vlm_{field_type}", field_type, similarity, length_ratio
+        if ocr_valid and vlm_valid:
+            return "ocr", f"high_risk_{field_type}_conflict", field_type, similarity, length_ratio
+    if similarity < settings.bbox_recognition_min_similarity:
+        return "ocr", "candidate_similarity_guard", field_type, similarity, length_ratio
+    if not (
+        settings.bbox_recognition_min_length_ratio
+        <= length_ratio
+        <= settings.bbox_recognition_max_length_ratio
+    ):
+        return "ocr", "candidate_length_guard", field_type, similarity, length_ratio
+    ocr_quality = _recognition_candidate_quality(ocr_text)
+    vlm_quality = _recognition_candidate_quality(vlm_text)
+    if (
+        line.confidence is not None
+        and line.confidence >= settings.bbox_recognition_high_confidence_threshold
+        and ocr_quality >= vlm_quality
+    ):
+        return "ocr", "high_confidence_ocr", field_type, similarity, length_ratio
+    if vlm_quality < ocr_quality:
+        return "ocr", "vlm_quality_guard", field_type, similarity, length_ratio
+    if line.confidence is None and not settings.bbox_recognition_prefer_vlm_for_unscored:
+        return "ocr", "unscored_ocr_preference", field_type, similarity, length_ratio
+    return "vlm", "bbox_conditioned_vlm", field_type, similarity, length_ratio
+
+
+def _apply_bbox_recognition_text(
+    line: TextLine,
+    candidate_id: str,
+    vlm_text: str,
+    reason: str,
+    settings: FusionSettings,
+) -> None:
+    original = line.text
+    line.text = vlm_text
+    line.confidence = settings.bbox_recognition_assumed_confidence
+    if line.spans:
+        line.spans[0]["content"] = vlm_text
+        if "text" in line.spans[0]:
+            line.spans[0]["text"] = vlm_text
+        for span in line.spans[1:]:
+            span["content"] = ""
+    for span in (line.spans[0] if line.spans else None, line.source_span):
+        if not isinstance(span, dict):
+            continue
+        span["fusion_recognition_id"] = candidate_id
+        span["fusion_recognition_source"] = "vlm"
+        span["fusion_recognition_original_ocr"] = original
+        span["fusion_recognition_vlm"] = vlm_text
+        span["fusion_recognition_reason"] = reason
+        span["fusion_recognition_assumed_confidence"] = (
+            settings.bbox_recognition_assumed_confidence
+        )
+        span["score"] = settings.bbox_recognition_assumed_confidence
+        if span is line.source_span:
+            span["text"] = vlm_text
+    if line.source_cell is not None:
+        line.source_cell["fusion_recognition_changed"] = True
+
+
+def synchronize_recognized_table_html(
+    page: Mapping[str, Any],
+    table_lines: Sequence[TextLine],
+    page_index: int,
+) -> tuple[int, int]:
+    """Propagate selected VLM text into Pipeline Cell metadata and safe Table HTML."""
+    lines_by_cell: dict[int, list[TextLine]] = {}
+    cells_by_id: dict[int, dict[str, Any]] = {}
+    for line in table_lines:
+        if line.source_cell is None:
+            continue
+        cell_id = id(line.source_cell)
+        cells_by_id[cell_id] = line.source_cell
+        lines_by_cell.setdefault(cell_id, []).append(line)
+    changed_cells: dict[int, str] = {}
+    for cell_id, lines in lines_by_cell.items():
+        cell = cells_by_id[cell_id]
+        if not cell.get("fusion_recognition_changed"):
+            continue
+        text, _confidence = _join_fragments(lines)
+        if not text:
+            continue
+        cell.setdefault("fusion_recognition_original_ocr", cell.get("text"))
+        cell["text"] = text
+        cell["fusion_recognition_source"] = "vlm"
+        cell["score"] = min(
+            (
+                line.confidence
+                for line in lines
+                if line.confidence is not None
+            ),
+            default=None,
+        )
+        changed_cells[cell_id] = text
+    rebuilt_tables = 0
+    rejected_tables = 0
+    for table in collect_structured_spans(page, page_index, {"table"}):
+        html = table.span.get("html")
+        raw_cells = table.span.get("table_cells", [])
+        if not isinstance(html, str) or not isinstance(raw_cells, list):
+            continue
+        parsed = parse_table_html(html)
+        if not parsed.valid:
+            continue
+        replacements = {}
+        for raw_cell in raw_cells:
+            if not isinstance(raw_cell, dict) or id(raw_cell) not in changed_cells:
+                continue
+            try:
+                key = tuple(
+                    int(raw_cell[name])
+                    for name in ("row_start", "row_end", "col_start", "col_end")
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            if key not in parsed.cell_map:
+                continue
+            replacements[key] = escape(changed_cells[id(raw_cell)]).replace("\n", "<br>")
+        if not replacements:
+            continue
+        rebuilt, error = rebuild_table_html(parsed, replacements)
+        if rebuilt is None:
+            table.span["fusion_recognition_rebuild_error"] = error
+            rejected_tables += 1
+            continue
+        rebuilt_parsed = parse_table_html(rebuilt)
+        if rebuilt_parsed.structure_signature != parsed.structure_signature:
+            table.span["fusion_recognition_rebuild_error"] = "structure_changed"
+            rejected_tables += 1
+            continue
+        table.span["html"] = rebuilt
+        table.span["fusion_recognition_cells_updated"] = len(replacements)
+        rebuilt_tables += 1
+    return rebuilt_tables, rejected_tables
+
+
+def apply_recognition_batch_quality_guard(
+    batches: Sequence[dict[str, Any]],
+    returned: Mapping[str, str],
+    by_id: Mapping[str, TextLine],
+    settings: FusionSettings,
+) -> set[str]:
+    """Annotate low-quality batches and return candidate IDs that must retain OCR."""
+    guarded_ids: set[str] = set()
+    if not settings.bbox_recognition_batch_guard_enabled:
+        return guarded_ids
+    clearly_unacceptable_reasons = {
+        "empty_vlm_candidate",
+        "bbox_protocol_id_echo",
+        "vlm_candidate_too_long",
+        "candidate_similarity_guard",
+        "candidate_length_guard",
+        "empty_ocr_vlm_recovery",
+        "vlm_primary_quality_guard",
+    }
+    for batch in batches:
+        raw_ids = batch.get("ids")
+        if not isinstance(raw_ids, list):
+            continue
+        batch_ids = [
+            candidate_id
+            for candidate_id in raw_ids
+            if isinstance(candidate_id, str) and candidate_id in by_id
+        ]
+        if len(batch_ids) < settings.bbox_recognition_batch_guard_min_candidates:
+            continue
+        acceptable = 0
+        for candidate_id in batch_ids:
+            vlm_text = returned.get(candidate_id)
+            if vlm_text is None:
+                continue
+            _source, reason, _field_type, _similarity, _length_ratio = (
+                select_bbox_recognition_candidate(
+                    by_id[candidate_id],
+                    vlm_text,
+                    settings,
+                )
+            )
+            unacceptable = (
+                reason in clearly_unacceptable_reasons
+                or reason.startswith("invalid_vlm_")
+                or reason.endswith("_repair_guard")
+            )
+            acceptable += int(not unacceptable)
+        acceptable_ratio = acceptable / len(batch_ids)
+        batch["quality_guard_evaluated"] = True
+        batch["quality_acceptable_responses"] = acceptable
+        batch["quality_acceptable_ratio"] = round(acceptable_ratio, 6)
+        if acceptable_ratio < settings.bbox_recognition_min_batch_acceptable_ratio:
+            batch["quality_guard_triggered"] = True
+            guarded_ids.update(batch_ids)
+    return guarded_ids
+
+
+def recognition_quality_passed_ids(
+    batches: Sequence[Mapping[str, Any]],
+) -> set[str]:
+    passed_ids = set()
+    for batch in batches:
+        if not batch.get("quality_guard_evaluated") or batch.get(
+            "quality_guard_triggered"
+        ):
+            continue
+        raw_ids = batch.get("ids")
+        if isinstance(raw_ids, list):
+            passed_ids.update(
+                candidate_id
+                for candidate_id in raw_ids
+                if isinstance(candidate_id, str)
+            )
+    return passed_ids
+
+
+def apply_bbox_recognition(
+    page_index: int,
+    page_size: Sequence[float],
+    lines: Sequence[TextLine],
+    settings: FusionSettings,
+    recognizer: BBoxRecognizer,
+) -> tuple[dict[str, int], list[dict[str, Any]], list[dict[str, Any]]]:
+    manifest, by_id = build_bbox_recognition_manifest(page_index, lines)
+    stats = {
+        "candidates": len(manifest),
+        "requests": 0,
+        "responses": 0,
+        "vlm_selected": 0,
+        "ocr_kept": 0,
+        "invalid_outputs": 0,
+        "errors": 0,
+        "high_risk_fallbacks": 0,
+        "protocol_echoes": 0,
+        "batch_quality_fallbacks": 0,
+        "empty_ocr_recoveries": 0,
+        "empty_ocr_context_fallbacks": 0,
+    }
+    decisions: list[dict[str, Any]] = []
+    batches: list[dict[str, Any]] = []
+    if not manifest:
+        return stats, decisions, batches
+    try:
+        response = recognizer(page_index, page_size, manifest)
+    except Exception as exc:
+        response = None
+        stats["errors"] += 1
+        batches.append({"page": page_index, "status": "error", "error": type(exc).__name__})
+    if not isinstance(response, Mapping):
+        response = {}
+    for key in ("requests", "invalid_outputs", "errors"):
+        value = response.get(key)
+        if isinstance(value, int) and value > 0:
+            stats[key] += value
+    raw_batches = response.get("batches", [])
+    if isinstance(raw_batches, list):
+        batches.extend(item for item in raw_batches if isinstance(item, dict))
+    returned: dict[str, str] = {}
+    raw_items = response.get("items", [])
+    if isinstance(raw_items, list):
+        for item in raw_items:
+            if not isinstance(item, Mapping):
+                stats["invalid_outputs"] += 1
+                continue
+            candidate_id = item.get("id")
+            text = item.get("text")
+            if (
+                not isinstance(candidate_id, str)
+                or candidate_id not in by_id
+                or not isinstance(text, str)
+                or candidate_id in returned
+            ):
+                stats["invalid_outputs"] += 1
+                continue
+            returned[candidate_id] = text.strip()
+    stats["responses"] = len(returned)
+    batch_guarded_ids = apply_recognition_batch_quality_guard(
+        batches,
+        returned,
+        by_id,
+        settings,
+    )
+    quality_passed_ids = recognition_quality_passed_ids(batches)
+    for candidate in manifest:
+        candidate_id = candidate["id"]
+        line = by_id[candidate_id]
+        vlm_text = returned.get(candidate_id, "")
+        source, reason, field_type, similarity, length_ratio = (
+            select_bbox_recognition_candidate(line, vlm_text, settings)
+            if candidate_id in returned
+            else ("ocr", "no_vlm_response", "general", 0.0, 0.0)
+        )
+        candidate_reason = reason
+        if candidate_id in batch_guarded_ids:
+            source = "ocr"
+            reason = "recognizer_batch_quality_guard"
+            stats["batch_quality_fallbacks"] += 1
+        elif (
+            candidate_reason == "empty_ocr_vlm_recovery"
+            and candidate_id not in quality_passed_ids
+        ):
+            source = "ocr"
+            reason = "empty_ocr_context_guard"
+            stats["empty_ocr_context_fallbacks"] += 1
+        if source == "vlm":
+            _apply_bbox_recognition_text(
+                line,
+                candidate_id,
+                vlm_text,
+                reason,
+                settings,
+            )
+            stats["vlm_selected"] += 1
+            if candidate_reason == "empty_ocr_vlm_recovery":
+                stats["empty_ocr_recoveries"] += 1
+        else:
+            stats["ocr_kept"] += 1
+            if candidate_reason.startswith("high_risk_"):
+                stats["high_risk_fallbacks"] += 1
+            if candidate_reason == "bbox_protocol_id_echo":
+                stats["protocol_echoes"] += 1
+        decision = {
+            "kind": "bbox_recognition",
+            "page": page_index,
+            "id": candidate_id,
+            "bbox": candidate["bbox"],
+            "block_type": line.block_type,
+            "ocr_text": candidate["ocr_text"],
+            "ocr_confidence": candidate["ocr_confidence"],
+            "vlm_text": vlm_text if candidate_id in returned else None,
+            "selected_source": source,
+            "selected_text": line.text,
+            "reason": reason,
+            "field_type": field_type,
+            "similarity": round(similarity, 6),
+            "length_ratio": round(length_ratio, 6),
+        }
+        if candidate_reason != reason:
+            decision["candidate_reason"] = candidate_reason
+        decisions.append(decision)
+    return stats, decisions, batches
 
 
 def mark_structured_table_coverage(
@@ -1800,11 +2600,13 @@ def fuse_middle_json(
     candidate_chooser: CandidateChooser | None = None,
     table_cell_candidate_chooser: TableCellCandidateChooser | None = None,
     page_reconciler: PageReconciler | None = None,
+    bbox_recognizer: BBoxRecognizer | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Fuse OCR evidence into Hybrid preproc blocks and return a detailed audit report."""
     fused = copy.deepcopy(hybrid_middle)
     hybrid_pages = fused.get("pdf_info")
-    ocr_pages = ocr_middle.get("pdf_info")
+    ocr_source = copy.deepcopy(ocr_middle) if settings.bbox_recognition_enabled else ocr_middle
+    ocr_pages = ocr_source.get("pdf_info")
     if not isinstance(hybrid_pages, list) or not isinstance(ocr_pages, list):
         raise ValueError("Both middle JSON inputs must contain pdf_info arrays")
     if len(hybrid_pages) != len(ocr_pages):
@@ -1840,6 +2642,21 @@ def fuse_middle_json(
         "page_reconciliation_candidates": 0,
         "page_reconciliation_insertions": 0,
         "page_reconciliation_errors": 0,
+        "bbox_recognition_candidates": 0,
+        "bbox_recognition_requests": 0,
+        "bbox_recognition_responses": 0,
+        "bbox_recognition_vlm_selected": 0,
+        "bbox_recognition_ocr_kept": 0,
+        "bbox_recognition_invalid_outputs": 0,
+        "bbox_recognition_errors": 0,
+        "bbox_recognition_high_risk_fallbacks": 0,
+        "bbox_recognition_protocol_echoes": 0,
+        "bbox_recognition_batch_quality_fallbacks": 0,
+        "bbox_recognition_empty_ocr_recoveries": 0,
+        "bbox_recognition_empty_ocr_context_fallbacks": 0,
+        "bbox_recognition_candidate_limit": 0,
+        "bbox_recognition_tables_rebuilt": 0,
+        "bbox_recognition_table_rebuild_rejections": 0,
         "table_targets": 0,
         "table_fallback_replacements": 0,
         "table_conflicts": 0,
@@ -1884,8 +2701,128 @@ def fuse_middle_json(
     coverage: list[dict[str, Any]] = []
     key_value_pairs: list[dict[str, Any]] = []
     table_quality: list[dict[str, Any]] = []
+    recognition_batches: list[dict[str, Any]] = []
+    recognition_candidate_count = 0
+    recognition_bbox_unchanged = True
+    recognition_table_structure_unchanged = True
     for page_index, (hybrid_page, ocr_page) in enumerate(zip(hybrid_pages, ocr_pages)):
         page_size = hybrid_page.get("page_size", [0, 0])
+        recognition_invariant_before = (
+            _page_recognition_invariant_snapshot(ocr_page)
+            if settings.bbox_recognition_enabled
+            else None
+        )
+        if settings.bbox_recognition_enabled:
+            normal_recognition_lines = (
+                collect_text_lines(ocr_page, page_index)
+                if settings.bbox_recognition_normal_ocr_enabled
+                else []
+            )
+            table_recognition_lines = (
+                collect_table_ocr_lines(ocr_page, page_index)
+                if settings.bbox_recognition_table_ocr_enabled
+                else []
+            )
+            recognition_lines = normal_recognition_lines + table_recognition_lines
+            remaining_recognition_budget = max(
+                settings.bbox_recognition_max_candidates_per_document
+                - recognition_candidate_count,
+                0,
+            )
+            if len(recognition_lines) > remaining_recognition_budget:
+                counts["bbox_recognition_candidate_limit"] += (
+                    len(recognition_lines) - remaining_recognition_budget
+                )
+                recognition_lines = recognition_lines[:remaining_recognition_budget]
+            if bbox_recognizer is None:
+                if recognition_lines:
+                    unavailable_manifest, _unavailable_by_id = (
+                        build_bbox_recognition_manifest(page_index, recognition_lines)
+                    )
+                    recognition_candidate_count += len(unavailable_manifest)
+                    counts["bbox_recognition_candidates"] += len(
+                        unavailable_manifest
+                    )
+                    counts["bbox_recognition_ocr_kept"] += len(
+                        unavailable_manifest
+                    )
+                    counts["bbox_recognition_errors"] += 1
+                    recognition_batches.append(
+                        {
+                            "page": page_index,
+                            "status": "recognizer_unavailable",
+                            "candidates": len(recognition_lines),
+                        }
+                    )
+                    decisions.extend(
+                        {
+                            "kind": "bbox_recognition",
+                            "page": page_index,
+                            "id": candidate["id"],
+                            "bbox": candidate["bbox"],
+                            "block_type": candidate["type"],
+                            "ocr_text": candidate["ocr_text"],
+                            "ocr_confidence": candidate["ocr_confidence"],
+                            "vlm_text": None,
+                            "selected_source": "ocr",
+                            "selected_text": candidate["ocr_text"],
+                            "reason": "recognizer_unavailable",
+                            "field_type": "general",
+                            "similarity": 0.0,
+                            "length_ratio": 0.0,
+                        }
+                        for candidate in unavailable_manifest
+                    )
+            else:
+                recognition_stats, recognition_decisions, page_batches = (
+                    apply_bbox_recognition(
+                        page_index,
+                        page_size,
+                        recognition_lines,
+                        settings,
+                        bbox_recognizer,
+                    )
+                )
+                recognition_candidate_count += recognition_stats["candidates"]
+                for key in (
+                    "candidates",
+                    "requests",
+                    "responses",
+                    "vlm_selected",
+                    "ocr_kept",
+                    "invalid_outputs",
+                    "errors",
+                    "high_risk_fallbacks",
+                    "protocol_echoes",
+                    "batch_quality_fallbacks",
+                    "empty_ocr_recoveries",
+                    "empty_ocr_context_fallbacks",
+                ):
+                    counts[f"bbox_recognition_{key}"] += recognition_stats[key]
+                rebuilt, rejected = synchronize_recognized_table_html(
+                    ocr_page,
+                    table_recognition_lines,
+                    page_index,
+                )
+                counts["bbox_recognition_tables_rebuilt"] += rebuilt
+                counts["bbox_recognition_table_rebuild_rejections"] += rejected
+                decisions.extend(recognition_decisions)
+                recognition_batches.extend(page_batches)
+            recognition_invariant_after = _page_recognition_invariant_snapshot(
+                ocr_page
+            )
+            recognition_bbox_unchanged &= (
+                recognition_invariant_before[0] == recognition_invariant_after[0]
+            )
+            recognition_table_structure_unchanged &= (
+                recognition_invariant_before[1] == recognition_invariant_after[1]
+            )
+        if settings.mode == "bbox_vlm":
+            # This mode deliberately bypasses the normal Hybrid/OCR fusion stages.
+            # The recognized Pipeline page already contains the selected text while
+            # retaining every Pipeline-owned bbox and Table grid coordinate.
+            hybrid_pages[page_index] = copy.deepcopy(ocr_page)
+            continue
         apply_structured_fallbacks(
             hybrid_page,
             ocr_page,
@@ -2236,10 +3173,17 @@ def fuse_middle_json(
     }
     report = {
         "version": 1,
+        "mode": settings.mode,
         "counts": counts,
+        "recognition_invariants": {
+            "enabled": settings.bbox_recognition_enabled,
+            "bbox_unchanged": recognition_bbox_unchanged,
+            "table_structure_unchanged": recognition_table_structure_unchanged,
+        },
         "coverage": coverage,
         "table_quality": table_quality,
         "key_value_pairs": key_value_pairs,
+        "recognition_batches": recognition_batches,
         "decisions": decisions,
     }
     return fused, report
@@ -2260,6 +3204,19 @@ class PageCropProvider:
             from PIL import Image
         except ImportError as exc:
             raise RuntimeError("Visual fusion requires Pillow") from exc
+        if self.path.is_dir():
+            candidates = (
+                self.path / f"page-{page_index + 1}.png",
+                self.path / f"page-{page_index}.png",
+                self.path / f"page-{page_index + 1}.jpg",
+                self.path / f"page-{page_index}.jpg",
+            )
+            page_path = next((path for path in candidates if path.is_file()), None)
+            if page_path is None:
+                raise FileNotFoundError(
+                    f"No pre-rendered image found for page {page_index} in {self.path}"
+                )
+            return Image.open(page_path).convert("RGB")
         if self.path.suffix.lower() == ".pdf":
             try:
                 import pypdfium2 as pdfium

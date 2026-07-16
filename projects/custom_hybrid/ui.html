@@ -7,15 +7,16 @@
   <style>
     :root {
       color-scheme: light;
-      --blue: #286ee8;
-      --blue-dark: #1f58bf;
-      --ink: #172238;
-      --muted: #6f7c91;
-      --line: #dfe5ee;
-      --soft: #f5f7fa;
-      --success: #17815f;
-      --danger: #c84040;
-      --warning: #ad6a00;
+      --primary: #2563eb;
+      --primary-hover: #1d4ed8;
+      --ink: #18212f;
+      --muted: #667085;
+      --line: #d8dee8;
+      --soft: #f4f6f8;
+      --surface: #ffffff;
+      --success: #14805e;
+      --warning: #a15c00;
+      --danger: #c43d3d;
     }
     * { box-sizing: border-box; }
     body {
@@ -23,155 +24,318 @@
       min-height: 100vh;
       color: var(--ink);
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: #f7f8fb;
+      background: #f7f8fa;
     }
     button, input, select { font: inherit; }
-    .shell { width: min(1500px, calc(100% - 36px)); margin: 0 auto; padding: 26px 0 54px; }
-    .hero {
-      position: relative;
-      overflow: hidden;
-      padding: 34px 40px;
-      border-radius: 13px;
+    button, .download-button {
+      appearance: none;
+      min-height: 36px;
+      border: 1px solid transparent;
+      border-radius: 7px;
+      padding: 8px 12px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 650;
+    }
+    button:disabled { cursor: not-allowed; opacity: 0.45; }
+    .app-shell { width: min(1680px, calc(100% - 28px)); margin: 0 auto; padding: 14px 0 28px; }
+    .app-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      min-height: 52px;
+      margin-bottom: 12px;
+      padding: 0 4px;
+    }
+    .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+    .brand-mark {
+      display: grid;
+      place-items: center;
+      width: 34px;
+      height: 34px;
+      flex: none;
+      border-radius: 7px;
       color: white;
+      background: var(--primary);
+      font-size: 16px;
+      font-weight: 800;
+    }
+    .brand h1 { margin: 0; font-size: 17px; line-height: 1.2; letter-spacing: 0; }
+    .brand small { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; }
+    .service-status {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      flex: none;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #aab2bf; }
+    .service-status.online .status-dot { background: var(--success); }
+    .service-status.offline .status-dot { background: var(--danger); }
+    .workspace {
+      display: grid;
+      grid-template-columns: minmax(260px, 0.72fr) minmax(390px, 1.58fr) minmax(390px, 1.58fr);
+      gap: 12px;
+      align-items: stretch;
+    }
+    .panel {
+      min-width: 0;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+    }
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      min-height: 46px;
+      padding: 0 13px;
+      border-bottom: 1px solid var(--line);
+    }
+    .panel-title { margin: 0; font-size: 13px; font-weight: 700; letter-spacing: 0; }
+    .controls-pane { min-height: 790px; }
+    .controls { padding: 12px; }
+    .drop-zone {
+      display: grid;
+      place-items: center;
+      min-height: 138px;
+      padding: 18px 12px;
+      border: 1.5px dashed #b9c3d1;
+      border-radius: 7px;
       text-align: center;
-      background: linear-gradient(120deg, #347df4 0%, #1f58bd 100%);
-      box-shadow: 0 16px 38px rgba(32, 88, 190, 0.2);
+      cursor: pointer;
+      background: #fbfcfd;
     }
-    .hero::after {
-      content: "";
-      position: absolute;
-      width: 420px;
-      height: 420px;
-      right: -210px;
-      top: -260px;
-      border-radius: 50%;
-      background: rgba(255,255,255,0.1);
-    }
-    .hero h1 { position: relative; margin: 0; font-size: clamp(30px, 4vw, 48px); letter-spacing: -0.035em; }
-    .hero p { position: relative; max-width: 760px; margin: 11px auto 0; color: rgba(255,255,255,0.86); line-height: 1.55; }
-    .hero-badges { position: relative; display: flex; flex-wrap: wrap; justify-content: center; gap: 9px; margin-top: 19px; }
-    .hero-badge { padding: 7px 12px; border-radius: 999px; color: white; background: rgba(13, 33, 72, 0.46); font-size: 12px; font-weight: 700; }
-    .service-pill { display: inline-flex; align-items: center; gap: 8px; }
-    .dot { width: 8px; height: 8px; border-radius: 50%; background: #c4ccd8; }
-    .service-pill.online .dot { background: #68e0b2; box-shadow: 0 0 0 4px rgba(104,224,178,0.16); }
-    .service-pill.offline .dot { background: #ff8585; box-shadow: 0 0 0 4px rgba(255,133,133,0.16); }
-    .workspace { display: grid; grid-template-columns: 340px minmax(360px, 1fr) minmax(390px, 1fr); gap: 16px; margin-top: 20px; align-items: stretch; }
-    .panel { min-width: 0; min-height: 620px; overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: white; box-shadow: 0 8px 25px rgba(43, 61, 88, 0.055); }
-    .panel-title { display: flex; align-items: center; gap: 8px; min-height: 47px; padding: 0 16px; border-bottom: 1px solid var(--line); font-size: 13px; font-weight: 750; }
-    .panel-title span { color: var(--blue); }
-    .preview-title { justify-content: space-between; }
-    .preview-title-label { display: flex; align-items: center; gap: 8px; }
-    .preview-switch { display: flex; gap: 5px; }
-    .preview-switch button { padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; color: var(--muted); background: white; font-size: 10px; }
-    .preview-switch button:hover { transform: none; background: var(--soft); }
-    .preview-switch button.active { color: white; border-color: var(--blue); background: var(--blue); }
-    .controls { padding: 14px; }
-    .drop-zone { display: grid; place-items: center; min-height: 180px; padding: 20px 14px; border: 1.5px dashed #c3ccd9; border-radius: 9px; text-align: center; cursor: pointer; transition: 150ms ease; }
-    .drop-zone:hover, .drop-zone.dragging { border-color: var(--blue); background: #f4f8ff; }
-    .upload-icon { display: grid; place-items: center; width: 48px; height: 48px; margin-bottom: 13px; border-radius: 14px; color: var(--blue); background: #eaf2ff; font-size: 25px; font-weight: 700; }
-    .drop-zone strong { font-size: 15px; }
-    .drop-zone small { display: block; margin-top: 7px; color: var(--muted); line-height: 1.5; }
+    .drop-zone:hover, .drop-zone.dragging { border-color: var(--primary); background: #f3f7ff; }
+    .drop-zone.disabled { pointer-events: none; opacity: 0.55; }
+    .upload-symbol { color: var(--primary); font-size: 25px; line-height: 1; }
+    .drop-zone strong { margin-top: 10px; font-size: 13px; }
+    .drop-zone small { margin-top: 5px; color: var(--muted); font-size: 11px; }
     input[type=file] { display: none; }
-    .file-list { display: grid; gap: 7px; margin-top: 11px; }
-    .file-item { display: flex; justify-content: space-between; gap: 10px; padding: 9px 10px; border-radius: 7px; background: var(--soft); font-size: 12px; }
+    .file-list { display: grid; gap: 6px; margin-top: 9px; }
+    .file-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      min-width: 0;
+      padding: 8px 9px;
+      border: 1px solid #e2e6ed;
+      border-radius: 6px;
+      background: var(--soft);
+      font-size: 11px;
+    }
     .file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .file-size { flex: none; color: var(--muted); }
-    .setting-card { margin-top: 12px; padding: 13px; border: 1px solid var(--line); border-radius: 9px; }
-    .setting-label { margin-bottom: 5px; font-size: 12px; font-weight: 750; }
-    .setting-help { color: var(--muted); font-size: 11px; line-height: 1.5; }
-    .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; margin-top: 11px; }
+    .settings-section { margin-top: 13px; padding-top: 13px; border-top: 1px solid #e5e9ef; }
+    .settings-title { margin: 0 0 10px; font-size: 12px; font-weight: 700; }
+    .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
     .field { min-width: 0; }
     .field-wide { grid-column: 1 / -1; }
-    .field label { display: block; margin-bottom: 4px; color: #465268; font-size: 10px; font-weight: 750; }
-    .field input, .field select { width: 100%; min-width: 0; padding: 8px 9px; border: 1px solid #cfd7e3; border-radius: 7px; color: var(--ink); outline: none; background: white; font-size: 12px; }
-    .field input:focus, .field select:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(40,110,232,0.1); }
-    .parameter-note { margin-top: 9px; color: var(--muted); font-size: 10px; line-height: 1.45; }
-    .actions { display: grid; grid-template-columns: 1fr 0.65fr; gap: 8px; margin-top: 12px; }
-    button, .download-button { appearance: none; border: 0; border-radius: 8px; padding: 10px 12px; cursor: pointer; text-decoration: none; font-size: 13px; font-weight: 720; transition: 140ms ease; }
-    button:hover, .download-button:hover { transform: translateY(-1px); }
-    button:disabled { cursor: not-allowed; opacity: 0.48; transform: none; }
-    .primary { color: white; background: var(--blue); }
-    .primary:hover { background: var(--blue-dark); }
-    .secondary { color: var(--ink); background: #edf1f6; }
-    .preview-body { display: grid; place-items: center; height: 572px; padding: 12px; background: #fafbfc; }
-    .empty-preview { max-width: 270px; color: var(--muted); text-align: center; line-height: 1.6; }
-    .preview-frame, .preview-image { width: 100%; height: 100%; border: 0; border-radius: 7px; background: white; object-fit: contain; }
-    .results { display: flex; flex-direction: column; }
-    .tabs { display: grid; grid-template-columns: repeat(3, 1fr); min-height: 47px; border-bottom: 1px solid var(--line); }
-    .tab-button { position: relative; border-radius: 0; color: #3b4658; background: white; font-size: 12px; }
-    .tab-button:hover { transform: none; background: #fafbfc; }
-    .tab-button.active { color: var(--blue); }
-    .tab-button.active::after { content: ""; position: absolute; left: 18px; right: 18px; bottom: -1px; height: 2px; background: var(--blue); }
-    .tab-panel { display: none; flex: 1; min-height: 573px; overflow: auto; padding: 15px; }
-    .tab-panel.active { display: block; }
-    .output-empty { display: grid; place-items: center; height: 100%; min-height: 480px; color: var(--muted); text-align: center; line-height: 1.6; }
-    .coverage-summary { display: none; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; }
-    .coverage-summary.visible { display: grid; }
-    .coverage-metric { padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: #f8fafc; }
-    .coverage-metric strong { display: block; font-size: 18px; color: var(--ink); }
-    .coverage-metric span { display: block; margin-top: 4px; color: var(--muted); font-size: 10px; line-height: 1.3; text-transform: uppercase; letter-spacing: .04em; }
-    pre { margin: 0; min-height: 500px; overflow: auto; padding: 14px; border-radius: 8px; color: #dce8ff; background: #142137; font-size: 11px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
-    .download-card { display: none; padding: 18px; border: 1px solid #cfe8df; border-radius: 10px; background: #f1fbf7; }
-    .download-card.visible { display: block; }
-    .download-card h3 { margin: 0 0 8px; font-size: 16px; }
-    .download-card p { margin: 0 0 15px; color: var(--muted); font-size: 12px; line-height: 1.55; }
-    .download-button { display: inline-block; color: white; background: var(--success); }
-    .message { margin-top: 14px; min-height: 21px; color: var(--muted); font-size: 12px; line-height: 1.55; }
+    .field label { display: block; margin-bottom: 4px; color: #4b5668; font-size: 10px; font-weight: 650; }
+    .field input, .field select {
+      width: 100%;
+      min-width: 0;
+      height: 34px;
+      border: 1px solid #cbd3df;
+      border-radius: 6px;
+      padding: 6px 8px;
+      color: var(--ink);
+      outline: none;
+      background: white;
+      font-size: 12px;
+    }
+    .field input:focus, .field select:focus { border-color: var(--primary); box-shadow: 0 0 0 2px rgba(37,99,235,0.1); }
+    .advanced-settings { margin-top: 13px; padding-top: 12px; border-top: 1px solid #e5e9ef; }
+    .advanced-settings summary { cursor: pointer; color: #344054; font-size: 12px; font-weight: 700; }
+    .advanced-settings[open] summary { margin-bottom: 11px; }
+    .actions { display: grid; grid-template-columns: 1fr 0.66fr; gap: 8px; margin-top: 14px; }
+    .primary { color: white; border-color: var(--primary); background: var(--primary); }
+    .primary:hover:not(:disabled) { background: var(--primary-hover); }
+    .secondary { color: #344054; border-color: #d4dae3; background: white; }
+    .secondary:hover:not(:disabled) { background: var(--soft); }
+    .task-status { margin-top: 13px; padding-top: 12px; border-top: 1px solid #e5e9ef; }
+    .task-status-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .task-state {
+      display: inline-flex;
+      padding: 4px 7px;
+      border-radius: 5px;
+      color: var(--muted);
+      background: #eef1f5;
+      font-size: 10px;
+      font-weight: 750;
+      text-transform: uppercase;
+    }
+    .task-state.queued, .task-state.processing, .task-state.uploading { color: var(--warning); background: #fff2d7; }
+    .task-state.completed { color: var(--success); background: #e0f4ec; }
+    .task-state.failed { color: var(--danger); background: #fde6e6; }
+    .message { min-height: 34px; margin-top: 8px; color: var(--muted); font-size: 11px; line-height: 1.45; }
     .message.error { color: var(--danger); }
-    .task-state { display: inline-flex; margin-top: 10px; padding: 5px 9px; border-radius: 999px; color: var(--muted); background: #edf1f6; font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.05em; }
-    .task-state.queued, .task-state.processing, .task-state.uploading { color: var(--warning); background: #fff3da; }
-    .task-state.completed { color: var(--success); background: #e1f5ed; }
-    .task-state.failed { color: var(--danger); background: #fde7e7; }
-    .pipeline { margin-top: 16px; padding: 17px 18px; border: 1px solid var(--line); border-radius: 12px; background: white; box-shadow: 0 8px 25px rgba(43, 61, 88, 0.045); }
-    .pipeline h2 { margin: 0 0 15px; font-size: 14px; }
-    .stages { display: grid; grid-template-columns: repeat(7, 1fr); gap: 8px; }
-    .stage { position: relative; min-width: 0; padding-top: 20px; color: #929dad; text-align: center; font-size: 10px; font-weight: 700; }
-    .stage::before { content: ""; position: absolute; top: 2px; left: 50%; width: 11px; height: 11px; transform: translateX(-50%); border: 2px solid #c8d0db; border-radius: 50%; background: white; z-index: 2; }
-    .stage::after { content: ""; position: absolute; top: 8px; left: calc(-50% + 5px); width: calc(100% - 10px); height: 2px; background: #dfe4eb; }
-    .stage:first-child::after { display: none; }
-    .stage.active { color: var(--blue); }
-    .stage.active::before { border-color: var(--blue); box-shadow: 0 0 0 4px rgba(40,110,232,0.13); }
+    .progress-list { display: grid; gap: 6px; margin: 10px 0 0; padding: 0; list-style: none; }
+    .stage { display: flex; align-items: center; gap: 7px; color: #8a94a3; font-size: 10px; }
+    .stage::before { content: ""; width: 7px; height: 7px; flex: none; border: 1.5px solid #b8c0cc; border-radius: 50%; background: white; }
+    .stage.active { color: var(--primary); font-weight: 700; }
+    .stage.active::before { border-color: var(--primary); background: var(--primary); }
     .stage.done { color: var(--success); }
     .stage.done::before { border-color: var(--success); background: var(--success); }
-    .stage.done::after { background: var(--success); }
+    .viewer-pane, .output-pane { min-height: 790px; display: flex; flex-direction: column; }
+    .segmented { display: flex; gap: 2px; padding: 2px; border-radius: 6px; background: #eef1f5; }
+    .segmented button { min-height: 28px; padding: 4px 8px; border: 0; color: var(--muted); background: transparent; font-size: 10px; }
+    .segmented button.active { color: var(--ink); background: white; box-shadow: 0 1px 2px rgba(16,24,40,0.08); }
+    .preview-body { display: grid; place-items: center; flex: 1; min-height: 742px; padding: 10px; background: #f1f3f6; }
+    .empty-state { max-width: 280px; color: var(--muted); text-align: center; font-size: 12px; line-height: 1.55; }
+    .preview-frame, .preview-image { width: 100%; height: 100%; min-height: 720px; border: 0; border-radius: 4px; background: white; object-fit: contain; }
+    .output-actions { display: flex; align-items: center; gap: 7px; min-width: 0; }
+    .document-select {
+      min-width: 120px;
+      max-width: 190px;
+      height: 30px;
+      border: 1px solid #ccd4df;
+      border-radius: 6px;
+      padding: 4px 7px;
+      color: #344054;
+      background: white;
+      font-size: 10px;
+    }
+    .download-button {
+      display: none;
+      align-items: center;
+      min-height: 30px;
+      padding: 5px 9px;
+      color: white;
+      text-decoration: none;
+      background: var(--success);
+      font-size: 10px;
+    }
+    .download-button.visible { display: inline-flex; }
+    .result-tabs { display: flex; min-height: 42px; overflow-x: auto; border-bottom: 1px solid var(--line); }
+    .result-tab {
+      position: relative;
+      min-width: max-content;
+      min-height: 42px;
+      border: 0;
+      border-radius: 0;
+      padding: 8px 13px;
+      color: #596579;
+      background: white;
+      font-size: 11px;
+    }
+    .result-tab.active { color: var(--primary); font-weight: 700; }
+    .result-tab.active::after { content: ""; position: absolute; left: 12px; right: 12px; bottom: -1px; height: 2px; background: var(--primary); }
+    .result-panel { display: none; flex: 1; min-height: 700px; overflow: auto; padding: 16px; }
+    .result-panel.active { display: block; }
+    .result-empty { display: grid; place-items: center; min-height: 650px; color: var(--muted); text-align: center; font-size: 12px; }
+    .markdown-render { color: #202938; font-size: 13px; line-height: 1.65; word-break: break-word; }
+    .markdown-render h1, .markdown-render h2, .markdown-render h3, .markdown-render h4 { margin: 1.15em 0 0.55em; line-height: 1.3; letter-spacing: 0; }
+    .markdown-render h1 { margin-top: 0; font-size: 23px; }
+    .markdown-render h2 { font-size: 19px; border-bottom: 1px solid #e4e8ee; padding-bottom: 5px; }
+    .markdown-render h3 { font-size: 16px; }
+    .markdown-render p { margin: 0.7em 0; }
+    .markdown-render ul, .markdown-render ol { padding-left: 23px; }
+    .markdown-render blockquote { margin: 1em 0; padding: 7px 12px; border-left: 3px solid #9bb8ef; color: #4f5d73; background: #f6f8fc; }
+    .markdown-render code { padding: 2px 4px; border-radius: 4px; background: #eef1f5; font-family: "SFMono-Regular", Consolas, monospace; font-size: 0.92em; }
+    .markdown-render pre { overflow: auto; padding: 12px; border-radius: 6px; color: #dbe6f7; background: #172033; }
+    .markdown-render pre code { padding: 0; color: inherit; background: transparent; }
+    .markdown-render table { width: 100%; margin: 12px 0; border-collapse: collapse; font-size: 12px; }
+    .markdown-render th, .markdown-render td { border: 1px solid #d9dfe8; padding: 7px 8px; text-align: left; vertical-align: top; }
+    .markdown-render th { background: #f1f4f8; font-weight: 700; }
+    .markdown-render img { display: block; max-width: 100%; max-height: 520px; margin: 12px auto; object-fit: contain; }
+    .source-output {
+      min-height: 650px;
+      margin: 0;
+      overflow: auto;
+      padding: 13px;
+      border: 1px solid #dde2ea;
+      border-radius: 6px;
+      color: #263247;
+      background: #f8f9fb;
+      font-family: "SFMono-Regular", Consolas, monospace;
+      font-size: 11px;
+      line-height: 1.55;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .coverage-summary { display: none; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin-bottom: 12px; }
+    .coverage-summary.visible { display: grid; }
+    .coverage-metric { padding: 9px; border: 1px solid #dde3eb; border-radius: 6px; background: #f8fafc; }
+    .coverage-metric strong { display: block; font-size: 16px; }
+    .coverage-metric span { display: block; margin-top: 3px; color: var(--muted); font-size: 9px; line-height: 1.25; text-transform: uppercase; }
+    .fusion-section-title { margin: 14px 0 7px; font-size: 11px; color: #475467; text-transform: uppercase; }
     .hidden { display: none !important; }
-    @media (max-width: 1120px) { .workspace { grid-template-columns: 280px 1fr; } .results { grid-column: 1 / -1; min-height: 480px; } .tab-panel { min-height: 430px; } }
-    @media (max-width: 720px) { .shell { width: min(100% - 20px, 1500px); padding-top: 10px; } .hero { padding: 27px 18px; } .workspace { grid-template-columns: 1fr; } .panel { min-height: auto; } .preview-body { height: 480px; } .results { grid-column: auto; } .coverage-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } .stages { grid-template-columns: repeat(4, 1fr); row-gap: 18px; } .stage::after { display: none; } }
+    @media (max-width: 1180px) {
+      .workspace { grid-template-columns: 270px minmax(400px, 1fr); }
+      .output-pane { grid-column: 1 / -1; min-height: 620px; }
+      .result-panel { min-height: 530px; }
+      .result-empty, .source-output { min-height: 480px; }
+    }
+    @media (max-width: 760px) {
+      .app-shell { width: min(100% - 16px, 1680px); padding-top: 8px; }
+      .app-header { align-items: flex-start; }
+      .brand small { display: none; }
+      .workspace { grid-template-columns: 1fr; }
+      .controls-pane, .viewer-pane, .output-pane { min-height: auto; grid-column: auto; }
+      .preview-body { min-height: 500px; }
+      .preview-frame, .preview-image { min-height: 480px; }
+      .result-panel { min-height: 500px; }
+      .output-actions { flex-wrap: wrap; justify-content: flex-end; }
+    }
   </style>
 </head>
 <body>
-<main class="shell">
-  <header class="hero">
-    <h1>Custom Hybrid MinerU</h1>
-    <p>Remote document extraction with Pipeline OCR, controlled vLLM generation, hierarchical Table Cell fusion, and content-level bounding boxes.</p>
-    <div class="hero-badges">
-      <span class="hero-badge">OCR + Hybrid Fusion</span>
-      <span class="hero-badge">Table Cell Bounding Boxes</span>
-      <span id="serverStatus" class="hero-badge service-pill"><span class="dot"></span><span>Checking service</span></span>
+<main class="app-shell">
+  <header class="app-header">
+    <div class="brand">
+      <div class="brand-mark">M</div>
+      <div>
+        <h1>Custom Hybrid MinerU</h1>
+        <small>Document extraction workspace</small>
+      </div>
+    </div>
+    <div id="serverStatus" class="service-status">
+      <span class="status-dot"></span>
+      <span>Checking service</span>
     </div>
   </header>
 
   <section class="workspace">
-    <aside class="panel">
-      <div class="panel-title"><span>01</span> Upload & Settings</div>
+    <aside class="panel controls-pane">
+      <div class="panel-header"><h2 class="panel-title">Upload & Settings</h2></div>
       <div class="controls">
         <label id="dropZone" class="drop-zone" for="fileInput">
-          <span class="upload-icon">↑</span>
+          <span class="upload-symbol">&#8593;</span>
           <strong>Drop files here</strong>
-          <small>or click to upload PDF and image files</small>
+          <small>PDF and image files</small>
         </label>
         <input id="fileInput" type="file" multiple accept=".pdf,.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff">
         <div id="fileList" class="file-list"></div>
 
-        <div class="setting-card">
-          <div class="setting-label">Extraction Settings</div>
-          <div class="setting-help">Applied to this task only.</div>
+        <section class="settings-section">
+          <h3 class="settings-title">Extraction</h3>
           <div class="settings-grid">
+            <div class="field field-wide">
+              <label for="extractionModeInput">Extraction Mode</label>
+              <select id="extractionModeInput">
+                <option value="hybrid_fusion" selected>Hybrid Fusion</option>
+                <option value="bbox_vlm">OCR BBox + VLM</option>
+              </select>
+            </div>
+            <div class="field field-wide">
+              <label for="costProfileInput">Cost Profile</label>
+              <select id="costProfileInput">
+                <option value="balanced" selected>Balanced</option>
+                <option value="quality">Workflow Config</option>
+              </select>
+            </div>
             <div class="field">
               <label for="effortInput">Effort</label>
               <select id="effortInput">
-                <option value="medium">Medium</option>
-                <option value="high" selected>High</option>
+                <option value="medium" selected>Medium</option>
+                <option value="high">High</option>
               </select>
             </div>
             <div class="field">
@@ -183,14 +347,14 @@
               </select>
             </div>
             <div class="field field-wide">
-              <label for="langInput">Language</label>
+              <label for="langInput">OCR Language</label>
               <input id="langInput" type="text" value="ch" maxlength="32" autocomplete="off">
             </div>
           </div>
-        </div>
-        <div class="setting-card">
-          <div class="setting-label">vLLM Generation</div>
-          <div class="setting-help">These values take priority over workflow rules for this task.</div>
+        </section>
+
+        <details class="advanced-settings">
+          <summary>Advanced vLLM Settings</summary>
           <div class="settings-grid">
             <div class="field">
               <label for="temperatureInput">Temperature</label>
@@ -213,76 +377,92 @@
               <input id="repetitionPenaltyInput" type="number" min="0.01" max="2" step="0.01" value="1">
             </div>
           </div>
-          <div class="parameter-note">Keep prompt tokens + Max Tokens within the remote model context window.</div>
-        </div>
+        </details>
 
         <div class="actions">
           <button id="submitButton" class="primary" disabled>Convert</button>
           <button id="clearButton" class="secondary" disabled>Clear</button>
         </div>
-        <span id="taskState" class="task-state">waiting</span>
-        <div id="message" class="message">Select one or more files to begin.</div>
+
+        <section class="task-status">
+          <div class="task-status-row">
+            <strong class="settings-title">Status</strong>
+            <span id="taskState" class="task-state">waiting</span>
+          </div>
+          <div id="message" class="message">Select one or more files to begin.</div>
+          <ol class="progress-list" aria-label="Conversion progress">
+            <li class="stage" data-stage="prepare">Prepare</li>
+            <li class="stage" data-stage="service">Service</li>
+            <li class="stage" data-stage="upload">Upload</li>
+            <li class="stage" data-stage="queue">Queue</li>
+            <li class="stage" data-stage="parse">Parse & OCR</li>
+            <li class="stage" data-stage="build">Build Outputs</li>
+            <li class="stage" data-stage="done">Done</li>
+          </ol>
+        </section>
       </div>
     </aside>
 
-    <section class="panel">
-      <div class="panel-title preview-title">
-        <div class="preview-title-label"><span>02</span> Document Preview</div>
-        <div class="preview-switch">
+    <section class="panel viewer-pane">
+      <div class="panel-header">
+        <h2 class="panel-title">Document Preview</h2>
+        <div class="segmented" aria-label="Document view">
           <button id="viewOriginalButton" class="active" disabled>Original</button>
           <button id="viewBboxButton" disabled>Bounding Boxes</button>
         </div>
       </div>
-      <div id="previewBody" class="preview-body">
-        <div id="emptyPreview" class="empty-preview">The selected PDF or image will be previewed here before it is sent to the remote MinerU service.</div>
+      <div class="preview-body">
+        <div id="emptyPreview" class="empty-state">Select a document to preview.</div>
         <iframe id="previewFrame" class="preview-frame hidden" title="PDF preview"></iframe>
         <img id="previewImage" class="preview-image hidden" alt="Selected document preview">
       </div>
     </section>
 
-    <section class="panel results">
-      <nav class="tabs" aria-label="Result views">
-        <button class="tab-button active" data-tab="report">Fusion Report</button>
-        <button class="tab-button" data-tab="task">Task Details</button>
-        <button class="tab-button" data-tab="downloads">Downloads</button>
+    <section class="panel output-pane">
+      <div class="panel-header">
+        <h2 class="panel-title">Extraction Result</h2>
+        <div class="output-actions">
+          <select id="documentSelect" class="document-select hidden" aria-label="Result document"></select>
+          <a id="downloadButton" class="download-button" href="#">Download ZIP</a>
+        </div>
+      </div>
+      <nav class="result-tabs" aria-label="Result views" role="tablist">
+        <button class="result-tab active" data-result-tab="rendered" role="tab" aria-selected="true">Markdown Rendering</button>
+        <button class="result-tab" data-result-tab="markdown" role="tab" aria-selected="false">Markdown Text</button>
+        <button class="result-tab" data-result-tab="content" role="tab" aria-selected="false">Content List JSON</button>
+        <button class="result-tab" data-result-tab="fusion" role="tab" aria-selected="false">Fusion Report</button>
       </nav>
-      <div id="reportPanel" class="tab-panel active">
+
+      <div id="renderedPanel" class="result-panel active" role="tabpanel">
+        <div id="markdownEmpty" class="result-empty">Markdown output will appear here.</div>
+        <article id="markdownRender" class="markdown-render hidden"></article>
+      </div>
+      <div id="markdownPanel" class="result-panel" role="tabpanel">
+        <pre id="markdownText" class="source-output">Markdown text will appear here.</pre>
+      </div>
+      <div id="contentPanel" class="result-panel" role="tabpanel">
+        <pre id="contentListOutput" class="source-output">Content list JSON will appear here.</pre>
+      </div>
+      <div id="fusionPanel" class="result-panel" role="tabpanel">
         <div id="coverageSummary" class="coverage-summary" aria-label="Coverage summary">
-          <div class="coverage-metric"><strong id="coverageValue">—</strong><span>OCR Spatial Coverage</span></div>
-          <div class="coverage-metric"><strong id="recoveredValue">—</strong><span>Recovered OCR Lines</span></div>
-          <div class="coverage-metric"><strong id="uncoveredValue">—</strong><span>Uncovered OCR Lines</span></div>
-          <div class="coverage-metric"><strong id="unreliableTablesValue">—</strong><span>Unreliable Tables</span></div>
-          <div class="coverage-metric"><strong id="keyValuePairsValue">—</strong><span>Key–Value Pairs</span></div>
+          <div class="coverage-metric"><strong id="coverageValue">-</strong><span>OCR Spatial Coverage</span></div>
+          <div class="coverage-metric"><strong id="recoveredValue">-</strong><span>Recovered OCR Lines</span></div>
+          <div class="coverage-metric"><strong id="uncoveredValue">-</strong><span>Uncovered OCR Lines</span></div>
+          <div class="coverage-metric"><strong id="unreliableTablesValue">-</strong><span>Unreliable Tables</span></div>
+          <div class="coverage-metric"><strong id="keyValuePairsValue">-</strong><span>Key–Value Pairs</span></div>
+          <div class="coverage-metric"><strong id="vlmRecognizedValue">-</strong><span>VLM Recognized</span></div>
+          <div class="coverage-metric"><strong id="ocrRetainedValue">-</strong><span>OCR Retained</span></div>
+          <div class="coverage-metric"><strong id="protocolEchoesValue">-</strong><span>Protocol Echoes</span></div>
+          <div class="coverage-metric"><strong id="invalidRecognitionValue">-</strong><span>Invalid VLM Outputs</span></div>
+          <div class="coverage-metric"><strong id="recognitionErrorsValue">-</strong><span>Recognition Errors</span></div>
         </div>
-        <div id="reportEmpty" class="output-empty">Fusion statistics will appear here after processing completes.</div>
-        <pre id="reportOutput" class="hidden"></pre>
-      </div>
-      <div id="taskPanel" class="tab-panel">
-        <div id="taskEmpty" class="output-empty">Task status and server timestamps will appear after submission.</div>
-        <pre id="taskOutput" class="hidden"></pre>
-      </div>
-      <div id="downloadsPanel" class="tab-panel">
-        <div id="downloadEmpty" class="output-empty">The fused result package will be available when the task is complete.</div>
-        <div id="downloadCard" class="download-card">
-          <h3>Fused result package</h3>
-          <p>Includes fused outputs, Table Cell metadata, OCR content boxes, fusion summary, and the vLLM request audit.</p>
-          <a id="downloadButton" class="download-button">Download Fused ZIP</a>
-        </div>
+        <div id="fusionEmpty" class="result-empty">Fusion statistics will appear here.</div>
+        <h3 id="fusionReportTitle" class="fusion-section-title hidden">Fusion Report</h3>
+        <pre id="reportOutput" class="source-output hidden"></pre>
+        <h3 id="taskDetailsTitle" class="fusion-section-title hidden">Task Details</h3>
+        <pre id="taskOutput" class="source-output hidden"></pre>
       </div>
     </section>
-  </section>
-
-  <section class="pipeline">
-    <h2>Conversion progress</h2>
-    <div class="stages">
-      <div class="stage" data-stage="prepare">Prepare</div>
-      <div class="stage" data-stage="service">Check Service</div>
-      <div class="stage" data-stage="upload">Upload</div>
-      <div class="stage" data-stage="queue">Queue</div>
-      <div class="stage" data-stage="parse">Parse & OCR</div>
-      <div class="stage" data-stage="build">Build Outputs</div>
-      <div class="stage" data-stage="done">Done</div>
-    </div>
   </section>
 </main>
 
@@ -290,6 +470,8 @@
   const fileInput = document.querySelector('#fileInput');
   const dropZone = document.querySelector('#dropZone');
   const fileList = document.querySelector('#fileList');
+  const costProfileInput = document.querySelector('#costProfileInput');
+  const extractionModeInput = document.querySelector('#extractionModeInput');
   const effortInput = document.querySelector('#effortInput');
   const methodInput = document.querySelector('#methodInput');
   const langInput = document.querySelector('#langInput');
@@ -308,25 +490,43 @@
   const previewImage = document.querySelector('#previewImage');
   const viewOriginalButton = document.querySelector('#viewOriginalButton');
   const viewBboxButton = document.querySelector('#viewBboxButton');
-  const reportEmpty = document.querySelector('#reportEmpty');
-  const reportOutput = document.querySelector('#reportOutput');
-  const coverageSummary = document.querySelector('#coverageSummary');
-  const taskEmpty = document.querySelector('#taskEmpty');
-  const taskOutput = document.querySelector('#taskOutput');
-  const downloadEmpty = document.querySelector('#downloadEmpty');
-  const downloadCard = document.querySelector('#downloadCard');
+  const documentSelect = document.querySelector('#documentSelect');
   const downloadButton = document.querySelector('#downloadButton');
+  const markdownEmpty = document.querySelector('#markdownEmpty');
+  const markdownRender = document.querySelector('#markdownRender');
+  const markdownText = document.querySelector('#markdownText');
+  const contentListOutput = document.querySelector('#contentListOutput');
+  const coverageSummary = document.querySelector('#coverageSummary');
+  const fusionEmpty = document.querySelector('#fusionEmpty');
+  const fusionReportTitle = document.querySelector('#fusionReportTitle');
+  const reportOutput = document.querySelector('#reportOutput');
+  const taskDetailsTitle = document.querySelector('#taskDetailsTitle');
+  const taskOutput = document.querySelector('#taskOutput');
+
   let selectedFiles = [];
   let previewUrl = null;
   let pollTimer = null;
   let serviceOnline = false;
+  let taskBusy = false;
+  let activeTaskId = null;
 
   const parameterInputs = [
-    effortInput, methodInput, langInput, temperatureInput, topPInput,
-    seedInput, maxTokensInput, repetitionPenaltyInput,
+    extractionModeInput, costProfileInput, effortInput, methodInput, langInput, temperatureInput,
+    topPInput, seedInput, maxTokensInput, repetitionPenaltyInput,
   ];
-
   const stageOrder = ['prepare', 'service', 'upload', 'queue', 'parse', 'build', 'done'];
+
+  function escapeHtml(value) {
+    const node = document.createElement('div');
+    node.textContent = String(value ?? '');
+    return node.innerHTML;
+  }
+
+  function formatBytes(value) {
+    return value < 1024 * 1024
+      ? `${(value / 1024).toFixed(1)} KB`
+      : `${(value / 1024 / 1024).toFixed(2)} MB`;
+  }
 
   function setStage(activeName, completedNames = []) {
     document.querySelectorAll('.stage').forEach(stage => {
@@ -342,21 +542,13 @@
     setStage(null, stageOrder.slice(0, index + 1));
   }
 
-  const formatBytes = value => value < 1024 * 1024
-    ? `${(value / 1024).toFixed(1)} KB`
-    : `${(value / 1024 / 1024).toFixed(2)} MB`;
-
-  function escapeHtml(value) {
-    const node = document.createElement('div');
-    node.textContent = value;
-    return node.innerHTML;
-  }
-
   function applyParameterDefaults(defaults) {
     if (!defaults) return;
     const mineru = defaults.mineru || {};
     const generation = defaults.generation || {};
     const assignments = [
+      [extractionModeInput, defaults.extraction_mode],
+      [costProfileInput, defaults.cost_profile],
       [effortInput, mineru.effort],
       [methodInput, mineru.method],
       [langInput, mineru.lang],
@@ -367,27 +559,43 @@
       [repetitionPenaltyInput, generation.repetition_penalty],
     ];
     assignments.forEach(([input, value]) => {
-      input.value = value === null || value === undefined ? '' : String(value);
+      if (value !== null && value !== undefined) input.value = String(value);
     });
+  }
+
+  function setBusy(busy) {
+    taskBusy = busy;
+    fileInput.disabled = busy;
+    dropZone.classList.toggle('disabled', busy);
+    parameterInputs.forEach(input => { input.disabled = busy; });
+    submitButton.disabled = busy || !selectedFiles.length || !serviceOnline;
+    clearButton.disabled = busy || !selectedFiles.length;
+    submitButton.textContent = busy
+      ? 'Converting...'
+      : (activeTaskId ? 'Convert Again' : 'Convert');
   }
 
   function renderFiles() {
     fileList.innerHTML = selectedFiles.map(file => `
-      <div class="file-item"><span class="file-name">${escapeHtml(file.name)}</span><span class="file-size">${formatBytes(file.size)}</span></div>
+      <div class="file-item">
+        <span class="file-name">${escapeHtml(file.name)}</span>
+        <span class="file-size">${formatBytes(file.size)}</span>
+      </div>
     `).join('');
-    submitButton.disabled = selectedFiles.length === 0 || !serviceOnline;
-    clearButton.disabled = selectedFiles.length === 0;
+    setBusy(taskBusy);
   }
 
-  function renderPreview() {
+  function renderOriginalPreview() {
     if (previewUrl) URL.revokeObjectURL(previewUrl);
     previewFrame.classList.add('hidden');
     previewImage.classList.add('hidden');
     previewFrame.removeAttribute('src');
     previewImage.removeAttribute('src');
+    viewOriginalButton.classList.add('active');
+    viewBboxButton.classList.remove('active');
     if (!selectedFiles.length) {
-      emptyPreview.classList.remove('hidden');
       previewUrl = null;
+      emptyPreview.classList.remove('hidden');
       viewOriginalButton.disabled = true;
       viewBboxButton.disabled = true;
       return;
@@ -396,8 +604,6 @@
     previewUrl = URL.createObjectURL(file);
     emptyPreview.classList.add('hidden');
     viewOriginalButton.disabled = false;
-    viewOriginalButton.classList.add('active');
-    viewBboxButton.classList.remove('active');
     if (file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')) {
       previewFrame.src = previewUrl;
       previewFrame.classList.remove('hidden');
@@ -408,24 +614,58 @@
   }
 
   function showBoundingBoxPreview(taskId) {
-    if (previewUrl) {
-      URL.revokeObjectURL(previewUrl);
-      previewUrl = null;
-    }
-    emptyPreview.classList.add('hidden');
     previewImage.classList.add('hidden');
-    previewFrame.src = `/api/tasks/${taskId}/preview`;
+    emptyPreview.classList.add('hidden');
+    previewFrame.src = `/api/tasks/${encodeURIComponent(taskId)}/preview`;
     previewFrame.classList.remove('hidden');
     viewOriginalButton.classList.remove('active');
     viewBboxButton.classList.add('active');
   }
 
+  function activateResultTab(name) {
+    document.querySelectorAll('.result-tab').forEach(button => {
+      const active = button.dataset.resultTab === name;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-selected', String(active));
+    });
+    document.querySelectorAll('.result-panel').forEach(panel => {
+      panel.classList.toggle('active', panel.id === `${name}Panel`);
+    });
+  }
+
+  document.querySelectorAll('.result-tab').forEach(button => {
+    button.addEventListener('click', () => activateResultTab(button.dataset.resultTab));
+  });
+
+  function resetResults() {
+    markdownEmpty.classList.remove('hidden');
+    markdownRender.classList.add('hidden');
+    markdownRender.replaceChildren();
+    markdownText.textContent = 'Markdown text will appear here.';
+    contentListOutput.textContent = 'Content list JSON will appear here.';
+    coverageSummary.classList.remove('visible');
+    fusionEmpty.classList.remove('hidden');
+    fusionReportTitle.classList.add('hidden');
+    reportOutput.classList.add('hidden');
+    reportOutput.textContent = '';
+    taskDetailsTitle.classList.add('hidden');
+    taskOutput.classList.add('hidden');
+    taskOutput.textContent = '';
+    documentSelect.classList.add('hidden');
+    documentSelect.replaceChildren();
+    downloadButton.classList.remove('visible');
+    downloadButton.removeAttribute('href');
+    activateResultTab('rendered');
+  }
+
   function selectFiles(files) {
     selectedFiles = Array.from(files);
+    activeTaskId = null;
     viewBboxButton.disabled = true;
     viewBboxButton.onclick = null;
+    resetResults();
     renderFiles();
-    renderPreview();
+    renderOriginalPreview();
     taskState.textContent = selectedFiles.length ? 'ready' : 'waiting';
     taskState.className = 'task-state';
     message.className = 'message';
@@ -435,26 +675,16 @@
     if (selectedFiles.length) setStage('service', ['prepare']);
   }
 
-  function resetResults() {
-    coverageSummary.classList.remove('visible');
-    reportEmpty.classList.remove('hidden');
-    reportOutput.classList.add('hidden');
-    reportOutput.textContent = '';
-    taskEmpty.classList.remove('hidden');
-    taskOutput.classList.add('hidden');
-    taskOutput.textContent = '';
-    downloadEmpty.classList.remove('hidden');
-    downloadCard.classList.remove('visible');
-    downloadButton.removeAttribute('href');
-  }
-
   function clearAll() {
-    if (pollTimer) clearInterval(pollTimer);
+    if (taskBusy) return;
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = null;
+    activeTaskId = null;
     selectedFiles = [];
     fileInput.value = '';
-    renderFiles();
-    renderPreview();
     resetResults();
+    renderFiles();
+    renderOriginalPreview();
     taskState.textContent = 'waiting';
     taskState.className = 'task-state';
     message.className = 'message';
@@ -464,28 +694,303 @@
 
   fileInput.addEventListener('change', event => selectFiles(event.target.files));
   ['dragenter', 'dragover'].forEach(name => dropZone.addEventListener(name, event => {
-    event.preventDefault(); dropZone.classList.add('dragging');
+    event.preventDefault();
+    if (!taskBusy) dropZone.classList.add('dragging');
   }));
   ['dragleave', 'drop'].forEach(name => dropZone.addEventListener(name, event => {
-    event.preventDefault(); dropZone.classList.remove('dragging');
+    event.preventDefault();
+    dropZone.classList.remove('dragging');
   }));
-  dropZone.addEventListener('drop', event => selectFiles(event.dataTransfer.files));
-  clearButton.addEventListener('click', clearAll);
-  viewOriginalButton.addEventListener('click', () => renderPreview());
-
-  document.querySelectorAll('.tab-button').forEach(button => {
-    button.addEventListener('click', () => {
-      document.querySelectorAll('.tab-button').forEach(item => item.classList.toggle('active', item === button));
-      document.querySelectorAll('.tab-panel').forEach(panel => panel.classList.toggle('active', panel.id === `${button.dataset.tab}Panel`));
-    });
+  dropZone.addEventListener('drop', event => {
+    if (!taskBusy) selectFiles(event.dataTransfer.files);
   });
+  clearButton.addEventListener('click', clearAll);
+  viewOriginalButton.addEventListener('click', renderOriginalPreview);
 
   async function jsonResponse(response) {
     const text = await response.text();
     let payload;
-    try { payload = JSON.parse(text); } catch { payload = { detail: text || `HTTP ${response.status}` }; }
+    try { payload = JSON.parse(text); }
+    catch { payload = { detail: text || `HTTP ${response.status}` }; }
     if (!response.ok) throw new Error(payload.detail || payload.error || `HTTP ${response.status}`);
     return payload;
+  }
+
+  function safeLinkUrl(rawUrl) {
+    try {
+      const parsed = new URL(rawUrl, window.location.origin);
+      return ['http:', 'https:'].includes(parsed.protocol) ? parsed.href : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function assetUrl(taskId, documentId, rawPath) {
+    const value = String(rawPath || '').trim().replace(/^<|>$/g, '');
+    if (!value || /^(?:[a-z]+:|\/\/|#)/i.test(value)) return null;
+    const query = new URLSearchParams({document: documentId, path: value});
+    return `/api/tasks/${encodeURIComponent(taskId)}/asset?${query.toString()}`;
+  }
+
+  function renderInline(source, taskId, documentId) {
+    const tokens = [];
+    const hold = html => `\uE000${tokens.push(html) - 1}\uE001`;
+    let value = String(source || '');
+    value = value.replace(/`([^`]+)`/g, (_match, code) => hold(`<code>${escapeHtml(code)}</code>`));
+    value = value.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_match, alt, path) => {
+      const src = assetUrl(taskId, documentId, path);
+      return src ? hold(`<img src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" loading="lazy">`) : escapeHtml(alt);
+    });
+    value = value.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_match, label, url) => {
+      const href = safeLinkUrl(url);
+      return href
+        ? hold(`<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)}</a>`)
+        : escapeHtml(label);
+    });
+    value = escapeHtml(value);
+    value = value.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    value = value.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+    value = value.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+    value = value.replace(/\uE000(\d+)\uE001/g, (_match, index) => tokens[Number(index)] || '');
+    return value;
+  }
+
+  function splitPipeRow(line) {
+    return line.trim().replace(/^\||\|$/g, '').split(/(?<!\\)\|/).map(cell => cell.trim().replace(/\\\|/g, '|'));
+  }
+
+  function isPipeSeparator(line) {
+    const cells = splitPipeRow(line);
+    return cells.length > 0 && cells.every(cell => /^:?-{3,}:?$/.test(cell));
+  }
+
+  function sanitizeHtmlTable(rawTable, taskId, documentId) {
+    const parsed = new DOMParser().parseFromString(rawTable, 'text/html');
+    const table = parsed.querySelector('table');
+    if (!table) return `<p>${escapeHtml(rawTable)}</p>`;
+    const rows = Array.from(table.querySelectorAll('tr'));
+    const body = rows.map(row => {
+      const cells = Array.from(row.children).filter(cell => ['TH', 'TD'].includes(cell.tagName));
+      return `<tr>${cells.map(cell => {
+        const tag = cell.tagName === 'TH' ? 'th' : 'td';
+        const colspan = /^\d+$/.test(cell.getAttribute('colspan') || '') ? ` colspan="${cell.getAttribute('colspan')}"` : '';
+        const rowspan = /^\d+$/.test(cell.getAttribute('rowspan') || '') ? ` rowspan="${cell.getAttribute('rowspan')}"` : '';
+        return `<${tag}${colspan}${rowspan}>${renderInline(cell.textContent || '', taskId, documentId)}</${tag}>`;
+      }).join('')}</tr>`;
+    }).join('');
+    return `<table><tbody>${body}</tbody></table>`;
+  }
+
+  function renderMarkdown(source, taskId, documentId) {
+    const lines = String(source || '').replace(/\r\n?/g, '\n').split('\n');
+    const output = [];
+    for (let index = 0; index < lines.length;) {
+      const line = lines[index];
+      if (!line.trim()) { index += 1; continue; }
+      if (/^```/.test(line.trim())) {
+        const language = line.trim().slice(3).trim();
+        const code = [];
+        index += 1;
+        while (index < lines.length && !/^```/.test(lines[index].trim())) code.push(lines[index++]);
+        if (index < lines.length) index += 1;
+        output.push(`<pre><code data-language="${escapeHtml(language)}">${escapeHtml(code.join('\n'))}</code></pre>`);
+        continue;
+      }
+      if (/<table(?:\s|>)/i.test(line)) {
+        const tableLines = [line];
+        index += 1;
+        while (index < lines.length && !/<\/table>/i.test(tableLines[tableLines.length - 1])) tableLines.push(lines[index++]);
+        output.push(sanitizeHtmlTable(tableLines.join('\n'), taskId, documentId));
+        continue;
+      }
+      if (index + 1 < lines.length && line.includes('|') && isPipeSeparator(lines[index + 1])) {
+        const headers = splitPipeRow(line);
+        index += 2;
+        const rows = [];
+        while (index < lines.length && lines[index].includes('|') && lines[index].trim()) rows.push(splitPipeRow(lines[index++]));
+        output.push(`<table><thead><tr>${headers.map(cell => `<th>${renderInline(cell, taskId, documentId)}</th>`).join('')}</tr></thead><tbody>${rows.map(row => `<tr>${headers.map((_header, cellIndex) => `<td>${renderInline(row[cellIndex] || '', taskId, documentId)}</td>`).join('')}</tr>`).join('')}</tbody></table>`);
+        continue;
+      }
+      const heading = line.match(/^(#{1,4})\s+(.+)$/);
+      if (heading) {
+        const level = heading[1].length;
+        output.push(`<h${level}>${renderInline(heading[2], taskId, documentId)}</h${level}>`);
+        index += 1;
+        continue;
+      }
+      if (/^\s*[-*_]{3,}\s*$/.test(line)) { output.push('<hr>'); index += 1; continue; }
+      if (/^>\s?/.test(line)) { output.push(`<blockquote>${renderInline(line.replace(/^>\s?/, ''), taskId, documentId)}</blockquote>`); index += 1; continue; }
+      if (/^\s*[-+*]\s+/.test(line)) {
+        const items = [];
+        while (index < lines.length && /^\s*[-+*]\s+/.test(lines[index])) items.push(lines[index++].replace(/^\s*[-+*]\s+/, ''));
+        output.push(`<ul>${items.map(item => `<li>${renderInline(item, taskId, documentId)}</li>`).join('')}</ul>`);
+        continue;
+      }
+      if (/^\s*\d+[.)]\s+/.test(line)) {
+        const items = [];
+        while (index < lines.length && /^\s*\d+[.)]\s+/.test(lines[index])) items.push(lines[index++].replace(/^\s*\d+[.)]\s+/, ''));
+        output.push(`<ol>${items.map(item => `<li>${renderInline(item, taskId, documentId)}</li>`).join('')}</ol>`);
+        continue;
+      }
+      output.push(`<p>${renderInline(line, taskId, documentId)}</p>`);
+      index += 1;
+    }
+    return output.join('');
+  }
+
+  function formatJsonText(raw) {
+    if (!raw) return 'No content list JSON is available for this document.';
+    try { return JSON.stringify(JSON.parse(raw), null, 2); }
+    catch { return raw; }
+  }
+
+  function populateDocumentSelect(documents, selected) {
+    documentSelect.replaceChildren();
+    documents.forEach(documentInfo => {
+      const option = document.createElement('option');
+      option.value = documentInfo.id;
+      option.textContent = documentInfo.name;
+      option.selected = documentInfo.id === selected;
+      documentSelect.appendChild(option);
+    });
+    documentSelect.classList.toggle('hidden', documents.length <= 1);
+  }
+
+  async function loadMarkdown(taskId, selectedDocument = null) {
+    const query = selectedDocument ? `?document=${encodeURIComponent(selectedDocument)}` : '';
+    const result = await jsonResponse(await fetch(`/api/tasks/${encodeURIComponent(taskId)}/markdown${query}`));
+    populateDocumentSelect(result.documents || [], result.selected);
+    markdownText.textContent = result.markdown || '';
+    contentListOutput.textContent = formatJsonText(result.content_list);
+    markdownRender.innerHTML = renderMarkdown(result.markdown || '', taskId, result.selected);
+    markdownEmpty.classList.add('hidden');
+    markdownRender.classList.remove('hidden');
+  }
+
+  documentSelect.addEventListener('change', async () => {
+    if (!activeTaskId) return;
+    try { await loadMarkdown(activeTaskId, documentSelect.value); }
+    catch (error) {
+      markdownText.textContent = error.message;
+      markdownRender.textContent = error.message;
+    }
+  });
+
+  function updateTask(status) {
+    taskState.textContent = status.status;
+    taskState.className = `task-state ${status.status}`;
+    taskOutput.textContent = JSON.stringify(status, null, 2);
+    taskOutput.classList.remove('hidden');
+    taskDetailsTitle.classList.remove('hidden');
+    fusionEmpty.classList.add('hidden');
+    message.className = status.status === 'failed' ? 'message error' : 'message';
+    if (status.status === 'queued') {
+      message.textContent = 'Waiting for remote OCR and vLLM resources.';
+      setStage('queue', ['prepare', 'service', 'upload']);
+    } else if (status.status === 'processing') {
+      message.textContent = extractionModeInput.value === 'bbox_vlm'
+        ? 'Running Pipeline OCR, local Table BBox recognition, and safe text fusion.'
+        : 'Running Hybrid extraction, Pipeline OCR, and fusion.';
+      setStage('parse', ['prepare', 'service', 'upload', 'queue']);
+    } else if (status.status === 'completed') {
+      message.textContent = 'Conversion completed. You can convert the same files again.';
+      completeThrough('done');
+    } else if (status.status === 'failed') {
+      message.textContent = status.error || 'The remote workflow failed.';
+    }
+  }
+
+  function renderCoverageSummary(report) {
+    const totals = {total: 0, matched: 0, recovered: 0, uncovered: 0, unreliableTables: 0, keyValuePairs: 0, vlmRecognized: 0, ocrRetained: 0, protocolEchoes: 0, invalidRecognition: 0, recognitionErrors: 0};
+    const documents = report && report.documents ? Object.values(report.documents) : [];
+    documents.forEach(documentResult => {
+      const counts = documentResult && documentResult.counts ? documentResult.counts : {};
+      totals.total += Number(counts.ocr_recall_lines_total || 0);
+      totals.matched += Number(counts.ocr_recall_lines_matched || 0);
+      totals.recovered += Number(counts.ocr_recall_lines_recovered || 0);
+      totals.uncovered += Number(counts.ocr_recall_lines_unmatched || 0);
+      totals.unreliableTables += Number(counts.unreliable_table_targets || 0);
+      totals.keyValuePairs += Number(counts.key_value_pairs || 0);
+      totals.vlmRecognized += Number(counts.bbox_recognition_vlm_selected || 0);
+      totals.ocrRetained += Number(counts.bbox_recognition_ocr_kept || 0);
+      totals.protocolEchoes += Number(counts.bbox_recognition_protocol_echoes || 0);
+      totals.invalidRecognition += Number(counts.bbox_recognition_invalid_outputs || 0);
+      totals.recognitionErrors += Number(counts.bbox_recognition_errors || 0);
+    });
+    const coverage = totals.total ? ((totals.matched + totals.recovered) / totals.total) * 100 : 100;
+    document.querySelector('#coverageValue').textContent = `${coverage.toFixed(1)}%`;
+    document.querySelector('#recoveredValue').textContent = String(totals.recovered);
+    document.querySelector('#uncoveredValue').textContent = String(totals.uncovered);
+    document.querySelector('#unreliableTablesValue').textContent = String(totals.unreliableTables);
+    document.querySelector('#keyValuePairsValue').textContent = String(totals.keyValuePairs);
+    document.querySelector('#vlmRecognizedValue').textContent = String(totals.vlmRecognized);
+    document.querySelector('#ocrRetainedValue').textContent = String(totals.ocrRetained);
+    document.querySelector('#protocolEchoesValue').textContent = String(totals.protocolEchoes);
+    document.querySelector('#invalidRecognitionValue').textContent = String(totals.invalidRecognition);
+    document.querySelector('#recognitionErrorsValue').textContent = String(totals.recognitionErrors);
+    coverageSummary.classList.add('visible');
+  }
+
+  async function loadCompletedOutputs(taskId) {
+    setStage('build', ['prepare', 'service', 'upload', 'queue', 'parse']);
+    const [reportResult, markdownResult] = await Promise.allSettled([
+      fetch(`/api/tasks/${encodeURIComponent(taskId)}/report`).then(jsonResponse),
+      loadMarkdown(taskId),
+    ]);
+    if (reportResult.status === 'fulfilled') {
+      renderCoverageSummary(reportResult.value);
+      reportOutput.textContent = JSON.stringify(reportResult.value, null, 2);
+      reportOutput.classList.remove('hidden');
+      fusionReportTitle.classList.remove('hidden');
+      fusionEmpty.classList.add('hidden');
+    }
+    if (markdownResult.status === 'rejected') {
+      markdownEmpty.textContent = markdownResult.reason.message || 'Markdown output is unavailable.';
+    }
+    downloadButton.href = `/api/tasks/${encodeURIComponent(taskId)}/result`;
+    downloadButton.classList.add('visible');
+    const firstFile = selectedFiles[0];
+    const isPdf = firstFile && (firstFile.type === 'application/pdf' || firstFile.name.toLowerCase().endsWith('.pdf'));
+    if (isPdf) {
+      viewBboxButton.disabled = false;
+      viewBboxButton.onclick = () => showBoundingBoxPreview(taskId);
+      showBoundingBoxPreview(taskId);
+    }
+    completeThrough('done');
+  }
+
+  async function pollTask(taskId) {
+    try {
+      const status = await jsonResponse(await fetch(`/api/tasks/${encodeURIComponent(taskId)}`));
+      if (taskId !== activeTaskId) return true;
+      updateTask(status);
+      if (status.status === 'completed') {
+        await loadCompletedOutputs(taskId);
+        setBusy(false);
+        return true;
+      }
+      if (status.status === 'failed') {
+        setBusy(false);
+        return true;
+      }
+      return false;
+    } catch (error) {
+      taskState.textContent = 'error';
+      taskState.className = 'task-state failed';
+      message.className = 'message error';
+      message.textContent = error.message;
+      setBusy(false);
+      return true;
+    }
+  }
+
+  async function continuePolling(taskId) {
+    const terminal = await pollTask(taskId);
+    if (!terminal && taskId === activeTaskId) {
+      pollTimer = setTimeout(() => continuePolling(taskId), 1500);
+    } else {
+      pollTimer = null;
+    }
   }
 
   async function checkHealth() {
@@ -493,12 +998,12 @@
       const health = await jsonResponse(await fetch('/api/health'));
       applyParameterDefaults(health.task_parameter_defaults);
       serviceOnline = true;
-      serverStatus.className = 'hero-badge service-pill online';
+      serverStatus.className = 'service-status online';
       serverStatus.lastElementChild.textContent = 'Remote service online';
       setStage('prepare', ['service']);
     } catch (error) {
       serviceOnline = false;
-      serverStatus.className = 'hero-badge service-pill offline';
+      serverStatus.className = 'service-status offline';
       serverStatus.lastElementChild.textContent = 'Remote service unavailable';
       setStage('service');
       message.className = 'message error';
@@ -507,103 +1012,26 @@
     renderFiles();
   }
 
-  function updateTask(status) {
-    taskState.textContent = status.status;
-    taskState.className = `task-state ${status.status}`;
-    taskOutput.textContent = JSON.stringify(status, null, 2);
-    taskOutput.classList.remove('hidden');
-    taskEmpty.classList.add('hidden');
-    message.className = status.status === 'failed' ? 'message error' : 'message';
-    if (status.status === 'queued') {
-      message.textContent = 'The task is waiting for remote OCR and vLLM resources.';
-      setStage('queue', ['prepare', 'service', 'upload']);
-    } else if (status.status === 'processing') {
-      message.textContent = 'Running Hybrid extraction, Pipeline OCR, and Table Cell fusion.';
-      setStage('parse', ['prepare', 'service', 'upload', 'queue']);
-    } else if (status.status === 'completed') {
-      message.textContent = 'Conversion completed. The fused result package is ready.';
-      completeThrough('done');
-    } else if (status.status === 'failed') {
-      message.textContent = status.error || 'The remote workflow failed.';
-    }
-  }
-
-  function renderCoverageSummary(report) {
-    const totals = { total: 0, matched: 0, recovered: 0, uncovered: 0, unreliableTables: 0, keyValuePairs: 0 };
-    const documents = report && report.documents ? Object.values(report.documents) : [];
-    for (const documentResult of documents) {
-      const counts = documentResult && documentResult.counts ? documentResult.counts : {};
-      totals.total += Number(counts.ocr_recall_lines_total || 0);
-      totals.matched += Number(counts.ocr_recall_lines_matched || 0);
-      totals.recovered += Number(counts.ocr_recall_lines_recovered || 0);
-      totals.uncovered += Number(counts.ocr_recall_lines_unmatched || 0);
-      totals.unreliableTables += Number(counts.unreliable_table_targets || 0);
-      totals.keyValuePairs += Number(counts.key_value_pairs || 0);
-    }
-    const coverage = totals.total ? ((totals.matched + totals.recovered) / totals.total) * 100 : 100;
-    document.querySelector('#coverageValue').textContent = `${coverage.toFixed(1)}%`;
-    document.querySelector('#recoveredValue').textContent = String(totals.recovered);
-    document.querySelector('#uncoveredValue').textContent = String(totals.uncovered);
-    document.querySelector('#unreliableTablesValue').textContent = String(totals.unreliableTables);
-    document.querySelector('#keyValuePairsValue').textContent = String(totals.keyValuePairs);
-    coverageSummary.classList.add('visible');
-  }
-
-  async function pollTask(taskId) {
-    try {
-      const status = await jsonResponse(await fetch(`/api/tasks/${taskId}`));
-      updateTask(status);
-      if (status.status === 'completed') {
-        if (pollTimer) clearInterval(pollTimer);
-        setStage('build', ['prepare', 'service', 'upload', 'queue', 'parse']);
-        const report = await jsonResponse(await fetch(`/api/tasks/${taskId}/report`));
-        renderCoverageSummary(report);
-        reportOutput.textContent = JSON.stringify(report, null, 2);
-        reportOutput.classList.remove('hidden');
-        reportEmpty.classList.add('hidden');
-        downloadButton.href = `/api/tasks/${taskId}/result`;
-        downloadCard.classList.add('visible');
-        downloadEmpty.classList.add('hidden');
-        const firstFile = selectedFiles[0];
-        const isPdf = firstFile && (firstFile.type === 'application/pdf' || firstFile.name.toLowerCase().endsWith('.pdf'));
-        if (isPdf) {
-          viewBboxButton.disabled = false;
-          viewBboxButton.onclick = () => showBoundingBoxPreview(taskId);
-          showBoundingBoxPreview(taskId);
-        }
-        completeThrough('done');
-      } else if (status.status === 'failed') {
-        if (pollTimer) clearInterval(pollTimer);
-      }
-      return status.status === 'completed' || status.status === 'failed';
-    } catch (error) {
-      if (pollTimer) clearInterval(pollTimer);
-      taskState.textContent = 'error';
-      taskState.className = 'task-state failed';
-      message.className = 'message error';
-      message.textContent = error.message;
-      return true;
-    }
-  }
-
   submitButton.addEventListener('click', async () => {
-    if (!selectedFiles.length || !serviceOnline) return;
+    if (!selectedFiles.length || !serviceOnline || taskBusy) return;
     const invalidInput = parameterInputs.find(input => !input.checkValidity());
-    if (invalidInput) {
-      invalidInput.reportValidity();
-      return;
-    }
-    submitButton.disabled = true;
-    clearButton.disabled = true;
+    if (invalidInput) { invalidInput.reportValidity(); return; }
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = null;
+    activeTaskId = null;
     resetResults();
+    renderOriginalPreview();
+    setBusy(true);
     taskState.textContent = 'uploading';
     taskState.className = 'task-state uploading';
     message.className = 'message';
-    message.textContent = 'Uploading files to the remote Custom Hybrid MinerU service.';
+    message.textContent = 'Uploading files to the remote service.';
     setStage('upload', ['prepare', 'service']);
     const form = new FormData();
     selectedFiles.forEach(file => form.append('files', file, file.name));
     const taskParameters = {
+      extraction_mode: extractionModeInput.value,
+      cost_profile: costProfileInput.value,
       effort: effortInput.value,
       method: methodInput.value,
       lang: langInput.value.trim(),
@@ -617,23 +1045,22 @@
       if (value !== '') form.append(name, value);
     });
     try {
-      const task = await jsonResponse(await fetch('/api/tasks', { method: 'POST', body: form }));
+      const task = await jsonResponse(await fetch('/api/tasks', {method: 'POST', body: form}));
+      activeTaskId = task.task_id;
       updateTask(task);
-      const terminal = await pollTask(task.task_id);
-      if (!terminal) pollTimer = setInterval(() => pollTask(task.task_id), 1500);
+      await continuePolling(task.task_id);
     } catch (error) {
       taskState.textContent = 'failed';
       taskState.className = 'task-state failed';
       message.className = 'message error';
       message.textContent = error.message;
       setStage('upload', ['prepare', 'service']);
-    } finally {
-      clearButton.disabled = false;
-      if (taskState.textContent === 'failed') submitButton.disabled = false;
+      setBusy(false);
     }
   });
 
   resetResults();
+  renderOriginalPreview();
   checkHealth();
 </script>
 </body>

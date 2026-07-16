@@ -13,12 +13,17 @@ from projects.custom_hybrid.fusion import (
     OpenAIVisionVerifier,
     _parse_verifier_text,
     _parse_reconciliation_ids,
+    apply_bbox_recognition,
+    build_bbox_recognition_manifest,
     assign_ocr_lines,
     collect_table_geometry_quality,
+    collect_table_ocr_lines,
     collect_text_lines,
     collect_unreliable_table_ocr_lines,
     fuse_middle_json,
     recover_table_cell_geometry,
+    select_bbox_recognition_candidate,
+    synchronize_recognized_table_html,
 )
 from projects.custom_hybrid.table_fusion import (
     TableCellContext,
@@ -89,6 +94,129 @@ def structured_middle(
 
 
 class FusionTests(unittest.TestCase):
+    def test_bbox_vlm_settings_force_table_only_vlm_primary_recognition(self):
+        settings = FusionSettings.from_mapping(
+            {
+                "mode": "bbox_vlm",
+                "recognizer": {
+                    "enabled": False,
+                    "normal_ocr_enabled": True,
+                    "table_ocr_enabled": False,
+                    "selection_policy": "conservative",
+                },
+            }
+        )
+
+        self.assertEqual(settings.mode, "bbox_vlm")
+        self.assertTrue(settings.bbox_recognition_enabled)
+        self.assertFalse(settings.bbox_recognition_normal_ocr_enabled)
+        self.assertTrue(settings.bbox_recognition_table_ocr_enabled)
+        self.assertEqual(settings.bbox_recognition_selection_policy, "vlm_primary")
+
+    def test_vlm_primary_uses_valid_text_and_rejects_invalid_structured_values(self):
+        settings = FusionSettings.from_mapping({"mode": "bbox_vlm"})
+        general = collect_text_lines(middle("B1aine Bai")["pdf_info"][0], 0)[0]
+        amount = collect_text_lines(middle("9.000.09")["pdf_info"][0], 0)[0]
+        date = collect_text_lines(middle("25 DEQ 2Q25")["pdf_info"][0], 0)[0]
+        identifier = collect_text_lines(middle("AB123")["pdf_info"][0], 0)[0]
+
+        self.assertEqual(
+            select_bbox_recognition_candidate(general, "Blaine Bai", settings)[:2],
+            ("vlm", "bbox_vlm_primary"),
+        )
+        self.assertEqual(
+            select_bbox_recognition_candidate(amount, "nine thousand", settings)[:2],
+            ("ocr", "invalid_vlm_amount"),
+        )
+        self.assertEqual(
+            select_bbox_recognition_candidate(date, "tomorrow", settings)[:2],
+            ("ocr", "invalid_vlm_date"),
+        )
+        self.assertEqual(
+            select_bbox_recognition_candidate(identifier, "wrong value", settings)[:2],
+            ("ocr", "invalid_vlm_identifier"),
+        )
+
+    def test_bbox_vlm_mode_replaces_only_table_text_and_preserves_pipeline_geometry(self):
+        original_html = "<table><tr><td>Name</td><td>B1aine Bai</td></tr></table>"
+        cells = [
+            {
+                "bbox": [10, 10, 100, 40],
+                "content_spans": [{"bbox": [20, 18, 70, 32], "text": "Name"}],
+                "text": "Name",
+                "row_start": 0,
+                "row_end": 0,
+                "col_start": 0,
+                "col_end": 0,
+            },
+            {
+                "bbox": [100, 10, 190, 40],
+                "content_spans": [
+                    {"bbox": [110, 18, 180, 32], "text": "B1aine Bai"}
+                ],
+                "text": "B1aine Bai",
+                "row_start": 0,
+                "row_end": 0,
+                "col_start": 1,
+                "col_end": 1,
+            },
+        ]
+        pipeline = structured_middle(
+            "table",
+            html=original_html,
+            table_cells=cells,
+        )
+        seen = []
+
+        def recognize(_page, _size, candidates):
+            seen.extend(candidates)
+            return {
+                "items": [
+                    {
+                        "id": candidate["id"],
+                        "text": "Blaine Bai"
+                        if candidate["ocr_text"] == "B1aine Bai"
+                        else candidate["ocr_text"],
+                    }
+                    for candidate in candidates
+                ]
+            }
+
+        fused, report = fuse_middle_json(
+            pipeline,
+            pipeline,
+            FusionSettings.from_mapping({"mode": "bbox_vlm"}),
+            bbox_recognizer=recognize,
+        )
+
+        span = fused["pdf_info"][0]["preproc_blocks"][0]["lines"][0]["spans"][0]
+        self.assertTrue(seen)
+        self.assertTrue(all(candidate["type"] == "table_ocr" for candidate in seen))
+        self.assertIn("<td>Blaine Bai</td>", span["html"])
+        self.assertEqual(
+            parse_table_html(span["html"]).structure_signature,
+            parse_table_html(original_html).structure_signature,
+        )
+        self.assertEqual(
+            [cell["bbox"] for cell in span["table_cells"]],
+            [[10, 10, 100, 40], [100, 10, 190, 40]],
+        )
+        self.assertEqual(
+            [cell["content_spans"][0]["bbox"] for cell in span["table_cells"]],
+            [[20, 18, 70, 32], [110, 18, 180, 32]],
+        )
+        self.assertEqual(
+            [
+                tuple(cell[key] for key in ("row_start", "row_end", "col_start", "col_end"))
+                for cell in span["table_cells"]
+            ],
+            [(0, 0, 0, 0), (0, 0, 1, 1)],
+        )
+        self.assertEqual(report["mode"], "bbox_vlm")
+        self.assertEqual(report["counts"]["bbox_recognition_vlm_selected"], 1)
+        self.assertTrue(report["recognition_invariants"]["bbox_unchanged"])
+        self.assertTrue(report["recognition_invariants"]["table_structure_unchanged"])
+
     def test_unkeyed_pipeline_cells_are_retained_for_bbox_rendering(self):
         html = "<table><tr><td>Key</td><td>Value</td></tr></table>"
         table_cells = [
@@ -793,6 +921,560 @@ class FusionTests(unittest.TestCase):
             ["p0-ocr-1"],
         )
         self.assertEqual(_parse_reconciliation_ids('{"text":"invented"}'), [])
+
+    def test_bbox_recognition_preserves_geometry_and_recovers_vlm_text(self):
+        hybrid = middle("Anchor", 0.99, bbox=(10, 10, 190, 30))
+        ocr = middle("Anchor", 0.99, bbox=(10, 10, 190, 30))
+        missing = middle("B1aine Bai", None, bbox=(20, 50, 100, 70))["pdf_info"][0][
+            "preproc_blocks"
+        ][0]
+        ocr["pdf_info"][0]["preproc_blocks"].append(missing)
+        seen = []
+
+        def recognize(_page, _size, candidates):
+            seen.extend(candidates)
+            return {
+                "items": [
+                    {
+                        "id": item["id"],
+                        "text": "Blaine Bai"
+                        if item["ocr_text"] == "B1aine Bai"
+                        else item["ocr_text"],
+                    }
+                    for item in candidates
+                ],
+                "batches": [{"status": "ok", "latency_ms": 12.5}],
+            }
+
+        fused, report = fuse_middle_json(
+            hybrid,
+            ocr,
+            FusionSettings(bbox_recognition_enabled=True),
+            bbox_recognizer=recognize,
+        )
+
+        recovered = [
+            block
+            for block in fused["pdf_info"][0]["preproc_blocks"]
+            if block.get("fusion_source") == "ocr_recovered"
+        ]
+        self.assertEqual(recovered[0]["bbox"], [20.0, 50.0, 100.0, 70.0])
+        self.assertEqual(
+            recovered[0]["lines"][0]["spans"][0]["content"],
+            "Blaine Bai",
+        )
+        candidate = next(item for item in seen if item["ocr_text"] == "B1aine Bai")
+        self.assertEqual(candidate["bbox"], [20.0, 50.0, 100.0, 70.0])
+        self.assertEqual(report["counts"]["bbox_recognition_vlm_selected"], 1)
+        self.assertEqual(report["recognition_batches"][0]["latency_ms"], 12.5)
+        self.assertEqual(
+            report["recognition_invariants"],
+            {
+                "enabled": True,
+                "bbox_unchanged": True,
+                "table_structure_unchanged": True,
+            },
+        )
+
+    def test_bbox_recognition_aggregates_request_and_error_audit_counts(self):
+        def recognize(_page, _size, candidates):
+            return {
+                "items": [],
+                "batches": [
+                    {"status": "invalid_schema", "invalid_outputs": 2},
+                    {"status": "error", "error": "TimeoutException"},
+                ],
+                "requests": 2,
+                "invalid_outputs": 2,
+                "errors": 1,
+            }
+
+        _fused, report = fuse_middle_json(
+            middle("OCR", 0.99),
+            middle("OCR", 0.99),
+            FusionSettings(bbox_recognition_enabled=True),
+            bbox_recognizer=recognize,
+        )
+
+        counts = report["counts"]
+        self.assertEqual(counts["bbox_recognition_requests"], 2)
+        self.assertEqual(counts["bbox_recognition_invalid_outputs"], 2)
+        self.assertEqual(counts["bbox_recognition_errors"], 1)
+        self.assertEqual(counts["bbox_recognition_ocr_kept"], 1)
+        self.assertEqual(len(report["recognition_batches"]), 2)
+
+    def test_bbox_recognition_feature_flag_keeps_existing_output_unchanged(self):
+        called = False
+
+        def recognize(*_args):
+            nonlocal called
+            called = True
+            return {"items": []}
+
+        hybrid = middle("Hybrid")
+        ocr = middle("OCR", 0.99)
+        baseline, _baseline_report = fuse_middle_json(
+            hybrid,
+            ocr,
+            FusionSettings(),
+        )
+        fused, report = fuse_middle_json(
+            hybrid,
+            ocr,
+            FusionSettings(bbox_recognition_enabled=False),
+            bbox_recognizer=recognize,
+        )
+
+        self.assertFalse(called)
+        self.assertEqual(fused, baseline)
+        self.assertEqual(report["counts"]["bbox_recognition_candidates"], 0)
+
+    def test_bbox_recognition_high_risk_validators_are_conservative(self):
+        date_line = collect_text_lines(middle("25 DEQ 2Q25")["pdf_info"][0], 0)[0]
+        amount_line = collect_text_lines(middle("9.000.09")["pdf_info"][0], 0)[0]
+        identifier_line = collect_text_lines(middle("3O156")["pdf_info"][0], 0)[0]
+        settings = FusionSettings(bbox_recognition_enabled=True)
+
+        date = select_bbox_recognition_candidate(date_line, "25 DEC 2023", settings)
+        amount = select_bbox_recognition_candidate(amount_line, "9,000.00", settings)
+        identifier = select_bbox_recognition_candidate(
+            identifier_line,
+            "30156",
+            settings,
+        )
+
+        self.assertEqual(date[:3], ("vlm", "validated_date_repair", "date"))
+        self.assertEqual(amount[:3], ("vlm", "validated_amount_repair", "amount"))
+        self.assertEqual(
+            identifier[:3],
+            ("ocr", "high_risk_identifier_conflict", "identifier"),
+        )
+
+        protocol_echo = select_bbox_recognition_candidate(
+            collect_text_lines(middle("FOQD/DRINKS")["pdf_info"][0], 0)[0],
+            "p12-bbox-0",
+            settings,
+        )
+        self.assertEqual(protocol_echo[0:2], ("ocr", "bbox_protocol_id_echo"))
+
+        slot_echo = select_bbox_recognition_candidate(
+            collect_text_lines(middle("Blaine Bai")["pdf_info"][0], 0)[0],
+            "p6-0",
+            settings,
+        )
+        self.assertEqual(slot_echo[0:2], ("ocr", "bbox_protocol_id_echo"))
+
+        identifier_repair = select_bbox_recognition_candidate(
+            collect_text_lines(middle("3O156")["pdf_info"][0], 0)[0],
+            "30156",
+            settings,
+        )
+        self.assertEqual(
+            identifier_repair[0:2],
+            ("ocr", "high_risk_identifier_conflict"),
+        )
+
+        word_with_digit_confusion = select_bbox_recognition_candidate(
+            collect_text_lines(middle("B1aine")["pdf_info"][0], 0)[0],
+            "Blaine",
+            settings,
+        )
+        self.assertEqual(
+            word_with_digit_confusion[0:3],
+            ("vlm", "bbox_conditioned_vlm", "general"),
+        )
+
+        unrelated_valid_date = select_bbox_recognition_candidate(
+            collect_text_lines(middle("Patient name")["pdf_info"][0], 0)[0],
+            "25 DEC 2023",
+            settings,
+        )
+        self.assertNotEqual(
+            unrelated_valid_date[0:2],
+            ("vlm", "validated_date_repair"),
+        )
+
+    def test_bbox_recognition_rejects_captured_protocol_echo_regressions(self):
+        captured = (
+            (
+                "(9/12/2023 PRE-OP + LAPAROSCOPIC SIGMOIDECTOMY)",
+                "p2-0",
+            ),
+            ("TOTAL FEES DUÉ TO DOCTOR/PRIVATÉ NURSE", "p2-0"),
+            ("25 DEQ 2Q25", "p6-0"),
+            ("Blaine Bai", "p6-0"),
+            ("Room No.", "p6-0"),
+            (
+                "(9/12/2O23 PRE-OP + LAPAROSCOP1Q SIGMQIDECTOMYD",
+                "p6-0",
+            ),
+            ("FOQD/DRINKS", "p12-bbox-0"),
+        )
+        settings = FusionSettings(bbox_recognition_enabled=True)
+
+        for ocr_text, vlm_text in captured:
+            with self.subTest(ocr_text=ocr_text, vlm_text=vlm_text):
+                line = collect_text_lines(
+                    middle(ocr_text)["pdf_info"][0],
+                    0,
+                )[0]
+                selected = select_bbox_recognition_candidate(
+                    line,
+                    vlm_text,
+                    settings,
+                )
+                self.assertEqual(selected[0], "ocr")
+                self.assertEqual(selected[1], "bbox_protocol_id_echo")
+
+        def recognize(_page, _size, candidates):
+            return {
+                "items": [
+                    {"id": candidate["id"], "text": "p6-0"}
+                    for candidate in candidates
+                ]
+            }
+
+        _fused, report = fuse_middle_json(
+            middle("Blaine Bai"),
+            middle("Blaine Bai"),
+            settings,
+            bbox_recognizer=recognize,
+        )
+        self.assertEqual(
+            report["counts"]["bbox_recognition_protocol_echoes"],
+            1,
+        )
+        self.assertEqual(report["counts"]["bbox_recognition_vlm_selected"], 0)
+
+    def test_bbox_recognition_batch_guard_rejects_isolated_plausible_output(self):
+        lines = [
+            collect_text_lines(middle(text)["pdf_info"][0], 0)[0]
+            for text in ("B1aine Bai", "Room No.", "Date Discharged")
+        ]
+
+        def recognize(_page, _size, candidates):
+            texts = ("Blaine Bai", "p0-0", "}{")
+            return {
+                "items": [
+                    {"id": candidate["id"], "text": text}
+                    for candidate, text in zip(candidates, texts)
+                ],
+                "batches": [
+                    {
+                        "status": "ok",
+                        "ids": [candidate["id"] for candidate in candidates],
+                    }
+                ],
+            }
+
+        stats, decisions, batches = apply_bbox_recognition(
+            0,
+            [200, 300],
+            lines,
+            FusionSettings(bbox_recognition_enabled=True),
+            recognize,
+        )
+
+        self.assertEqual(stats["vlm_selected"], 0)
+        self.assertEqual(stats["batch_quality_fallbacks"], 3)
+        self.assertTrue(batches[0]["quality_guard_triggered"])
+        self.assertEqual(batches[0]["quality_acceptable_responses"], 1)
+        self.assertTrue(
+            all(
+                decision["reason"] == "recognizer_batch_quality_guard"
+                for decision in decisions
+            )
+        )
+        self.assertEqual(decisions[0]["candidate_reason"], "bbox_conditioned_vlm")
+
+    def test_empty_ocr_bbox_requires_healthy_batch_context(self):
+        settings = FusionSettings(bbox_recognition_enabled=True)
+        empty_line = collect_text_lines(middle("")["pdf_info"][0], 0)[0]
+
+        def recognize_isolated(_page, _size, candidates):
+            return {
+                "items": [
+                    {"id": candidates[0]["id"], "text": "Missing Value"}
+                ],
+                "batches": [{"status": "ok", "ids": [candidates[0]["id"]]}],
+            }
+
+        isolated_stats, isolated_decisions, _batches = apply_bbox_recognition(
+            0,
+            [200, 300],
+            [empty_line],
+            settings,
+            recognize_isolated,
+        )
+
+        self.assertEqual(isolated_stats["vlm_selected"], 0)
+        self.assertEqual(isolated_stats["empty_ocr_context_fallbacks"], 1)
+        self.assertEqual(
+            isolated_decisions[0]["reason"],
+            "empty_ocr_context_guard",
+        )
+
+        lines = [
+            collect_text_lines(middle(text)["pdf_info"][0], 0)[0]
+            for text in ("", "B1aine", "R0om")
+        ]
+
+        def recognize_batch(_page, _size, candidates):
+            replacements = {
+                "": "Missing Value",
+                "B1aine": "Blaine",
+                "R0om": "Room",
+            }
+            return {
+                "items": [
+                    {
+                        "id": candidate["id"],
+                        "text": replacements[candidate["ocr_text"]],
+                    }
+                    for candidate in candidates
+                ],
+                "batches": [
+                    {
+                        "status": "ok",
+                        "ids": [candidate["id"] for candidate in candidates],
+                    }
+                ],
+            }
+
+        stats, decisions, batches = apply_bbox_recognition(
+            0,
+            [200, 300],
+            lines,
+            settings,
+            recognize_batch,
+        )
+
+        recovered = next(decision for decision in decisions if not decision["ocr_text"])
+        self.assertEqual(stats["vlm_selected"], 3)
+        self.assertEqual(stats["empty_ocr_recoveries"], 1)
+        self.assertEqual(stats["empty_ocr_context_fallbacks"], 0)
+        self.assertEqual(recovered["selected_text"], "Missing Value")
+        self.assertEqual(recovered["reason"], "empty_ocr_vlm_recovery")
+        self.assertTrue(batches[0]["quality_guard_evaluated"])
+        self.assertNotIn("quality_guard_triggered", batches[0])
+
+    def test_table_collector_keeps_empty_content_bbox_for_recognition(self):
+        page = structured_middle(
+            "table",
+            html="<table><tr><td></td></tr></table>",
+            table_cells=[
+                {
+                    "bbox": [10, 10, 190, 40],
+                    "content_spans": [
+                        {"bbox": [20, 18, 170, 32], "text": ""}
+                    ],
+                    "text": "",
+                    "row_start": 0,
+                    "row_end": 0,
+                    "col_start": 0,
+                    "col_end": 0,
+                }
+            ],
+        )["pdf_info"][0]
+
+        lines = collect_table_ocr_lines(page, 0)
+        manifest, _by_id = build_bbox_recognition_manifest(0, lines)
+
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0].text, "")
+        self.assertEqual(lines[0].bbox, (20.0, 18.0, 170.0, 32.0))
+        self.assertEqual(manifest[0]["ocr_text"], "")
+        self.assertEqual(manifest[0]["contexts"]["target"], [20.0, 18.0, 170.0, 32.0])
+
+    def test_healthy_batch_recovers_empty_table_cell_without_geometry_change(self):
+        original_html = (
+            "<table><tr><td></td><td>B1aine</td><td>R0om</td></tr></table>"
+        )
+        cells = [
+            {
+                "bbox": [10 + index * 60, 10, 70 + index * 60, 40],
+                "content_spans": [
+                    {
+                        "bbox": [15 + index * 60, 18, 65 + index * 60, 32],
+                        "text": text,
+                    }
+                ],
+                "text": text,
+                "row_start": 0,
+                "row_end": 0,
+                "col_start": index,
+                "col_end": index,
+            }
+            for index, text in enumerate(("", "B1aine", "R0om"))
+        ]
+        page = structured_middle(
+            "table",
+            html=original_html,
+            table_cells=cells,
+        )["pdf_info"][0]
+        original_bboxes = [
+            (list(cell["bbox"]), list(cell["content_spans"][0]["bbox"]))
+            for cell in cells
+        ]
+        lines = collect_table_ocr_lines(page, 0)
+
+        def recognize(_page, _size, candidates):
+            replacements = {
+                "": "Missing Value",
+                "B1aine": "Blaine",
+                "R0om": "Room",
+            }
+            return {
+                "items": [
+                    {
+                        "id": candidate["id"],
+                        "text": replacements[candidate["ocr_text"]],
+                    }
+                    for candidate in candidates
+                ],
+                "batches": [
+                    {
+                        "status": "ok",
+                        "ids": [candidate["id"] for candidate in candidates],
+                    }
+                ],
+            }
+
+        stats, _decisions, _batches = apply_bbox_recognition(
+            0,
+            [200, 300],
+            lines,
+            FusionSettings(bbox_recognition_enabled=True),
+            recognize,
+        )
+        rebuilt, rejected = synchronize_recognized_table_html(page, lines, 0)
+
+        span = page["preproc_blocks"][0]["lines"][0]["spans"][0]
+        self.assertEqual(stats["empty_ocr_recoveries"], 1)
+        self.assertEqual(rebuilt, 1)
+        self.assertEqual(rejected, 0)
+        self.assertIn("<td>Missing Value</td>", span["html"])
+        self.assertIn("<td>Blaine</td>", span["html"])
+        self.assertIn("<td>Room</td>", span["html"])
+        self.assertEqual(
+            parse_table_html(span["html"]).structure_signature,
+            parse_table_html(original_html).structure_signature,
+        )
+        self.assertEqual(
+            [
+                (list(cell["bbox"]), list(cell["content_spans"][0]["bbox"]))
+                for cell in span["table_cells"]
+            ],
+            original_bboxes,
+        )
+
+    def test_table_recognition_manifest_contains_multiscale_context(self):
+        cells = [
+            {
+                "bbox": [10, 10, 100, 40],
+                "content_spans": [{"bbox": [20, 18, 70, 32], "text": "Date"}],
+                "row_start": 0,
+                "row_end": 0,
+                "col_start": 0,
+                "col_end": 0,
+            },
+            {
+                "bbox": [100, 10, 190, 40],
+                "content_spans": [
+                    {"bbox": [110, 18, 170, 32], "text": "25 DEQ 2Q25"}
+                ],
+                "row_start": 0,
+                "row_end": 0,
+                "col_start": 1,
+                "col_end": 1,
+            },
+        ]
+        page = structured_middle(
+            "table",
+            html="<table><tr><td>Date</td><td>25 DEQ 2Q25</td></tr></table>",
+            table_cells=cells,
+        )["pdf_info"][0]
+        lines = collect_table_ocr_lines(page, 0)
+
+        manifest, _by_id = build_bbox_recognition_manifest(0, lines)
+
+        value = next(item for item in manifest if item["ocr_text"] == "25 DEQ 2Q25")
+        self.assertEqual(value["bbox"], [110.0, 18.0, 170.0, 32.0])
+        self.assertEqual(value["contexts"]["cell"], [100.0, 10.0, 190.0, 40.0])
+        self.assertEqual(value["contexts"]["row"], [20.0, 18.0, 170.0, 32.0])
+        self.assertEqual(value["contexts"]["table"], [10.0, 10.0, 190.0, 80.0])
+
+    def test_recognized_cell_updates_pipeline_html_without_changing_bbox_or_grid(self):
+        cells = [
+            {
+                "bbox": [10, 10, 100, 40],
+                "content_spans": [{"bbox": [20, 18, 70, 32], "text": "Date"}],
+                "text": "Date",
+                "row_start": 0,
+                "row_end": 0,
+                "col_start": 0,
+                "col_end": 0,
+            },
+            {
+                "bbox": [100, 10, 190, 40],
+                "content_spans": [
+                    {"bbox": [110, 18, 170, 32], "text": "25 DEQ 2Q25"}
+                ],
+                "text": "25 DEQ 2Q25",
+                "row_start": 0,
+                "row_end": 0,
+                "col_start": 1,
+                "col_end": 1,
+            },
+        ]
+        original_html = "<table><tr><td>Date</td><td>25 DEQ 2Q25</td></tr></table>"
+        page = structured_middle(
+            "table",
+            html=original_html,
+            table_cells=cells,
+        )["pdf_info"][0]
+        lines = collect_table_ocr_lines(page, 0)
+
+        def recognize(_page, _size, candidates):
+            return {
+                "items": [
+                    {
+                        "id": item["id"],
+                        "text": "25 DEC 2023"
+                        if item["ocr_text"] == "25 DEQ 2Q25"
+                        else item["ocr_text"],
+                    }
+                    for item in candidates
+                ]
+            }
+
+        stats, _decisions, _batches = apply_bbox_recognition(
+            0,
+            [200, 300],
+            lines,
+            FusionSettings(bbox_recognition_enabled=True),
+            recognize,
+        )
+        rebuilt, rejected = synchronize_recognized_table_html(page, lines, 0)
+
+        span = page["preproc_blocks"][0]["lines"][0]["spans"][0]
+        self.assertEqual(stats["vlm_selected"], 1)
+        self.assertEqual(rebuilt, 1)
+        self.assertEqual(rejected, 0)
+        self.assertIn("<td>25 DEC 2023</td>", span["html"])
+        self.assertEqual(
+            parse_table_html(span["html"]).structure_signature,
+            parse_table_html(original_html).structure_signature,
+        )
+        self.assertEqual(span["table_cells"][1]["bbox"], [100, 10, 190, 40])
+        self.assertEqual(
+            span["table_cells"][1]["content_spans"][0]["bbox"],
+            [110, 18, 170, 32],
+        )
+        self.assertEqual(
+            span["table_cells"][1]["content_spans"][0]["text"],
+            "25 DEC 2023",
+        )
 
     def test_missing_ocr_inside_table_is_not_recovered_as_paragraph(self):
         hybrid = structured_middle(

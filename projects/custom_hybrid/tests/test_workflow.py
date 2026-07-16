@@ -37,6 +37,7 @@ from projects.custom_hybrid.workflow import (
     prepare_parameter_proxy_config,
     regenerate_fused_visualizations,
     resolve_upstream_max_model_len,
+    run_extract,
     run_doctor,
     _generate_fused_visualizations,
     _index_input_documents,
@@ -176,7 +177,7 @@ class WorkflowTests(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
-            self.assertEqual(marker["bbox_renderer_version"], 3)
+            self.assertEqual(marker["bbox_renderer_version"], 4)
             self.assertFalse(list(parse_dir.glob(".*-span.pdf")))
 
     def test_real_proxy_rewrites_openai_request_and_writes_safe_audit(self):
@@ -512,6 +513,7 @@ class WorkflowTests(unittest.TestCase):
                 load_config(path)
 
         config = json.loads(source.read_text(encoding="utf-8"))
+        config["fusion"]["verifier"]["enabled"] = True
         config["fusion"]["verifier"]["table_cell_render_scale"] = 0
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "invalid-scale.json"
@@ -532,6 +534,104 @@ class WorkflowTests(unittest.TestCase):
             ):
                 load_config(path)
 
+    def test_config_validates_bbox_recognizer_limits(self):
+        source = Path(__file__).parents[1] / "workflow.example.json"
+        config = json.loads(source.read_text(encoding="utf-8"))
+        config["fusion"]["recognizer"]["min_length_ratio"] = 3.0
+        config["fusion"]["recognizer"]["max_length_ratio"] = 2.0
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "invalid-recognizer.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(WorkflowConfigError, "length ratios"):
+                load_config(path)
+
+        config = json.loads(source.read_text(encoding="utf-8"))
+        config["fusion"]["recognizer"]["max_context_tokens"] = 1024
+        config["fusion"]["recognizer"]["context_reserve_tokens"] = 2048
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "invalid-recognizer-context.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(WorkflowConfigError, "context token limit"):
+                load_config(path)
+
+        for key, value, message in (
+            ("temperature", 2.1, "temperature"),
+            ("top_p", 0.0, "top_p"),
+            ("seed", 1.5, "seed"),
+            ("max_batch_size", 1.5, "max_batch_size"),
+            ("context_reserve_tokens", 0, "context_reserve_tokens"),
+            ("min_batch_acceptable_ratio", 1.1, "min_batch_acceptable_ratio"),
+            ("batch_guard_min_candidates", 0, "batch_guard_min_candidates"),
+        ):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as temp_dir:
+                config = json.loads(source.read_text(encoding="utf-8"))
+                config["fusion"]["recognizer"][key] = value
+                path = Path(temp_dir) / f"invalid-{key}.json"
+                path.write_text(json.dumps(config), encoding="utf-8")
+                with self.assertRaisesRegex(WorkflowConfigError, message):
+                    load_config(path)
+
+        config = json.loads(source.read_text(encoding="utf-8"))
+        config["fusion"]["recognizer"]["structured_output_mode"] = "best_effort"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "invalid-structured-output-mode.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(
+                WorkflowConfigError,
+                "structured_output_mode",
+            ):
+                load_config(path)
+
+        for key, value in (
+            ("base_url", "10.100.0.30:8205"),
+            ("model", ""),
+            ("api_key_env", 42),
+            ("empty_ocr_enabled", "yes"),
+        ):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as temp_dir:
+                config = json.loads(source.read_text(encoding="utf-8"))
+                config["fusion"]["recognizer"][key] = value
+                path = Path(temp_dir) / f"invalid-{key}.json"
+                path.write_text(json.dumps(config), encoding="utf-8")
+                with self.assertRaisesRegex(WorkflowConfigError, key):
+                    load_config(path)
+
+    def test_config_validates_bbox_vlm_mode_and_selection_policy(self):
+        source = Path(__file__).parents[1] / "workflow.example.json"
+        cases = (
+            (("fusion", "mode"), "unknown", "fusion.mode"),
+            (
+                ("fusion", "recognizer", "selection_policy"),
+                "always_vlm",
+                "selection_policy",
+            ),
+            (
+                ("fusion", "recognizer", "vlm_primary_min_quality"),
+                1.1,
+                "vlm_primary_min_quality",
+            ),
+        )
+        for path_parts, value, message in cases:
+            with self.subTest(path_parts=path_parts), tempfile.TemporaryDirectory() as temp_dir:
+                config = json.loads(source.read_text(encoding="utf-8"))
+                target = config
+                for key in path_parts[:-1]:
+                    target = target[key]
+                target[path_parts[-1]] = value
+                path = Path(temp_dir) / "invalid.json"
+                path.write_text(json.dumps(config), encoding="utf-8")
+                with self.assertRaisesRegex(WorkflowConfigError, message):
+                    load_config(path)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = json.loads(source.read_text(encoding="utf-8"))
+            config["fusion"]["mode"] = "bbox_vlm"
+            config["fusion"]["enabled"] = False
+            path = Path(temp_dir) / "disabled.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(WorkflowConfigError, "enabled"):
+                load_config(path)
+
     def test_mineru_command_uses_proxy_and_hybrid_settings(self):
         config = load_config(Path(__file__).parents[1] / "workflow.example.json")
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -544,7 +644,7 @@ class WorkflowTests(unittest.TestCase):
             )
 
         self.assertIn("hybrid-http-client", command)
-        self.assertIn("high", command)
+        self.assertIn("medium", command)
         self.assertIn("http://127.0.0.1:32100", command)
 
     def test_pipeline_command_forces_ocr_backend(self):
@@ -556,6 +656,122 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("pipeline", command)
         self.assertIn("ocr", command)
         self.assertNotIn("http://127.0.0.1:30000", command)
+
+    def test_bbox_vlm_extract_runs_pipeline_only_and_uses_it_as_fusion_baseline(self):
+        config = load_config(Path(__file__).parents[1] / "workflow.example.json")
+        config["fusion"]["mode"] = "bbox_vlm"
+        config["fusion"]["recognizer"]["enabled"] = False
+        server = object()
+        thread = object()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "input.pdf"
+            input_path.write_bytes(b"pdf")
+            output_path = root / "output"
+            with (
+                mock.patch(
+                    "projects.custom_hybrid.workflow._start_parameter_proxy",
+                    return_value=(server, thread, "http://127.0.0.1:32100"),
+                ),
+                mock.patch(
+                    "projects.custom_hybrid.workflow._stop_parameter_proxy"
+                ) as stop_proxy,
+                mock.patch(
+                    "projects.custom_hybrid.workflow.build_pipeline_command",
+                    return_value=["pipeline-command"],
+                ) as build_pipeline,
+                mock.patch(
+                    "projects.custom_hybrid.workflow.build_mineru_command"
+                ) as build_hybrid,
+                mock.patch(
+                    "projects.custom_hybrid.workflow._run_mineru_command"
+                ) as run_command,
+                mock.patch(
+                    "projects.custom_hybrid.workflow.fuse_output_trees",
+                    return_value={"documents": {}, "failed": {}},
+                ) as fuse_trees,
+            ):
+                result = run_extract(config, input_path, output_path)
+
+        self.assertEqual(result, 0)
+        build_pipeline.assert_called_once_with(
+            config,
+            input_path,
+            output_path.resolve() / "ocr",
+        )
+        build_hybrid.assert_not_called()
+        run_command.assert_called_once_with(["pipeline-command"])
+        fuse_trees.assert_called_once_with(
+            config,
+            input_path,
+            output_path.resolve() / "ocr",
+            output_path.resolve() / "ocr",
+            output_path.resolve() / "fused",
+            "http://127.0.0.1:32100",
+        )
+        stop_proxy.assert_called_once_with(server, thread)
+
+    def test_hybrid_fusion_extract_keeps_dual_parse_workflow(self):
+        config = load_config(Path(__file__).parents[1] / "workflow.example.json")
+        self.assertEqual(config["fusion"]["mode"], "hybrid_fusion")
+        server = object()
+        thread = object()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "input.pdf"
+            input_path.write_bytes(b"pdf")
+            output_path = root / "output"
+            with (
+                mock.patch(
+                    "projects.custom_hybrid.workflow._start_parameter_proxy",
+                    return_value=(server, thread, "http://127.0.0.1:32100"),
+                ),
+                mock.patch(
+                    "projects.custom_hybrid.workflow._stop_parameter_proxy"
+                ) as stop_proxy,
+                mock.patch(
+                    "projects.custom_hybrid.workflow.build_mineru_command",
+                    return_value=["hybrid-command"],
+                ) as build_hybrid,
+                mock.patch(
+                    "projects.custom_hybrid.workflow.build_pipeline_command",
+                    return_value=["pipeline-command"],
+                ) as build_pipeline,
+                mock.patch(
+                    "projects.custom_hybrid.workflow._run_mineru_command"
+                ) as run_command,
+                mock.patch(
+                    "projects.custom_hybrid.workflow.fuse_output_trees",
+                    return_value={"documents": {}, "failed": {}},
+                ) as fuse_trees,
+            ):
+                result = run_extract(config, input_path, output_path)
+
+        self.assertEqual(result, 0)
+        build_hybrid.assert_called_once_with(
+            config,
+            input_path,
+            output_path.resolve() / "hybrid",
+            "http://127.0.0.1:32100",
+        )
+        build_pipeline.assert_called_once_with(
+            config,
+            input_path,
+            output_path.resolve() / "ocr",
+        )
+        self.assertEqual(
+            run_command.call_args_list,
+            [mock.call(["hybrid-command"]), mock.call(["pipeline-command"])],
+        )
+        fuse_trees.assert_called_once_with(
+            config,
+            input_path,
+            output_path.resolve() / "hybrid",
+            output_path.resolve() / "ocr",
+            output_path.resolve() / "fused",
+            "http://127.0.0.1:32100",
+        )
+        stop_proxy.assert_called_once_with(server, thread)
 
     def test_vllm_server_command_encodes_object_arguments_as_json(self):
         config = load_config(Path(__file__).parents[1] / "workflow.example.json")
@@ -579,6 +795,65 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("six", report["dependencies"])
         self.assertEqual(report["upstream"]["url"], "http://127.0.0.1:1")
         self.assertFalse(report["upstream"]["reachable"])
+        self.assertFalse(report["recognizer"]["enabled"])
+        self.assertTrue(report["recognizer"]["ready"])
+
+    def test_doctor_checks_bbox_vlm_recognizer_model_and_structured_output(self):
+        class Response:
+            def __init__(self, payload):
+                self.status_code = 200
+                self.is_success = True
+                self.payload = payload
+
+            def json(self):
+                return self.payload
+
+        config = load_config(Path(__file__).parents[1] / "workflow.example.json")
+        config["vllm"]["upstream_url"] = "http://vision.test"
+        config["fusion"]["mode"] = "bbox_vlm"
+        recognizer = config["fusion"]["recognizer"]
+        recognizer["enabled"] = False
+        recognizer["base_url"] = "http://vision.test"
+        recognizer["model"] = "document-vision"
+        recognizer["structured_output_mode"] = "json_schema"
+        models = Response(
+            {
+                "data": [
+                    {
+                        "id": "document-vision",
+                        "max_model_len": 8192,
+                    }
+                ]
+            }
+        )
+        openapi = Response(
+            {
+                "components": {
+                    "schemas": {
+                        "ChatCompletionRequest": {
+                            "properties": {"response_format": {}}
+                        },
+                        "ResponseFormat": {
+                            "properties": {
+                                "type": {
+                                    "enum": ["text", "json_object", "json_schema"]
+                                }
+                            }
+                        },
+                    }
+                }
+            }
+        )
+
+        with mock.patch("httpx.get", side_effect=[models, models, openapi]):
+            report = run_doctor(config)
+
+        self.assertTrue(report["recognizer"]["ready"])
+        self.assertTrue(report["recognizer"]["enabled"])
+        self.assertTrue(report["recognizer"]["model_available"])
+        self.assertTrue(report["recognizer"]["structured_output_supported"])
+        self.assertEqual(report["recognizer"]["max_model_len"], 8192)
+        self.assertTrue(report["recognizer"]["capability_trial_required"])
 
     def test_benchmark_ranks_runs_and_groups_tags(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -773,6 +1048,99 @@ class WorkflowTests(unittest.TestCase):
             fused_path.parent,
             "sample",
             input_pdf.resolve(),
+        )
+
+    def test_fuse_output_trees_wires_and_closes_enabled_bbox_recognizer(self):
+        def build_middle(text, score=None):
+            span = {
+                "type": "text",
+                "content": text,
+                "bbox": [10, 10, 100, 30],
+            }
+            if score is not None:
+                span["score"] = score
+            return {
+                "pdf_info": [
+                    {
+                        "page_size": [200, 300],
+                        "preproc_blocks": [
+                            {
+                                "type": "text",
+                                "bbox": [10, 10, 100, 30],
+                                "lines": [
+                                    {
+                                        "bbox": [10, 10, 100, 30],
+                                        "spans": [span],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            }
+
+        config = load_config(Path(__file__).parents[1] / "workflow.example.json")
+        config["fusion"]["verifier"]["enabled"] = False
+        config["fusion"]["recognizer"]["enabled"] = True
+        config["fusion"]["recognizer"]["base_url"] = "http://vision.test"
+        recognizer = mock.Mock()
+        recognizer.return_value = {
+            "items": [],
+            "batches": [{"status": "ok", "responses": 0}],
+            "requests": 1,
+            "invalid_outputs": 0,
+            "errors": 0,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_pdf = root / "sample.pdf"
+            input_pdf.write_bytes(b"pdf")
+            hybrid_root = root / "hybrid" / "sample" / "hybrid_ocr"
+            ocr_root = root / "ocr" / "sample" / "ocr"
+            fused_root = root / "fused"
+            hybrid_root.mkdir(parents=True)
+            ocr_root.mkdir(parents=True)
+            (hybrid_root / "sample_middle.json").write_text(
+                json.dumps(build_middle("Hybrid")),
+                encoding="utf-8",
+            )
+            (ocr_root / "sample_middle.json").write_text(
+                json.dumps(build_middle("OCR", 0.99)),
+                encoding="utf-8",
+            )
+
+            with (
+                mock.patch(
+                    "projects.custom_hybrid.workflow.OpenAIBBoxRecognizer",
+                    return_value=recognizer,
+                ) as recognizer_class,
+                mock.patch(
+                    "projects.custom_hybrid.workflow._regenerate_fused_outputs"
+                ),
+            ):
+                summary = fuse_output_trees(
+                    config,
+                    input_pdf,
+                    root / "hybrid",
+                    root / "ocr",
+                    fused_root,
+                    "http://127.0.0.1:30001",
+                )
+
+        recognizer_class.assert_called_once_with(
+            "http://vision.test",
+            input_pdf.resolve(),
+            config["fusion"]["recognizer"],
+        )
+        recognizer.assert_called_once()
+        recognizer.close.assert_called_once_with()
+        self.assertFalse(summary["failed"])
+        self.assertEqual(
+            summary["documents"]["sample"]["counts"][
+                "bbox_recognition_requests"
+            ],
+            1,
         )
 
 

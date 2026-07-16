@@ -53,12 +53,58 @@ SUPPORTED_INPUT_SUFFIXES = {
     ".tif",
     ".tiff",
 }
+MARKDOWN_ASSET_SUFFIXES = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".gif",
+    ".bmp",
+}
 TERMINAL_STATUSES = {"completed", "failed"}
 Runner = Callable[[Mapping[str, Any], str | Path, str | Path], int]
 GENERATION_PARAMETER_LIMITS = {
     "temperature": (0.0, 2.0),
     "top_p": (0.0, 1.0),
     "repetition_penalty": (0.01, 2.0),
+}
+COST_PROFILES = {"balanced", "quality"}
+EXTRACTION_MODES = {"hybrid_fusion", "bbox_vlm"}
+DEFAULT_COST_PROFILE = "balanced"
+BALANCED_FUSION_OVERRIDES = {
+    "max_verifications_per_document": 0,
+    "formula_fallback_enabled": False,
+    "table_visual_verification_enabled": False,
+    "formula_visual_verification_enabled": False,
+    "max_structured_verifications_per_document": 0,
+    "max_table_cell_verifications_per_document": 0,
+    "verifier": {"enabled": False},
+    "recognizer": {"enabled": False},
+    "reconciliation": {"enabled": False},
+}
+BBOX_VLM_FUSION_OVERRIDES = {
+    "enabled": True,
+    "mode": "bbox_vlm",
+    "max_verifications_per_document": 0,
+    "table_fallback_enabled": False,
+    "formula_fallback_enabled": False,
+    "table_visual_verification_enabled": False,
+    "formula_visual_verification_enabled": False,
+    "max_structured_verifications_per_document": 0,
+    "table_cell_fusion_enabled": False,
+    "max_table_cell_verifications_per_document": 0,
+    "recover_missing_ocr_blocks": False,
+    "unreliable_table_recovery_enabled": False,
+    "recognizer": {
+        "enabled": True,
+        "normal_ocr_enabled": False,
+        "table_ocr_enabled": True,
+        "selection_policy": "vlm_primary",
+        "include_row_image": True,
+        "include_table_image": True,
+    },
+    "verifier": {"enabled": False},
+    "reconciliation": {"enabled": False},
 }
 
 
@@ -215,7 +261,16 @@ class CustomHybridTaskManager:
             record.output_root.mkdir(parents=True, exist_ok=True)
             (record.output_root / "task_parameters.json").write_text(
                 json.dumps(
-                    _task_parameter_defaults(config),
+                    _task_parameter_defaults(
+                        config,
+                        cost_profile=str(
+                            record.parameters.get(
+                                "cost_profile",
+                                DEFAULT_COST_PROFILE,
+                            )
+                        ),
+                        apply_profile=False,
+                    ),
                     ensure_ascii=False,
                     indent=2,
                 ),
@@ -240,6 +295,8 @@ class CustomHybridTaskManager:
 
 def _normalize_task_parameters(
     *,
+    cost_profile: str | None = None,
+    extraction_mode: str | None = None,
     effort: str | None = None,
     method: str | None = None,
     lang: str | None = None,
@@ -251,6 +308,34 @@ def _normalize_task_parameters(
 ) -> dict[str, Any]:
     mineru: dict[str, Any] = {}
     generation: dict[str, Any] = {}
+    recognizer_generation: dict[str, Any] = {}
+    fusion: dict[str, Any] = {}
+    if cost_profile is not None:
+        if cost_profile not in COST_PROFILES:
+            raise HTTPException(
+                status_code=400,
+                detail="cost_profile must be balanced or quality",
+            )
+        if cost_profile == "balanced":
+            mineru.update(
+                {
+                    "effort": "medium",
+                    "formula": False,
+                    "image_analysis": False,
+                }
+            )
+            generation["max_tokens"] = 2048
+            fusion.update(copy.deepcopy(BALANCED_FUSION_OVERRIDES))
+    if extraction_mode is not None:
+        if extraction_mode not in EXTRACTION_MODES:
+            raise HTTPException(
+                status_code=400,
+                detail="extraction_mode must be hybrid_fusion or bbox_vlm",
+            )
+        if extraction_mode == "bbox_vlm":
+            fusion.update(copy.deepcopy(BBOX_VLM_FUSION_OVERRIDES))
+        else:
+            fusion["mode"] = "hybrid_fusion"
     if effort is not None:
         if effort not in {"medium", "high"}:
             raise HTTPException(status_code=400, detail="effort must be medium or high")
@@ -289,10 +374,13 @@ def _normalize_task_parameters(
                 detail=f"{name} must be {qualifier}",
             )
         generation[name] = float(value)
+        if name in {"temperature", "top_p"}:
+            recognizer_generation[name] = float(value)
     if seed is not None:
         if not -(2**63) <= seed < 2**63:
             raise HTTPException(status_code=400, detail="seed must be a signed 64-bit integer")
         generation["seed"] = seed
+        recognizer_generation["seed"] = seed
     if max_tokens is not None:
         if not 1 <= max_tokens <= 131072:
             raise HTTPException(
@@ -300,11 +388,20 @@ def _normalize_task_parameters(
                 detail="max_tokens must be between 1 and 131072",
             )
         generation["max_tokens"] = max_tokens
+        recognizer_generation["max_tokens"] = max_tokens
+    if extraction_mode == "bbox_vlm" and recognizer_generation:
+        recognizer_overrides = fusion.setdefault("recognizer", {})
+        if isinstance(recognizer_overrides, dict):
+            recognizer_overrides.update(recognizer_generation)
     parameters: dict[str, Any] = {}
+    if cost_profile is not None:
+        parameters["cost_profile"] = cost_profile
     if mineru:
         parameters["mineru"] = mineru
     if generation:
         parameters["generation"] = generation
+    if fusion:
+        parameters["fusion"] = fusion
     return parameters
 
 
@@ -315,11 +412,33 @@ def _apply_task_parameters(config: dict[str, Any], parameters: Mapping[str, Any]
     generation = parameters.get("generation", {})
     if isinstance(generation, Mapping):
         config["vllm"]["generation"]["task_overrides"] = dict(generation)
+    fusion = parameters.get("fusion", {})
+    if isinstance(fusion, Mapping):
+        for key, value in fusion.items():
+            if isinstance(value, Mapping):
+                nested = config["fusion"].setdefault(key, {})
+                if isinstance(nested, dict):
+                    nested.update(value)
+                else:
+                    config["fusion"][key] = dict(value)
+            else:
+                config["fusion"][key] = value
 
 
-def _task_parameter_defaults(config: Mapping[str, Any]) -> dict[str, Any]:
-    mineru_config = config["mineru"]
-    generation_config = config["vllm"]["generation"]
+def _task_parameter_defaults(
+    config: Mapping[str, Any],
+    *,
+    cost_profile: str = DEFAULT_COST_PROFILE,
+    apply_profile: bool = True,
+) -> dict[str, Any]:
+    effective_config = copy.deepcopy(dict(config))
+    if apply_profile:
+        _apply_task_parameters(
+            effective_config,
+            _normalize_task_parameters(cost_profile=cost_profile),
+        )
+    mineru_config = effective_config["mineru"]
+    generation_config = effective_config["vllm"]["generation"]
     defaults = generation_config.get("defaults", {})
     overrides = generation_config.get("overrides", {})
     task_overrides = generation_config.get("task_overrides", {})
@@ -332,8 +451,13 @@ def _task_parameter_defaults(config: Mapping[str, Any]) -> dict[str, Any]:
         return defaults.get(name)
 
     return {
+        "cost_profile": cost_profile,
+        "extraction_mode": effective_config.get("fusion", {}).get(
+            "mode",
+            "hybrid_fusion",
+        ),
         "mineru": {
-            "effort": mineru_config.get("effort", "high"),
+            "effort": mineru_config.get("effort", "medium"),
             "method": mineru_config.get("method", "auto"),
             "lang": mineru_config.get("lang", "ch"),
         },
@@ -372,6 +496,37 @@ def _create_fused_archive(output_root: Path, archive_path: Path) -> None:
             for child in sorted(path.rglob("*")):
                 if child.is_file():
                     archive.write(child, child.relative_to(output_root).as_posix())
+
+
+def _task_markdown_documents(record: TaskRecord) -> dict[str, Path]:
+    fused_root = record.output_root / "fused"
+    if not fused_root.is_dir():
+        return {}
+    return {
+        path.relative_to(fused_root).as_posix(): path
+        for path in sorted(fused_root.rglob("*.md"))
+        if path.is_file()
+    }
+
+
+def _select_task_markdown(record: TaskRecord, document: str | None) -> tuple[str, Path]:
+    documents = _task_markdown_documents(record)
+    if not documents:
+        raise HTTPException(status_code=404, detail="No Markdown output is available")
+    selected = document or next(iter(documents))
+    path = documents.get(selected)
+    if path is None:
+        raise HTTPException(status_code=404, detail="Markdown document not found")
+    return selected, path
+
+
+def _content_list_text(markdown_path: Path) -> str | None:
+    candidates = (
+        markdown_path.with_name(f"{markdown_path.stem}_content_list.json"),
+        markdown_path.with_name("content_list.json"),
+    )
+    content_path = next((path for path in candidates if path.is_file()), None)
+    return content_path.read_text(encoding="utf-8") if content_path else None
 
 
 async def _save_uploads(
@@ -520,6 +675,8 @@ def create_app(
     async def submit_task(
         request: Request,
         files: list[UploadFile] = File(...),
+        cost_profile: str = Form(default=DEFAULT_COST_PROFILE),
+        extraction_mode: str | None = Form(default=None),
         effort: str | None = Form(default=None),
         method: str | None = Form(default=None),
         lang: str | None = Form(default=None),
@@ -530,6 +687,8 @@ def create_app(
         repetition_penalty: float | None = Form(default=None),
     ) -> dict[str, Any]:
         parameters = _normalize_task_parameters(
+            cost_profile=cost_profile,
+            extraction_mode=extraction_mode,
             effort=effort,
             method=method,
             lang=lang,
@@ -594,6 +753,55 @@ def create_app(
         )
 
     @app.get(
+        "/tasks/{task_id}/markdown",
+        dependencies=[Depends(authorize)],
+    )
+    async def get_task_markdown(task_id: str, document: str | None = None):
+        record = require_completed_task(task_id)
+        selected, markdown_path = _select_task_markdown(record, document)
+        documents = _task_markdown_documents(record)
+        return JSONResponse(
+            content={
+                "documents": [
+                    {"id": item_id, "name": path.stem}
+                    for item_id, path in documents.items()
+                ],
+                "selected": selected,
+                "name": markdown_path.stem,
+                "markdown": markdown_path.read_text(encoding="utf-8"),
+                "content_list": _content_list_text(markdown_path),
+            }
+        )
+
+    @app.get(
+        "/tasks/{task_id}/asset",
+        dependencies=[Depends(authorize)],
+    )
+    async def get_task_markdown_asset(
+        task_id: str,
+        document: str,
+        path: str,
+    ):
+        record = require_completed_task(task_id)
+        _, markdown_path = _select_task_markdown(record, document)
+        fused_root = (record.output_root / "fused").resolve()
+        asset_path = (markdown_path.parent / path).resolve()
+        try:
+            asset_path.relative_to(fused_root)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="Asset not found") from exc
+        if (
+            not asset_path.is_file()
+            or asset_path.suffix.lower() not in MARKDOWN_ASSET_SUFFIXES
+        ):
+            raise HTTPException(status_code=404, detail="Asset not found")
+        return FileResponse(
+            asset_path,
+            filename=asset_path.name,
+            content_disposition_type="inline",
+        )
+
+    @app.get(
         "/tasks/{task_id}/report",
         name="get_task_report",
         dependencies=[Depends(authorize)],
@@ -612,6 +820,8 @@ def create_app(
     @app.post("/file_parse", dependencies=[Depends(authorize)])
     async def file_parse(
         files: list[UploadFile] = File(...),
+        cost_profile: str = Form(default=DEFAULT_COST_PROFILE),
+        extraction_mode: str | None = Form(default=None),
         effort: str | None = Form(default=None),
         method: str | None = Form(default=None),
         lang: str | None = Form(default=None),
@@ -622,6 +832,8 @@ def create_app(
         repetition_penalty: float | None = Form(default=None),
     ):
         parameters = _normalize_task_parameters(
+            cost_profile=cost_profile,
+            extraction_mode=extraction_mode,
             effort=effort,
             method=method,
             lang=lang,

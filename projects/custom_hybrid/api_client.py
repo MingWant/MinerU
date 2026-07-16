@@ -46,12 +46,22 @@ def parse_remote(
     *,
     api_key: str | None = None,
     jupyter_token: str | None = None,
+    cost_profile: str | None = None,
+    extraction_mode: str | None = None,
     timeout_seconds: float = 3600,
 ) -> Path:
     inputs = collect_inputs(input_path)
     destination = Path(output_path).expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    task_parameters = {
+        name: value
+        for name, value in {
+            "cost_profile": cost_profile,
+            "extraction_mode": extraction_mode,
+        }.items()
+        if value is not None
+    }
     with ExitStack() as stack:
         files = [
             (
@@ -69,6 +79,7 @@ def parse_remote(
                 "POST",
                 base_url.rstrip("/") + "/file_parse",
                 files=files,
+                data=task_parameters or None,
                 headers=headers,
                 params={"token": jupyter_token} if jupyter_token else None,
             ) as response:
@@ -90,6 +101,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True, help="Destination ZIP path")
     parser.add_argument("--api-key-env", default="CUSTOM_HYBRID_API_KEY")
     parser.add_argument("--jupyter-token-env", default="JUPYTER_TOKEN")
+    parser.add_argument("--cost-profile", choices=("balanced", "quality"))
+    parser.add_argument(
+        "--extraction-mode",
+        choices=("hybrid_fusion", "bbox_vlm"),
+    )
     parser.add_argument("--timeout-seconds", type=float, default=3600)
     return parser
 
@@ -106,6 +122,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.output,
         api_key=api_key,
         jupyter_token=jupyter_token,
+        cost_profile=args.cost_profile,
+        extraction_mode=args.extraction_mode,
         timeout_seconds=args.timeout_seconds,
     )
     print(destination)

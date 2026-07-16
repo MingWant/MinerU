@@ -33,13 +33,19 @@ class CustomHybridUiTests(unittest.TestCase):
                     json={
                         "status": "ok",
                         "task_parameter_defaults": {
-                            "mineru": {"effort": "high", "method": "auto", "lang": "ch"},
+                            "cost_profile": "balanced",
+                            "extraction_mode": "hybrid_fusion",
+                            "mineru": {"effort": "medium", "method": "auto", "lang": "ch"},
                             "generation": {"temperature": 0.0, "seed": 42},
                         },
                     },
                 )
             if path == "/tasks" and request.method == "POST":
                 self.assertIn(b"invoice.pdf", body)
+                self.assertIn(b'name="cost_profile"', body)
+                self.assertIn(b"balanced", body)
+                self.assertIn(b'name="extraction_mode"', body)
+                self.assertIn(b"bbox_vlm", body)
                 self.assertIn(b'name="effort"', body)
                 self.assertIn(b"medium", body)
                 self.assertIn(b'name="temperature"', body)
@@ -58,6 +64,24 @@ class CustomHybridUiTests(unittest.TestCase):
                     200,
                     json={"documents": {"invoice": {"counts": {"targets": 1}}}},
                 )
+            if path == "/tasks/abc123/markdown":
+                self.assertEqual(request.url.params.get("document"), "document/document.md")
+                return httpx.Response(
+                    200,
+                    json={
+                        "documents": [
+                            {"id": "document/document.md", "name": "document"}
+                        ],
+                        "selected": "document/document.md",
+                        "name": "document",
+                        "markdown": "# Done",
+                        "content_list": "[]",
+                    },
+                )
+            if path == "/tasks/abc123/asset":
+                self.assertEqual(request.url.params.get("document"), "document/document.md")
+                self.assertEqual(request.url.params.get("path"), "images/page.png")
+                return httpx.Response(200, content=b"image")
             if path == "/tasks/abc123/result":
                 return httpx.Response(
                     200,
@@ -95,7 +119,18 @@ class CustomHybridUiTests(unittest.TestCase):
             self.assertIn("Fusion Report", page.text)
             self.assertIn("OCR Spatial Coverage", page.text)
             self.assertIn("Key–Value Pairs", page.text)
-            self.assertIn("vLLM Generation", page.text)
+            self.assertIn("VLM Recognized", page.text)
+            self.assertIn("Protocol Echoes", page.text)
+            self.assertIn("Invalid VLM Outputs", page.text)
+            self.assertIn("Recognition Errors", page.text)
+            self.assertIn("Advanced vLLM Settings", page.text)
+            self.assertIn("Markdown Rendering", page.text)
+            self.assertIn("Markdown Text", page.text)
+            self.assertIn("Content List JSON", page.text)
+            self.assertIn("Convert Again", page.text)
+            self.assertIn('id="costProfileInput"', page.text)
+            self.assertIn('id="extractionModeInput"', page.text)
+            self.assertIn("OCR BBox + VLM", page.text)
             self.assertIn('id="effortInput"', page.text)
             self.assertIn('id="temperatureInput"', page.text)
             self.assertIn('id="seedInput"', page.text)
@@ -104,7 +139,13 @@ class CustomHybridUiTests(unittest.TestCase):
             submitted = client.post(
                 "/api/tasks",
                 files={"files": ("invoice.pdf", b"pdf")},
-                data={"effort": "medium", "temperature": "0.25", "seed": "123"},
+                data={
+                    "cost_profile": "balanced",
+                    "extraction_mode": "bbox_vlm",
+                    "effort": "medium",
+                    "temperature": "0.25",
+                    "seed": "123",
+                },
             )
             self.assertEqual(submitted.status_code, 202)
             self.assertEqual(submitted.json()["task_id"], "abc123")
@@ -114,6 +155,19 @@ class CustomHybridUiTests(unittest.TestCase):
             )
             report = client.get("/api/tasks/abc123/report")
             self.assertEqual(report.json()["documents"]["invoice"]["counts"], {"targets": 1})
+            markdown = client.get(
+                "/api/tasks/abc123/markdown",
+                params={"document": "document/document.md"},
+            )
+            self.assertEqual(markdown.json()["markdown"], "# Done")
+            asset = client.get(
+                "/api/tasks/abc123/asset",
+                params={
+                    "document": "document/document.md",
+                    "path": "images/page.png",
+                },
+            )
+            self.assertEqual(asset.content, b"image")
             result = client.get("/api/tasks/abc123/result")
             self.assertEqual(result.status_code, 200)
             with zipfile.ZipFile(BytesIO(result.content)) as archive:

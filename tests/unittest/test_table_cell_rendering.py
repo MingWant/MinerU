@@ -14,7 +14,7 @@ def _blank_pdf_bytes(width=200, height=200):
     return buffer.getvalue()
 
 
-def test_span_bbox_renderer_uses_page_level_table_cell_bboxes(monkeypatch, tmp_path):
+def test_span_bbox_renderer_draws_content_without_cell_geometry(monkeypatch, tmp_path):
     rendered_table_cells = []
     rendered_content_spans = []
 
@@ -74,10 +74,7 @@ def test_span_bbox_renderer_uses_page_level_table_cell_bboxes(monkeypatch, tmp_p
         "table-cells.pdf",
     )
 
-    assert rendered_table_cells == [
-        [50, 60, 100, 100],
-        [100, 60, 150, 100],
-    ]
+    assert rendered_table_cells == []
     assert rendered_content_spans == [
         [55, 68, 88, 84],
         [108, 68, 142, 84],
@@ -130,7 +127,7 @@ def test_span_bbox_renderer_finds_cells_in_finalized_para_blocks(monkeypatch, tm
         "finalized-table-cells.pdf",
     )
 
-    assert rendered_table_cells == [[50, 60, 100, 100]]
+    assert rendered_table_cells == []
     assert rendered_content_spans == [[55, 68, 88, 84]]
 
 
@@ -151,7 +148,7 @@ def test_unreliable_overlapping_cell_geometry_is_hidden_but_content_remains():
     assert len(content_boxes) == 4
 
 
-def test_reliable_non_overlapping_cell_geometry_is_retained():
+def test_reliable_cell_geometry_is_not_returned_for_rendering():
     span = {
         "table_cells": [
             {"bbox": [10, 10, 100, 50], "content_bbox": [20, 20, 80, 40]},
@@ -161,8 +158,17 @@ def test_reliable_non_overlapping_cell_geometry_is_retained():
 
     cell_boxes, content_boxes = draw_bbox_module._table_cell_render_bboxes(span)
 
-    assert cell_boxes == [[10, 10, 100, 50], [100, 10, 190, 50]]
+    assert cell_boxes == []
     assert content_boxes == [[20, 20, 80, 40], [110, 20, 180, 40]]
+
+
+def test_content_bbox_renders_without_cell_geometry():
+    cell_boxes, content_boxes = draw_bbox_module._table_cell_render_bboxes(
+        {"table_cells": [{"content_bbox": [20, 20, 80, 40]}]}
+    )
+
+    assert cell_boxes == []
+    assert content_boxes == [[20, 20, 80, 40]]
 
 
 def test_span_bbox_renderer_draws_key_and_value_boxes(monkeypatch, tmp_path):

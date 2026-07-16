@@ -10,7 +10,6 @@ from reportlab.pdfgen import canvas
 
 from .enum_class import BlockType, ContentType, SplitFlag
 from .table_cell_quality import (
-    assess_table_cell_geometry,
     cell_content_bboxes,
     deduplicate_bboxes,
 )
@@ -36,7 +35,7 @@ DIRECT_LAYOUT_BBOX_BLOCK_TYPES = TEXT_LIKE_BLOCK_TYPES_FOR_BBOX | {
 
 # span.pdf 从这些结构性 block 中收集内部 span bbox。
 SPAN_SOURCE_BLOCK_TYPES = DIRECT_LAYOUT_BBOX_BLOCK_TYPES
-BBOX_RENDERER_VERSION = 3
+BBOX_RENDERER_VERSION = 4
 
 
 def _get_layout_source_blocks(page):
@@ -114,18 +113,16 @@ def _table_cell_render_bboxes(span):
         cell
         for cell in span.get("table_cells", [])
         if isinstance(cell, dict)
-        and _deduplicate_bboxes([cell.get("bbox")])
     ]
     content_bboxes = _deduplicate_bboxes(
         bbox
         for cell in cells
         for bbox in cell_content_bboxes(cell)
     )
-    cell_bboxes = _deduplicate_bboxes(cell["bbox"] for cell in cells)
-    quality = assess_table_cell_geometry(span)
-    if not quality.reliable:
-        return [], content_bboxes
-    return cell_bboxes, content_bboxes
+    # Cell geometry remains in middle JSON, but only content-tight OCR boxes are
+    # useful in visual review. Returning no Cell boxes keeps both PDF renderers
+    # focused on the OCR content overlay.
+    return [], content_bboxes
 
 
 def draw_bbox_without_number(i, bbox_list, page, c, rgb_config, fill_config):
@@ -188,7 +185,6 @@ def draw_bbox_with_number(i, bbox_list, page, c, rgb_config, fill_config, draw_b
 def draw_layout_bbox(pdf_info, pdf_bytes, out_path, filename):
     dropped_bbox_list = []
     tables_body_list, tables_caption_list, tables_footnote_list = [], [], []
-    table_cells_list = []
     table_content_list = []
     form_key_list = []
     form_value_list = []
@@ -204,7 +200,6 @@ def draw_layout_bbox(pdf_info, pdf_bytes, out_path, filename):
     for page in pdf_info:
         page_dropped_list = []
         tables_body, tables_caption, tables_footnote = [], [], []
-        table_cells = []
         table_content = []
         form_keys = []
         form_values = []
@@ -235,10 +230,9 @@ def draw_layout_bbox(pdf_info, pdf_bytes, out_path, filename):
                         for line in nested_block.get("lines", []):
                             for span in line.get("spans", []):
                                 if span.get("type") == ContentType.TABLE:
-                                    cell_boxes, content_boxes = (
+                                    _, content_boxes = (
                                         _table_cell_render_bboxes(span)
                                     )
-                                    table_cells.extend(cell_boxes)
                                     table_content.extend(content_boxes)
                     elif nested_block["type"] == BlockType.TABLE_CAPTION:
                         tables_caption.append(bbox)
@@ -292,7 +286,6 @@ def draw_layout_bbox(pdf_info, pdf_bytes, out_path, filename):
                 indices.append(bbox)
 
         tables_body_list.append(tables_body)
-        table_cells_list.append(table_cells)
         table_content_list.append(table_content)
         form_key_list.append(_deduplicate_bboxes(form_keys))
         form_value_list.append(_deduplicate_bboxes(form_values))
@@ -346,7 +339,6 @@ def draw_layout_bbox(pdf_info, pdf_bytes, out_path, filename):
         c = draw_bbox_without_number(i, codes_footnote_list, page, c, [229, 204, 255], True)
         c = draw_bbox_without_number(i, dropped_bbox_list, page, c, [158, 158, 158], True)
         c = draw_bbox_without_number(i, tables_body_list, page, c, [204, 204, 0], True)
-        c = draw_bbox_without_number(i, table_cells_list, page, c, [255, 128, 0], False)
         c = draw_bbox_without_number(i, table_content_list, page, c, [0, 180, 255], False)
         c = draw_bbox_without_number(i, form_key_list, page, c, [0, 160, 90], False)
         c = draw_bbox_without_number(i, form_value_list, page, c, [30, 90, 255], False)
@@ -391,7 +383,6 @@ def draw_span_bbox(pdf_info, pdf_bytes, out_path, filename):
     interline_equation_list = []
     image_list = []
     table_list = []
-    table_cell_list = []
     table_content_list = []
     form_key_list = []
     form_value_list = []
@@ -413,8 +404,7 @@ def draw_span_bbox(pdf_info, pdf_bytes, out_path, filename):
         elif span_type == ContentType.TABLE:
             if bbox is not None:
                 page_table_list.append(bbox)
-            cell_boxes, content_boxes = _table_cell_render_bboxes(span)
-            page_table_cell_list.extend(cell_boxes)
+            _, content_boxes = _table_cell_render_bboxes(span)
             page_table_content_list.extend(content_boxes)
 
     for page in pdf_info:
@@ -423,7 +413,6 @@ def draw_span_bbox(pdf_info, pdf_bytes, out_path, filename):
         page_interline_equation_list = []
         page_image_list = []
         page_table_list = []
-        page_table_cell_list = []
         page_table_content_list = []
         page_form_key_list = []
         page_form_value_list = []
@@ -466,7 +455,6 @@ def draw_span_bbox(pdf_info, pdf_bytes, out_path, filename):
         )
         image_list.append(_deduplicate_bboxes(page_image_list))
         table_list.append(_deduplicate_bboxes(page_table_list))
-        table_cell_list.append(_deduplicate_bboxes(page_table_cell_list))
         table_content_list.append(_deduplicate_bboxes(page_table_content_list))
         form_key_list.append(_deduplicate_bboxes(page_form_key_list))
         form_value_list.append(_deduplicate_bboxes(page_form_value_list))
@@ -490,7 +478,6 @@ def draw_span_bbox(pdf_info, pdf_bytes, out_path, filename):
         draw_bbox_without_number(i, interline_equation_list, page, c, [0, 0, 255], False)
         draw_bbox_without_number(i, image_list, page, c, [255, 204, 0], False)
         draw_bbox_without_number(i, table_list, page, c, [204, 0, 255], False)
-        draw_bbox_without_number(i, table_cell_list, page, c, [255, 128, 0], False)
         draw_bbox_without_number(i, table_content_list, page, c, [0, 180, 255], False)
         draw_bbox_without_number(i, form_key_list, page, c, [0, 160, 90], False)
         draw_bbox_without_number(i, form_value_list, page, c, [30, 90, 255], False)

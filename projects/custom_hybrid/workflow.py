@@ -37,6 +37,7 @@ from projects.custom_hybrid.fusion import (
     fuse_middle_json,
     recover_table_cell_geometry,
 )
+from projects.custom_hybrid.recognition import OpenAIBBoxRecognizer
 from projects.custom_hybrid.table_fusion import extract_table_snapshots
 
 
@@ -195,6 +196,15 @@ def _validate_proxy_config(vllm_config: Mapping[str, Any]) -> None:
 def _validate_fusion_config(fusion_config: Any) -> None:
     if not isinstance(fusion_config, dict):
         raise WorkflowConfigError("fusion must be a JSON object")
+    mode = fusion_config.get("mode", "hybrid_fusion")
+    if mode not in {"hybrid_fusion", "bbox_vlm"}:
+        raise WorkflowConfigError(
+            "fusion.mode must be hybrid_fusion or bbox_vlm"
+        )
+    if mode == "bbox_vlm" and not fusion_config.get("enabled", False):
+        raise WorkflowConfigError(
+            "fusion.enabled must be true when fusion.mode is bbox_vlm"
+        )
     if not fusion_config.get("enabled", False):
         return
     bounded_values = {
@@ -218,6 +228,185 @@ def _validate_fusion_config(fusion_config: Any) -> None:
     verifier = fusion_config.get("verifier", {})
     if not isinstance(verifier, dict):
         raise WorkflowConfigError("fusion.verifier must be a JSON object")
+    recognizer = fusion_config.get("recognizer", {})
+    if not isinstance(recognizer, dict):
+        raise WorkflowConfigError("fusion.recognizer must be a JSON object")
+    selection_policy = recognizer.get("selection_policy", "conservative")
+    if selection_policy not in {"conservative", "vlm_primary"}:
+        raise WorkflowConfigError(
+            "fusion.recognizer.selection_policy must be conservative or "
+            "vlm_primary"
+        )
+    recognizer_base_url = recognizer.get("base_url")
+    if recognizer_base_url is not None and (
+        not isinstance(recognizer_base_url, str)
+        or not recognizer_base_url.startswith(("http://", "https://"))
+    ):
+        raise WorkflowConfigError(
+            "fusion.recognizer.base_url must be null or an http(s) URL"
+        )
+    for key in ("model", "api_key_env"):
+        value = recognizer.get(key)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise WorkflowConfigError(
+                f"fusion.recognizer.{key} must be null or a non-empty string"
+            )
+    for key in (
+        "enabled",
+        "normal_ocr_enabled",
+        "table_ocr_enabled",
+        "prefer_vlm_for_unscored",
+        "json_mode",
+        "include_row_image",
+        "include_column_image",
+        "include_table_image",
+        "disable_structured_output_whitespace",
+        "hide_ids_in_prompt_when_constrained",
+        "batch_guard_enabled",
+        "empty_ocr_enabled",
+    ):
+        if not isinstance(recognizer.get(key, False if key == "enabled" else True), bool):
+            raise WorkflowConfigError(f"fusion.recognizer.{key} must be a boolean")
+    structured_output_mode = recognizer.get("structured_output_mode")
+    if structured_output_mode is not None and structured_output_mode not in {
+        "json_schema",
+        "structured_outputs",
+        "regex",
+        "json_object",
+        "none",
+    }:
+        raise WorkflowConfigError(
+            "fusion.recognizer.structured_output_mode must be json_schema, "
+            "structured_outputs, regex, json_object, or none"
+        )
+    for key in (
+        "min_similarity",
+        "high_confidence_threshold",
+        "assumed_vlm_confidence",
+        "min_batch_acceptable_ratio",
+        "vlm_primary_min_quality",
+    ):
+        value = recognizer.get(key)
+        if value is not None and (
+            not isinstance(value, (int, float)) or not 0 <= float(value) <= 1
+        ):
+            raise WorkflowConfigError(f"fusion.recognizer.{key} must be between 0 and 1")
+    min_length_ratio = recognizer.get("min_length_ratio", 0.4)
+    max_length_ratio = recognizer.get("max_length_ratio", 2.5)
+    if (
+        not isinstance(min_length_ratio, (int, float))
+        or float(min_length_ratio) <= 0
+        or not isinstance(max_length_ratio, (int, float))
+        or float(max_length_ratio) < float(min_length_ratio)
+    ):
+        raise WorkflowConfigError(
+            "fusion.recognizer length ratios must be positive and ordered"
+        )
+    for key in (
+        "timeout_seconds",
+        "target_render_scale",
+        "context_render_scale",
+    ):
+        value = recognizer.get(key)
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or float(value) <= 0
+        ):
+            raise WorkflowConfigError(f"fusion.recognizer.{key} must be positive")
+    for key in (
+        "max_tokens",
+        "cache_pages",
+        "max_batch_size",
+        "max_images_per_request",
+        "max_prompt_chars",
+        "candidate_text_max_chars",
+        "max_candidates_per_document",
+        "max_text_chars",
+        "batch_guard_min_candidates",
+    ):
+        value = recognizer.get(key)
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+        ):
+            raise WorkflowConfigError(
+                f"fusion.recognizer.{key} must be a positive integer"
+            )
+    preview_chars = recognizer.get("audit_response_preview_chars", 0)
+    if (
+        isinstance(preview_chars, bool)
+        or not isinstance(preview_chars, int)
+        or preview_chars < 0
+    ):
+        raise WorkflowConfigError(
+            "fusion.recognizer.audit_response_preview_chars must be a "
+            "non-negative integer"
+        )
+    max_requests = recognizer.get("max_requests_per_document", 80)
+    if (
+        isinstance(max_requests, bool)
+        or not isinstance(max_requests, int)
+        or max_requests < 0
+    ):
+        raise WorkflowConfigError(
+            "fusion.recognizer.max_requests_per_document must be a "
+            "non-negative integer"
+        )
+    temperature = recognizer.get("temperature", 0.0)
+    if (
+        isinstance(temperature, bool)
+        or not isinstance(temperature, (int, float))
+        or not 0 <= float(temperature) <= 2
+    ):
+        raise WorkflowConfigError(
+            "fusion.recognizer.temperature must be between 0 and 2"
+        )
+    top_p = recognizer.get("top_p", 1.0)
+    if (
+        isinstance(top_p, bool)
+        or not isinstance(top_p, (int, float))
+        or not 0 < float(top_p) <= 1
+    ):
+        raise WorkflowConfigError(
+            "fusion.recognizer.top_p must be greater than 0 and at most 1"
+        )
+    seed = recognizer.get("seed")
+    if seed is not None and (
+        isinstance(seed, bool)
+        or not isinstance(seed, int)
+        or not -(2**63) <= seed < 2**63
+    ):
+        raise WorkflowConfigError(
+            "fusion.recognizer.seed must be a signed 64-bit integer"
+        )
+    for key in ("target_padding_ratio", "context_padding_ratio"):
+        value = recognizer.get(key)
+        if value is not None and (
+            not isinstance(value, (int, float)) or float(value) < 0
+        ):
+            raise WorkflowConfigError(f"fusion.recognizer.{key} must be non-negative")
+    recognizer_jpeg_quality = recognizer.get("jpeg_quality", 92)
+    if not isinstance(recognizer_jpeg_quality, int) or not 1 <= recognizer_jpeg_quality <= 100:
+        raise WorkflowConfigError("fusion.recognizer.jpeg_quality must be from 1 to 100")
+    max_context_tokens = recognizer.get("max_context_tokens")
+    reserve_tokens = recognizer.get("context_reserve_tokens", 2048)
+    if (
+        isinstance(reserve_tokens, bool)
+        or not isinstance(reserve_tokens, int)
+        or reserve_tokens <= 0
+    ):
+        raise WorkflowConfigError(
+            "fusion.recognizer.context_reserve_tokens must be a positive integer"
+        )
+    if max_context_tokens is not None and (
+        isinstance(max_context_tokens, bool)
+        or not isinstance(max_context_tokens, int)
+        or max_context_tokens <= 1
+        or reserve_tokens >= max_context_tokens
+    ):
+        raise WorkflowConfigError(
+            "fusion.recognizer context token limit must exceed its positive reserve"
+        )
     reconciliation = fusion_config.get("reconciliation", {})
     if not isinstance(reconciliation, dict):
         raise WorkflowConfigError("fusion.reconciliation must be a JSON object")
@@ -1147,6 +1336,7 @@ def fuse_output_trees(
     fusion_config = config.get("fusion", {})
     settings = FusionSettings.from_mapping(fusion_config)
     verifier_config = fusion_config.get("verifier", {})
+    recognizer_config = fusion_config.get("recognizer", {})
     summary = {"documents": {}, "failed": {}}
 
     for stem, hybrid_path in hybrid_files.items():
@@ -1157,6 +1347,7 @@ def fuse_output_trees(
             summary["failed"][stem] = "missing matching OCR or fused middle JSON"
             continue
         verifier = None
+        recognizer = None
         try:
             if verifier_config.get("enabled", False) and document_path is not None:
                 verifier_base_url = str(verifier_config.get("base_url") or proxy_url)
@@ -1164,6 +1355,15 @@ def fuse_output_trees(
                     verifier_base_url,
                     document_path,
                     verifier_config,
+                )
+            if settings.bbox_recognition_enabled and document_path is not None:
+                recognizer_base_url = str(
+                    recognizer_config.get("base_url") or proxy_url
+                )
+                recognizer = OpenAIBBoxRecognizer(
+                    recognizer_base_url,
+                    document_path,
+                    recognizer_config,
                 )
             hybrid_middle = json.loads(hybrid_path.read_text(encoding="utf-8"))
             ocr_middle = json.loads(ocr_path.read_text(encoding="utf-8"))
@@ -1177,6 +1377,7 @@ def fuse_output_trees(
                     verifier.choose_table_cell if verifier else None
                 ),
                 page_reconciler=verifier.reconcile_page if verifier else None,
+                bbox_recognizer=recognizer if recognizer else None,
             )
             fused_path.write_text(
                 json.dumps(fused_middle, ensure_ascii=False, indent=4),
@@ -1203,17 +1404,49 @@ def fuse_output_trees(
         finally:
             if verifier is not None:
                 verifier.close()
+            if recognizer is not None:
+                recognizer.close()
     return summary
 
 
 def run_extract(config: Mapping[str, Any], input_path: str | Path, output_path: str | Path) -> int:
-    fusion_enabled = bool(config.get("fusion", {}).get("enabled", False))
+    fusion_config = config.get("fusion", {})
+    fusion_enabled = bool(fusion_config.get("enabled", False))
+    fusion_mode = str(fusion_config.get("mode", "hybrid_fusion"))
     output_root = Path(output_path).expanduser().resolve()
     if fusion_enabled:
-        for child_name in ("hybrid", "ocr", "fused"):
+        child_names = (
+            ("ocr", "fused")
+            if fusion_mode == "bbox_vlm"
+            else ("hybrid", "ocr", "fused")
+        )
+        for child_name in child_names:
             _require_empty_output(output_root / child_name, child_name.capitalize())
     server, thread, proxy_url = _start_parameter_proxy(config)
     try:
+        if fusion_enabled and fusion_mode == "bbox_vlm":
+            ocr_output = output_root / "ocr"
+            fused_output = output_root / "fused"
+            _run_mineru_command(build_pipeline_command(config, input_path, ocr_output))
+            summary = fuse_output_trees(
+                config,
+                input_path,
+                ocr_output,
+                ocr_output,
+                fused_output,
+                proxy_url,
+            )
+            summary_path = output_root / "fusion_summary.json"
+            summary_path.parent.mkdir(parents=True, exist_ok=True)
+            summary_path.write_text(
+                json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            if summary["failed"]:
+                raise RuntimeError(
+                    f"Fusion failed for {len(summary['failed'])} document(s); see {summary_path}"
+                )
+            return 0
+
         hybrid_output = output_root / "hybrid" if fusion_enabled else output_root
         _run_mineru_command(
             build_mineru_command(config, input_path, hybrid_output, proxy_url)
@@ -2012,11 +2245,138 @@ def run_doctor(config: Mapping[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         upstream_status["error"] = type(exc).__name__
 
+    fusion_config = config.get("fusion", {})
+    recognizer_config = (
+        fusion_config.get("recognizer", {})
+        if isinstance(fusion_config, Mapping)
+        else {}
+    )
+    recognizer_enabled = bool(
+        isinstance(recognizer_config, Mapping)
+        and (
+            recognizer_config.get("enabled", False)
+            or (
+                isinstance(fusion_config, Mapping)
+                and fusion_config.get("mode") == "bbox_vlm"
+            )
+        )
+    )
+    recognizer_status: dict[str, Any] = {
+        "enabled": recognizer_enabled,
+        "ready": not recognizer_enabled,
+        "capability_trial_required": recognizer_enabled,
+    }
+    if recognizer_enabled:
+        recognizer_url = str(
+            recognizer_config.get("base_url") or upstream_url
+        ).rstrip("/")
+        recognizer_status.update(
+            {
+                "url": recognizer_url,
+                "reachable": False,
+                "status_code": None,
+                "configured_model": recognizer_config.get("model"),
+                "structured_output_mode": recognizer_config.get(
+                    "structured_output_mode",
+                    "json_object",
+                ),
+                "structured_output_supported": False,
+            }
+        )
+        try:
+            import httpx
+
+            recognizer_headers = {}
+            recognizer_api_key_env = str(
+                recognizer_config.get("api_key_env", "VLLM_API_KEY")
+            )
+            recognizer_api_key = os.getenv(recognizer_api_key_env)
+            if recognizer_api_key:
+                recognizer_headers["Authorization"] = (
+                    f"Bearer {recognizer_api_key}"
+                )
+            models_response = httpx.get(
+                recognizer_url + "/v1/models",
+                headers=recognizer_headers,
+                timeout=3.0,
+            )
+            recognizer_status["status_code"] = models_response.status_code
+            recognizer_status["reachable"] = models_response.is_success
+            model_ids = []
+            context_lengths = []
+            if models_response.is_success:
+                payload = models_response.json()
+                models = payload.get("data", []) if isinstance(payload, dict) else []
+                model_ids = [
+                    item["id"]
+                    for item in models
+                    if isinstance(item, dict) and isinstance(item.get("id"), str)
+                ]
+                context_lengths = [
+                    item["max_model_len"]
+                    for item in models
+                    if isinstance(item, dict)
+                    and isinstance(item.get("max_model_len"), int)
+                    and item["max_model_len"] > 1
+                ]
+            recognizer_status["available_models"] = model_ids
+            configured_model = recognizer_config.get("model")
+            recognizer_status["model_available"] = (
+                bool(model_ids)
+                if not isinstance(configured_model, str) or not configured_model
+                else configured_model in model_ids
+            )
+            recognizer_status["max_model_len"] = (
+                min(context_lengths) if context_lengths else None
+            )
+            openapi_response = httpx.get(
+                recognizer_url + "/openapi.json",
+                headers=recognizer_headers,
+                timeout=3.0,
+            )
+            openapi = openapi_response.json() if openapi_response.is_success else {}
+            schemas = (
+                openapi.get("components", {}).get("schemas", {})
+                if isinstance(openapi, dict)
+                else {}
+            )
+            request_properties = (
+                schemas.get("ChatCompletionRequest", {}).get("properties", {})
+                if isinstance(schemas, dict)
+                else {}
+            )
+            mode = recognizer_status["structured_output_mode"]
+            if mode == "none":
+                structured_supported = True
+            elif mode in {"structured_outputs", "regex"}:
+                structured_supported = "structured_outputs" in request_properties
+            elif mode == "json_object":
+                structured_supported = "response_format" in request_properties
+            else:
+                response_format_enum = (
+                    schemas.get("ResponseFormat", {})
+                    .get("properties", {})
+                    .get("type", {})
+                    .get("enum", [])
+                )
+                structured_supported = "json_schema" in response_format_enum
+            recognizer_status["structured_output_supported"] = bool(
+                structured_supported
+            )
+            recognizer_status["ready"] = bool(
+                recognizer_status["reachable"]
+                and recognizer_status["model_available"]
+                and recognizer_status["structured_output_supported"]
+            )
+        except Exception as exc:
+            recognizer_status["error"] = type(exc).__name__
+
     missing_dependencies = [name for name, available in dependencies.items() if not available]
     ready = (
         local_mineru_source
         and not missing_dependencies
         and upstream_status["reachable"]
+        and recognizer_status["ready"]
     )
     return {
         "ready": ready,
@@ -2027,6 +2387,7 @@ def run_doctor(config: Mapping[str, Any]) -> dict[str, Any]:
         "dependencies": dependencies,
         "missing_dependencies": missing_dependencies,
         "upstream": upstream_status,
+        "recognizer": recognizer_status,
     }
 
 

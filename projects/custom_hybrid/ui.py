@@ -6,7 +6,7 @@ import argparse
 import os
 import re
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import httpx
 import uvicorn
@@ -48,14 +48,25 @@ def create_ui_app(
             raise HTTPException(status_code=400, detail="Invalid task id")
         return f"{remote_base}/tasks/{task_id}{suffix}"
 
-    async def buffered_request(method: str, url: str) -> Response:
+    def request_params(extra: Mapping[str, str] | None = None) -> dict[str, str] | None:
+        merged = dict(params or {})
+        if extra:
+            merged.update(extra)
+        return merged or None
+
+    async def buffered_request(
+        method: str,
+        url: str,
+        *,
+        extra_params: Mapping[str, str] | None = None,
+    ) -> Response:
         try:
             async with make_client() as client:
                 response = await client.request(
                     method,
                     url,
                     headers=headers,
-                    params=params,
+                    params=request_params(extra_params),
                 )
         except httpx.HTTPError as exc:
             return JSONResponse(
@@ -76,6 +87,7 @@ def create_ui_app(
         *,
         default_media_type: str,
         default_disposition: str,
+        extra_params: Mapping[str, str] | None = None,
     ):
         client = make_client()
         try:
@@ -83,7 +95,7 @@ def create_ui_app(
                 "GET",
                 task_url(task_id, suffix),
                 headers=headers,
-                params=params,
+                params=request_params(extra_params),
             )
             response = await client.send(request, stream=True)
         except httpx.HTTPError as exc:
@@ -130,6 +142,8 @@ def create_ui_app(
     @app.post("/api/tasks")
     async def submit_task(
         files: list[UploadFile] = File(...),
+        cost_profile: str | None = Form(default=None),
+        extraction_mode: str | None = Form(default=None),
         effort: str | None = Form(default=None),
         method: str | None = Form(default=None),
         lang: str | None = Form(default=None),
@@ -155,6 +169,8 @@ def create_ui_app(
         task_parameters = {
             key: value
             for key, value in {
+                "cost_profile": cost_profile,
+                "extraction_mode": extraction_mode,
                 "effort": effort,
                 "method": method,
                 "lang": lang,
@@ -198,6 +214,25 @@ def create_ui_app(
     @app.get("/api/tasks/{task_id}/report")
     async def get_report(task_id: str) -> Response:
         return await buffered_request("GET", task_url(task_id, "/report"))
+
+    @app.get("/api/tasks/{task_id}/markdown")
+    async def get_markdown(task_id: str, document: str | None = None) -> Response:
+        extra = {"document": document} if document else None
+        return await buffered_request(
+            "GET",
+            task_url(task_id, "/markdown"),
+            extra_params=extra,
+        )
+
+    @app.get("/api/tasks/{task_id}/asset")
+    async def get_markdown_asset(task_id: str, document: str, path: str):
+        return await streamed_task_request(
+            task_id,
+            "/asset",
+            default_media_type="application/octet-stream",
+            default_disposition="inline",
+            extra_params={"document": document, "path": path},
+        )
 
     @app.delete("/api/tasks/{task_id}")
     async def delete_task(task_id: str) -> Response:

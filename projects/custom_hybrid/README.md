@@ -50,6 +50,13 @@ Copy `workflow.example.json` and edit the copy. Important sections:
 
 `generation_config` is set to `vllm` in the example so the model repository's
 generation config does not silently replace the workflow's sampling baseline.
+The example is cost-optimized by default: Hybrid uses `effort=medium`, formula
+and image analysis are disabled, and the optional visual verifier, recognizer,
+and reconciliation stages are off. Pipeline OCR, deterministic fusion, Table
+processing, Cell metadata, and content-tight bbox rendering remain enabled.
+An existing `workflow.local.json` is not rewritten during an update. API/UI tasks
+still receive the Balanced runtime overrides by default; direct `extract` users
+should merge these example values into their local config explicitly.
 The example also removes MinerU's stale `top_k`, presence/frequency penalties,
 and `vllm_xargs`, while overriding generated output to `max_tokens=2048` instead
 of using a default that MinerU's own `max_tokens` can bypass. At proxy startup,
@@ -67,6 +74,11 @@ python projects/custom_hybrid/workflow.py --config workflow.local.json doctor
 ```
 
 The command reports missing proxy dependencies and probes `<upstream>/v1/models`.
+When `fusion.recognizer.enabled=true`, it also checks the independent Vision
+endpoint, configured model ID, context length, and whether the selected strict
+output mode appears in its OpenAPI schema. `recognizer.ready=true` proves only
+transport and protocol compatibility; `capability_trial_required=true` remains
+because bbox-ground-truth A/B must still prove transcription quality.
 The parameter proxy binds to loopback by default. A non-loopback host is rejected
 unless `vllm.proxy.allow_public_bind=true`, because the proxy can carry model API
 credentials and should not be exposed accidentally.
@@ -88,14 +100,23 @@ python projects/custom_hybrid/workflow.py --config workflow.local.json extract `
   --output output/custom_hybrid
 ```
 
-With `fusion.enabled=true`, `extract` starts the local parameter proxy and runs
-two independent parses:
+With `fusion.enabled=true`, `extract` starts the local parameter proxy. The
+default `fusion.mode=hybrid_fusion` runs two independent parses:
 
 - `output/hybrid`: Hybrid/VLM result with configured generation parameters;
 - `output/ocr`: pipeline backend forced to OCR mode;
 - `output/fused`: Hybrid structure with conservative OCR/VLM corrections and
   retained Pipeline table Cell/content geometry;
 - `output/fusion_summary.json`: per-document status and replacement counts.
+
+The alternative `fusion.mode=bbox_vlm` is a Pipeline-owned geometry path. It
+runs only `output/ocr`, skips the full-page Hybrid parse, sends the Pipeline
+Table content bboxes (the cyan boxes) as local crops to the constrained Vision
+recognizer, and writes selected text into `output/fused`. The OCR text is retained
+when the VLM response is missing, malformed, unsafe, or fails a structured-value
+guard. The mode bypasses the ordinary fusion/recovery stages after recognition,
+so it cannot add, move, or resize blocks, Cells, content boxes, or Table grid
+coordinates.
 
 Each fused parse directory also contains `<document>_fusion.json`, which records
 the bbox, candidates, confidence, similarity, and decision for every conflict.
@@ -106,9 +127,10 @@ stage-specific regex rules. The preview collector excludes image/audio fields an
 all `data:` URIs; leave it at `0` for normal runs.
 
 Fusion only auto-replaces empty, corrupt, repeated, or abnormally expanded VLM
-text when OCR confidence passes the threshold. Other disagreements are shown as
-page crops to the configured visual verifier. The built-in verifier can only
-select the exact `hybrid` or `ocr` candidate; it cannot transcribe a third value.
+text when OCR confidence passes the threshold. Other disagreements keep Hybrid
+by default. When explicitly enabled, the visual verifier receives page crops and
+can only select the exact `hybrid` or `ocr` candidate; it cannot transcribe a
+third value.
 High-confidence OCR lines that have no Hybrid target can be inserted as recovered
 text blocks. Images, charts, formulas, and geometrically reliable Tables remain
 protected visual containers. An unreliable Table is routed to the coverage-first
@@ -128,16 +150,145 @@ at a time instead of being globally suppressed by text equality.
 Every fusion report includes per-page `coverage` records, global
 `ocr_spatial_coverage`, Table quality routes, and structured `key_value_pairs`
 with `key_bbox` and `value_bbox`. The fused middle JSON stores the same page-level
-`form_fields` metadata. Bounding-box PDFs use orange for reliable Cell geometry,
-cyan for OCR content boxes, green for paired keys, and blue for paired values.
-When Cell geometry is unreliable, orange is suppressed while the content-tight
-cyan/key/value boxes remain visible.
+`form_fields` metadata. Bounding-box PDFs use cyan for OCR content boxes, green
+for paired keys, and blue for paired values. Table Cell geometry remains in
+middle JSON for fusion and downstream consumers, but is not drawn because the
+content-tight cyan boxes are more useful for visual review.
 
 Important coverage controls are `recover_missing_ocr_blocks`,
 `missing_ocr_min_confidence`, `max_missing_ocr_blocks_per_document`,
 `unreliable_table_recovery_enabled`,
 `unreliable_table_allow_unscored_ocr`, and
 `max_unreliable_table_ocr_blocks_per_document`.
+
+### Experimental bbox-conditioned VLM recognition
+
+Set `fusion.mode=bbox_vlm` to use bbox-conditioned recognition as the complete
+extraction mode. In this mode the recognizer is forced on, ordinary page-text
+recognition is forced off, Table content-box recognition is forced on, and valid
+VLM text is primary while guarded OCR remains the fallback. Keep
+`fusion.mode=hybrid_fusion` for the existing dual-parse workflow and its
+conservative optional recognizer behavior.
+
+`fusion.recognizer.enabled=false` is the default. When explicitly enabled, the
+recognizer runs before structured fusion and treats Pipeline OCR geometry as
+immutable: the Vision model receives existing bbox IDs and crops, then returns
+only `{id, text}` items. Unknown IDs, duplicate IDs, returned coordinates, and
+free-form output are ignored. Selected text is written back into OCR spans and
+Cell metadata without changing any bbox; keyed Pipeline Cells can safely rebuild
+their HTML while requiring the Table structure signature to stay identical.
+
+The recognizer supports target, row, column, and whole-Table crops. Target crops
+always receive image-budget priority. Row context is enabled by default; column
+and Table images are opt-in because they increase multimodal context cost. Batch
+size, image/request limits, rendering scale, padding, timeout, model, endpoint,
+sampling values, output tokens, and context reserve are server-controlled under
+`fusion.recognizer`. If the image budget is smaller than the requested batch,
+the client automatically creates more batches rather than dropping target
+crops.
+
+`structured_output_mode=json_schema` is the default example and sends a dynamic
+strict schema whose ID enum and item count match the current batch. vLLM-native
+`structured_outputs`, strict ordered `regex`, legacy `json_object`, and `none`
+are available explicitly for compatible servers. Native schema mode also asks
+vLLM to disable unconstrained whitespace. Regex mode encodes every batch ID and
+JSON-string escape rules directly, leaving no whitespace escape path.
+Constrained modes hide real bbox IDs from the prompt and expose only ordinal
+image slots, preventing protocol-token copying; returned bbox-ID-shaped text is
+always rejected as an echo and falls back to OCR.
+Unsupported strict modes fail closed and retain OCR.
+
+Candidate selection is conservative:
+
+- normalized consensus keeps OCR;
+- invalid OCR dates/amounts may use a format-valid VLM transcription;
+- when two valid dates, amounts, or identifiers disagree, OCR is retained and
+  the high-risk conflict is audited;
+- unrelated text and abnormal length changes are rejected;
+- high-confidence OCR stays unless it is demonstrably lower quality;
+- unscored OCR may prefer VLM only when all guards pass.
+- batches with fewer than the configured proportion of plausible responses
+  trigger a circuit breaker and retain OCR for the entire batch; the original
+  per-candidate reason remains in `candidate_reason` for diagnosis.
+
+Existing OCR/content bboxes with empty text are retained as recognition
+candidates when `empty_ocr_enabled=true`. An empty candidate can be filled only
+when a batch of at least `batch_guard_min_candidates` passes the configured
+quality ratio using non-empty OCR anchors. Isolated empty boxes and low-quality
+batches remain empty and are audited as `empty_ocr_context_guard`.
+
+Every bbox receives a `bbox_recognition` audit decision with OCR/VLM candidates,
+unchanged bbox, field type, similarity, selected source, and reason. Batch audit
+records include IDs, image count, latency, finish reason, prompt/completion token
+usage, request-limit outcomes, and errors.
+Each report also records machine-checked `bbox_unchanged` and
+`table_structure_unchanged` invariants; either failure prevents an enablement
+recommendation.
+The English UI summarizes VLM selections, OCR fallbacks, and recognition errors.
+It also surfaces protocol-token echoes and invalid VLM output counts so an
+incompatible recognizer is visible without opening the raw fusion report.
+
+For a separate instruction-following Vision endpoint:
+
+```json
+{
+  "fusion": {
+    "recognizer": {
+      "enabled": true,
+      "base_url": "http://vision-recognizer.example:8000",
+      "model": "document-vision-model",
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "seed": 42,
+      "structured_output_mode": "json_schema",
+      "max_tokens": 1024,
+      "max_context_tokens": 8192,
+      "context_reserve_tokens": 2048,
+      "max_batch_size": 8,
+      "include_row_image": true,
+      "include_column_image": false,
+      "include_table_image": false
+    }
+  }
+}
+```
+
+Keep the feature disabled until a reviewed bbox reference set proves lower CER
+and no regressions. Evaluate a fusion report with:
+
+```bash
+python projects/custom_hybrid/recognition_eval.py \
+  --report output/document_fusion.json \
+  --reference bbox_reference.json \
+  --output bbox_recognition_ab.json
+```
+
+After changing only fusion policy, replay the audited OCR/VLM candidates without
+another model request by adding `--reselect-config workflow.local.json`. Replay
+never changes bbox or raw candidates; it recalculates selected source, reason,
+and evaluation metrics with the current recognizer guards.
+
+Reference items use `{"page": 0, "bbox": [x0, y0, x1, y1], "text": "ground truth"}`.
+The evaluator reports OCR, raw VLM, and selected exact accuracy/CER, improved and
+regressed items, bbox-key coverage, geometry/Table-structure invariants, and
+whether the evidence supports enabling the recognizer by default. To run the
+configured recognizer on only the reviewed reference boxes before evaluating:
+
+```bash
+python projects/custom_hybrid/recognition_trial.py \
+  --config workflow.local.json \
+  --middle output/ocr/document_middle.json \
+  --document input/document.pdf \
+  --reference bbox_reference.json \
+  --output bbox_recognition_trial.json
+```
+
+Default-enable evidence also requires complete operational audit: every
+candidate must receive a valid response, every batch must finish with `ok`, and
+there must be no request errors, invalid outputs, protocol echoes, candidate
+limit, or batch-quality circuit breaker. Add
+`--require-default-enable-evidence` in CI to exit with status 2 when any
+accuracy, invariant, coverage, or operational gate fails.
 
 ### Hierarchical table fusion
 
@@ -155,7 +306,8 @@ Tables use a global-structure/local-content/global-validation pipeline:
 5. Keep consensus cells, fill empty Hybrid cells, and replace suspicious Hybrid
    cells only when Pipeline supplies sufficient OCR confidence (or the explicit
    `table_cell_allow_unscored_ocr` opt-in is enabled).
-6. Send remaining conflicts to the visual verifier with four possible crops:
+6. When enabled and within its request budget, send remaining conflicts to the
+   visual verifier with four possible crops:
    whole table, target row, target column, and target cell. The verifier may only
    choose `hybrid` or `pipeline`; it cannot invent or merge a third value.
 7. Replace only the selected cell's inner HTML, then parse the rebuilt table and
@@ -165,9 +317,10 @@ Tables use a global-structure/local-content/global-validation pipeline:
 
 The fused table copies Pipeline Cell geometry into the final Hybrid table and
 synchronizes every Cell's `text` with the final fused HTML. Bounding-box PDFs draw
-Cell boundaries in orange and OCR content-tight boxes in cyan. If OCR confidence
-is absent, the safe default `table_cell_allow_unscored_ocr=false` sends conflicts
-to visual verification instead of auto-replacing them.
+only OCR content-tight boxes in cyan; Cell geometry stays available in middle
+JSON. If OCR confidence is absent, the safe default
+`table_cell_allow_unscored_ocr=false` keeps the Hybrid candidate unless an
+explicitly enabled visual verifier selects another existing candidate.
 
 Important table controls:
 
@@ -261,11 +414,22 @@ python projects/custom_hybrid/api.py \
 Public binding without a token is rejected unless
 `--allow-unauthenticated-public` is explicitly supplied. Keep the service behind
 a private network, VPN, or authenticated reverse proxy. The server uses
-`workflow.local.json` as its baseline. Each task may safely override `effort`,
+`workflow.local.json` as its baseline. API tasks default to the `balanced` cost
+profile, which forces `effort=medium`, caps output at 2048 tokens, disables formula
+and image analysis, and prevents verifier/recognizer/reconciliation requests. It
+does not disable Table extraction, Pipeline OCR, deterministic fusion, or cyan
+content bboxes. Submit `extraction_mode=bbox_vlm` after either cost profile to
+enable the Pipeline BBox + local VLM path; this task override re-enables only the
+required Table recognizer and disables the unrelated verifier/reconciliation
+requests. Submit `cost_profile=quality` to use the corresponding workflow
+configuration instead. Each task may safely override `effort`,
 parse method, language, `temperature`, `top_p`, `seed`, `max_tokens`, and
 `repetition_penalty`; the API validates their types and ranges. Task generation
 values are applied after prompt-specific workflow rules, so the submitted values
-are the final values forwarded to vLLM. Upstream URL, credentials, proxy binding,
+are the final values forwarded to vLLM. In `bbox_vlm` mode, temperature, top-p,
+seed, and max-token overrides are also copied into the local bbox recognizer so
+they still apply when it uses a separately configured compatible endpoint.
+Upstream URL, credentials, proxy binding,
 fusion thresholds, and arbitrary vLLM arguments remain server-controlled. Tasks
 run serially because each extraction owns a local parameter-proxy port and local
 OCR resources. Completed ZIP files include `task_parameters.json` with the
@@ -278,6 +442,8 @@ Endpoints:
 - `POST /tasks`: upload PDF/images plus optional task parameters and receive a task id;
 - `GET /tasks/{task_id}`: poll status;
 - `GET /tasks/{task_id}/result`: download the fused ZIP;
+- `GET /tasks/{task_id}/markdown`: read Markdown and content-list output;
+- `GET /tasks/{task_id}/asset`: read a validated Markdown image asset;
 - `GET /tasks/{task_id}/report`: read `fusion_summary.json`;
 - `DELETE /tasks/{task_id}`: remove a completed/failed task and its files;
 - `POST /file_parse`: wait synchronously and return the fused ZIP.
@@ -288,6 +454,8 @@ Example task-level parameter override:
 curl -X POST \
   -H "Authorization: Bearer $CUSTOM_HYBRID_API_KEY" \
   -F "files=@invoice.pdf" \
+  -F "cost_profile=balanced" \
+  -F "extraction_mode=bbox_vlm" \
   -F "effort=medium" \
   -F "temperature=0.1" \
   -F "top_p=0.95" \
@@ -305,7 +473,9 @@ export CUSTOM_HYBRID_API_KEY='replace-with-a-long-random-token'
 python projects/custom_hybrid/api_client.py \
   --url http://10.100.0.30:8010 \
   --input ~/Documents/invoice.pdf \
-  --output ~/Documents/invoice-fused.zip
+  --output ~/Documents/invoice-fused.zip \
+  --cost-profile balanced \
+  --extraction-mode bbox_vlm
 ```
 
 The client accepts either one supported file or a directory and streams the ZIP
@@ -336,15 +506,22 @@ python projects/custom_hybrid/ui.py \
   --port 7860
 ```
 
-Open `http://127.0.0.1:7860`, drag in PDF/images, submit the task, inspect the
-fusion report, and download the fused ZIP. Extraction Settings and vLLM
-Generation controls are task-scoped; the task details panel echoes the accepted
-parameter snapshot. For PDF inputs, the fused workflow
-generates both `*_layout.pdf` and `*_span.pdf`; after completion the Document
-Preview automatically switches to `*_span.pdf`, where Table Cell boxes are orange
-and OCR content-tight boxes are cyan. Use the Original / Bounding Boxes controls
-to switch views. The UI refuses public binding unless `--allow-public-bind` is
-supplied explicitly.
+Open `http://127.0.0.1:7860`. The UI follows the official MinerU workspace shape:
+task controls on the left, document preview in the center, and extraction output
+on the right. Result tabs provide Markdown Rendering, Markdown Text, Content List
+JSON, and the Custom Hybrid Fusion Report. Relative Markdown images are served
+through a task-scoped, image-only endpoint with path traversal protection.
+
+Extraction and vLLM Generation controls are task-scoped; the Fusion Report tab
+includes the accepted task parameter snapshot. The English `Extraction Mode`
+selector offers `Hybrid Fusion` and `OCR BBox + VLM`. After a task completes, the same
+selected files and parameters remain available and Convert changes to Convert
+Again, so rerunning does not require Clear. For PDF inputs, the fused workflow
+generates both `*_layout.pdf` and `*_span.pdf`; Document Preview automatically
+switches to `*_span.pdf`, where OCR content-tight boxes are cyan. Table Cell
+geometry remains in middle JSON and is intentionally not drawn. Use Original /
+Bounding Boxes to switch views. The UI refuses public binding unless
+`--allow-public-bind` is supplied explicitly.
 
 `span.pdf` generation resolves the source PDF from the uploaded task input first
 and then falls back to the fused `*_origin.pdf` artifact. The preview endpoint
@@ -355,16 +532,10 @@ artifacts and are installed by the base project dependencies.
 
 Cell geometry is retained even when a table model supplies valid Cell bboxes but
 omits logical row/column indices. Logical indices remain required for automatic
-cell-text replacement, but not for orange Cell or cyan OCR-content rendering.
+cell-text replacement, but not for cyan OCR-content rendering.
 When Preview is opened, completed tasks also recover missing Cell geometry from
 the sibling Pipeline OCR middle JSON before deciding whether `*_span.pdf` needs
 to be redrawn.
-
-Rendering applies a separate Cell-geometry quality gate. Cyan OCR-content boxes
-remain visible, but orange Cell boxes are suppressed when a table is abnormally
-over-segmented, most content falls outside its assigned Cell, or Cell boxes have
-excessive material overlap. This avoids presenting a hallucinated table grid as
-reliable geometry on degraded scans while retaining orange boxes on stable tables.
 
 For a Jupyter Server Proxy URL, also export `JUPYTER_TOKEN` and use a remote URL
 such as `http://10.100.0.30:8989/proxy/6108`.
