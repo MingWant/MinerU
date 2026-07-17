@@ -642,6 +642,16 @@ class WorkflowTests(unittest.TestCase):
                 -1,
                 "max_tables_per_document",
             ),
+            (
+                ("fusion", "recovery", "table_orphan_recovery_enabled"),
+                "yes",
+                "table_orphan_recovery_enabled",
+            ),
+            (
+                ("fusion", "recovery", "table_orphan_min_ink_density"),
+                0,
+                "table_orphan_min_ink_density",
+            ),
         )
         for path_parts, value, message in cases:
             with self.subTest(path_parts=path_parts), tempfile.TemporaryDirectory() as temp_dir:

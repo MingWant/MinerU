@@ -134,6 +134,8 @@ class CustomHybridUiTests(unittest.TestCase):
             self.assertIn("Local Pixel Proposals", page.text)
             self.assertIn("Recovery Cells Analyzed", page.text)
             self.assertIn("Recovery Pixel Time", page.text)
+            self.assertIn("Orphan Tables Scanned", page.text)
+            self.assertIn("Orphan Boxes Added", page.text)
             self.assertIn("Recovery Tables Reviewed", page.text)
             self.assertIn("Recovered Boxes Added", page.text)
             self.assertIn("Advanced vLLM Settings", page.text)

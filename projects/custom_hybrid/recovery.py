@@ -44,6 +44,16 @@ def _clip_bbox(
     )
 
 
+def _bbox_overlap_ratio(
+    bbox: Sequence[float],
+    existing: Sequence[float],
+) -> float:
+    width = max(0.0, min(bbox[2], existing[2]) - max(bbox[0], existing[0]))
+    height = max(0.0, min(bbox[3], existing[3]) - max(bbox[1], existing[1]))
+    area = max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
+    return width * height / area if area > 0 else 0.0
+
+
 def _parse_json_object(content: Any) -> dict[str, Any] | None:
     if isinstance(content, list):
         content = "".join(
@@ -94,6 +104,8 @@ class OpenAIBBoxRecoveryReviewer:
         self.protocol_disabled = False
         self.pixel_cells_analyzed = 0
         self.pixel_cells_skipped = 0
+        self.orphan_tables_analyzed = 0
+        self.orphan_boxes_proposed = 0
         self._owns_provider = page_provider is None
         self.provider = page_provider or PageCropProvider(
             document_path,
@@ -276,6 +288,266 @@ class OpenAIBBoxRecoveryReviewer:
                 }
             )
         return suspicious
+
+    def _table_orphan_proposals(
+        self,
+        image,
+        page_size: Sequence[float],
+        table: Mapping[str, Any],
+        max_items: int,
+    ) -> list[dict[str, Any]]:
+        """Find text-line ink inside a Table but outside every OCR Cell bbox."""
+        if (
+            not self.config.get("table_orphan_recovery_enabled", True)
+            or max_items <= 0
+        ):
+            return []
+        table_bbox = _valid_bbox(table.get("bbox"))
+        cells = [
+            cell
+            for cell in table.get("cells", [])
+            if isinstance(cell, Mapping)
+            and _valid_bbox(cell.get("bbox")) is not None
+        ]
+        if table_bbox is None or not cells:
+            return []
+        scale_x, scale_y = self._page_scale(image, page_size)
+        crop_box = (
+            max(0, int(math.floor(table_bbox[0] * scale_x))),
+            max(0, int(math.floor(table_bbox[1] * scale_y))),
+            min(image.width, int(math.ceil(table_bbox[2] * scale_x))),
+            min(image.height, int(math.ceil(table_bbox[3] * scale_y))),
+        )
+        if crop_box[2] <= crop_box[0] or crop_box[3] <= crop_box[1]:
+            return []
+        crop = image.crop(crop_box).convert("L")
+        self.orphan_tables_analyzed += 1
+        try:
+            histogram = crop.histogram()
+            total_pixels = max(crop.width * crop.height, 1)
+            target = total_pixels * 0.9
+            cumulative = 0
+            background = 255
+            for value, count in enumerate(histogram):
+                cumulative += count
+                if cumulative >= target:
+                    background = value
+                    break
+            threshold = max(40, min(220, background - 25))
+            dark_mask = np.asarray(crop, dtype=np.uint8) < threshold
+            cell_mask = np.zeros_like(dark_mask, dtype=bool)
+            padding_points = max(
+                float(self.config.get("table_orphan_cell_padding", 1.5)),
+                0.0,
+            )
+            padding_x = int(math.ceil(padding_points * scale_x))
+            padding_y = int(math.ceil(padding_points * scale_y))
+
+            def mark_bbox(mask, raw_bbox: Any, extra_x: int, extra_y: int) -> None:
+                bbox = _valid_bbox(raw_bbox)
+                if bbox is None:
+                    return
+                left = max(
+                    0,
+                    int(math.floor(bbox[0] * scale_x)) - crop_box[0] - extra_x,
+                )
+                top = max(
+                    0,
+                    int(math.floor(bbox[1] * scale_y)) - crop_box[1] - extra_y,
+                )
+                right = min(
+                    crop.width,
+                    int(math.ceil(bbox[2] * scale_x)) - crop_box[0] + extra_x,
+                )
+                bottom = min(
+                    crop.height,
+                    int(math.ceil(bbox[3] * scale_y)) - crop_box[1] + extra_y,
+                )
+                if right > left and bottom > top:
+                    mask[top:bottom, left:right] = True
+
+            existing_mask = np.zeros_like(dark_mask, dtype=bool)
+            existing_bboxes = []
+            for cell in cells:
+                mark_bbox(cell_mask, cell.get("bbox"), padding_x, padding_y)
+                for box in cell.get("existing", []):
+                    if not isinstance(box, Mapping):
+                        continue
+                    bbox = _valid_bbox(box.get("bbox"))
+                    if bbox is not None:
+                        existing_bboxes.append(bbox)
+                        mark_bbox(existing_mask, bbox, padding_x, padding_y)
+
+            orphan_mask = dark_mask & ~cell_mask & ~existing_mask
+            border_px = max(1, int(round(min(scale_x, scale_y))))
+            orphan_mask[:border_px, :] = False
+            orphan_mask[-border_px:, :] = False
+            orphan_mask[:, :border_px] = False
+            orphan_mask[:, -border_px:] = False
+
+            horizontal_ratio = float(
+                self.config.get("table_orphan_horizontal_line_ratio", 0.5)
+            )
+            vertical_ratio = float(
+                self.config.get("table_orphan_vertical_line_ratio", 0.5)
+            )
+            long_rows = np.flatnonzero(
+                np.count_nonzero(orphan_mask, axis=1)
+                >= max(int(crop.width * horizontal_ratio), 1)
+            )
+            long_columns = np.flatnonzero(
+                np.count_nonzero(orphan_mask, axis=0)
+                >= max(int(crop.height * vertical_ratio), 1)
+            )
+            for row in long_rows:
+                orphan_mask[max(0, row - 1) : min(crop.height, row + 2), :] = False
+            for column in long_columns:
+                orphan_mask[:, max(0, column - 1) : min(crop.width, column + 2)] = False
+
+            minimum_row_ink = max(
+                int(self.config.get("table_orphan_min_row_ink_pixels", 4)),
+                int(crop.width * 0.002),
+            )
+            active_rows = np.flatnonzero(
+                np.count_nonzero(orphan_mask, axis=1) >= minimum_row_ink
+            )
+            if active_rows.size == 0:
+                return []
+            max_gap = max(
+                int(
+                    round(
+                        float(self.config.get("table_orphan_line_gap", 0.75))
+                        * scale_y
+                    )
+                ),
+                1,
+            )
+            bands: list[tuple[int, int]] = []
+            start = previous = int(active_rows[0])
+            for raw_row in active_rows[1:]:
+                row = int(raw_row)
+                if row - previous > max_gap + 1:
+                    bands.append((start, previous + 1))
+                    start = row
+                previous = row
+            bands.append((start, previous + 1))
+
+            proposals = []
+            minimum_height = max(
+                float(self.config.get("table_orphan_min_line_height", 4.0)),
+                0.0,
+            )
+            maximum_height_ratio = float(
+                self.config.get("table_orphan_max_line_height_ratio", 0.07)
+            )
+            minimum_width = max(
+                float(self.config.get("table_orphan_min_line_width", 20.0)),
+                0.0,
+            )
+            minimum_ink_density = float(
+                self.config.get("table_orphan_min_ink_density", 0.01)
+            )
+            maximum_ink_density = float(
+                self.config.get("table_orphan_max_ink_density", 0.7)
+            )
+            cells_with_bbox = [
+                (cell, _valid_bbox(cell.get("bbox"))) for cell in cells
+            ]
+            for top, bottom in bands:
+                band_mask = orphan_mask[top:bottom, :]
+                dark_y, dark_x = np.nonzero(band_mask)
+                if dark_x.size < minimum_row_ink:
+                    continue
+                min_x = int(dark_x.min())
+                max_x = int(dark_x.max()) + 1
+                min_y = top + int(dark_y.min())
+                max_y = top + int(dark_y.max()) + 1
+                raw_height = (max_y - min_y) / scale_y
+                if raw_height < float(
+                    self.config.get("table_orphan_min_dark_height", 2.0)
+                ):
+                    continue
+                pixel_area = max((max_x - min_x) * (max_y - min_y), 1)
+                ink_density = dark_x.size / pixel_area
+                if not minimum_ink_density <= ink_density <= maximum_ink_density:
+                    continue
+                bbox = _clip_bbox(
+                    (
+                        (crop_box[0] + min_x) / scale_x - 1.0,
+                        (crop_box[1] + min_y) / scale_y - 0.8,
+                        (crop_box[0] + max_x) / scale_x + 1.0,
+                        (crop_box[1] + max_y) / scale_y + 0.8,
+                    ),
+                    table_bbox,
+                )
+                if bbox is None:
+                    continue
+                height = bbox[3] - bbox[1]
+                maximum_height = max(
+                    (table_bbox[3] - table_bbox[1]) * maximum_height_ratio,
+                    minimum_height * 3,
+                )
+                if height < minimum_height or height > maximum_height:
+                    continue
+                if bbox[2] - bbox[0] < minimum_width:
+                    continue
+                if any(
+                    _bbox_overlap_ratio(bbox, existing_bbox) >= 0.5
+                    for existing_bbox in existing_bboxes
+                ):
+                    continue
+
+                def cell_distance(
+                    item: tuple[Mapping[str, Any], tuple[float, float, float, float] | None]
+                ) -> tuple[float, float]:
+                    cell, cell_bbox = item
+                    if cell_bbox is None:
+                        return (float("inf"), float("inf"))
+                    if bbox[1] >= cell_bbox[3]:
+                        vertical = bbox[1] - cell_bbox[3]
+                    elif cell_bbox[1] >= bbox[3]:
+                        vertical = cell_bbox[1] - bbox[3]
+                    else:
+                        vertical = 0.0
+                    horizontal_overlap = max(
+                        0.0,
+                        min(bbox[2], cell_bbox[2]) - max(bbox[0], cell_bbox[0]),
+                    )
+                    horizontal = 0.0 if horizontal_overlap > 0 else min(
+                        abs(bbox[0] - cell_bbox[2]),
+                        abs(cell_bbox[0] - bbox[2]),
+                    )
+                    row = cell.get("row_end")
+                    return (vertical + horizontal, -float(row or 0))
+
+                nearest_cell, _nearest_bbox = min(
+                    cells_with_bbox,
+                    key=cell_distance,
+                )
+                cell_id = nearest_cell.get("id")
+                table_id = table.get("id")
+                if not isinstance(cell_id, str) or not isinstance(table_id, str):
+                    continue
+                proposals.append(
+                    {
+                        "action": "add_orphan",
+                        "table_id": table_id,
+                        "cell_id": cell_id,
+                        "target_id": "",
+                        "bbox": list(bbox),
+                        "confidence": float(
+                            self.config.get("table_orphan_confidence", 0.92)
+                        ),
+                        "recovery_reasons": ["table_ink_outside_cells"],
+                        "recovery_source": "local_table_orphan_ink",
+                    }
+                )
+                if len(proposals) >= max_items:
+                    break
+            self.orphan_boxes_proposed += len(proposals)
+            return proposals
+        finally:
+            crop.close()
 
     def _overlay_data_url(
         self,
@@ -601,6 +873,8 @@ class OpenAIBBoxRecoveryReviewer:
     ) -> dict[str, Any]:
         analyzed_before = self.pixel_cells_analyzed
         skipped_before = self.pixel_cells_skipped
+        orphan_tables_before = self.orphan_tables_analyzed
+        orphan_boxes_before = self.orphan_boxes_proposed
         pixel_analysis_seconds = 0.0
         image = self.provider.get_page(page_index)
         resolved_model = None
@@ -646,15 +920,6 @@ class OpenAIBBoxRecoveryReviewer:
                 )
             finally:
                 pixel_analysis_seconds += time.monotonic() - pixel_started
-            if not suspicious:
-                batches.append(
-                    {
-                        "page": page_index,
-                        "table_id": table.get("id"),
-                        "status": "not_suspicious",
-                    }
-                )
-                continue
             remaining_proposals = max(max_proposals - self.proposals_returned, 0)
             if remaining_proposals <= 0:
                 proposal_budget_skips += 1
@@ -671,10 +936,43 @@ class OpenAIBBoxRecoveryReviewer:
                 int(self.config.get("max_proposals_per_table", 30)),
                 0,
             )
-            local_items = self._local_missing_proposals(
+            missing_items = self._local_missing_proposals(
                 suspicious,
                 min(remaining_proposals, per_table_limit),
             )
+            orphan_limit = min(
+                max(remaining_proposals - len(missing_items), 0),
+                max(per_table_limit - len(missing_items), 0),
+                max(
+                    int(
+                        self.config.get(
+                            "table_orphan_max_boxes_per_table",
+                            12,
+                        )
+                    ),
+                    0,
+                ),
+            )
+            pixel_started = time.monotonic()
+            try:
+                orphan_items = self._table_orphan_proposals(
+                    image,
+                    page_size,
+                    table,
+                    orphan_limit,
+                )
+            finally:
+                pixel_analysis_seconds += time.monotonic() - pixel_started
+            local_items = missing_items + orphan_items
+            if not suspicious and not local_items:
+                batches.append(
+                    {
+                        "page": page_index,
+                        "table_id": table.get("id"),
+                        "status": "not_suspicious",
+                    }
+                )
+                continue
             reviewed_locally = bool(local_items)
             if local_items:
                 items.extend(local_items)
@@ -689,6 +987,7 @@ class OpenAIBBoxRecoveryReviewer:
                         "status": "local_pixel_recovery",
                         "suspicious_cells": len(suspicious),
                         "proposals": local_count,
+                        "orphan_proposals": len(orphan_items),
                     }
                 )
                 if not self.config.get("review_after_local_recovery", False):
@@ -804,6 +1103,10 @@ class OpenAIBBoxRecoveryReviewer:
             "protocol_failures": protocol_failures,
             "protocol_skips": protocol_skips,
             "local_only_tables": local_only_tables,
+            "orphan_tables_analyzed": (
+                self.orphan_tables_analyzed - orphan_tables_before
+            ),
+            "orphan_proposals": self.orphan_boxes_proposed - orphan_boxes_before,
             "pixel_cells_analyzed": (
                 self.pixel_cells_analyzed - analyzed_before
             ),

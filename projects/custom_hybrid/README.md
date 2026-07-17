@@ -266,6 +266,14 @@ cache by default (`share_recognizer_page_cache=true`). Recovery still performs
 its own Cell-local ink analysis and never changes Table/Cell geometry, but it no
 longer renders the same PDF page a second time before native transcription.
 
+`table_orphan_recovery_enabled=true` also scans only the part of each Table that
+is outside the union of all OCR Cell bboxes. After removing long Table rules and
+borders, content-like line bands are inserted as `add_orphan` content boxes and
+sent through the same native transcription path. This covers truncated grids
+where visible text remains inside the Table but below or beside every detected
+Cell. Orphan boxes may be attached to the nearest Cell for text/HTML ownership,
+but the original Table and Cell bboxes remain immutable.
+
 `structured_output_mode=json_schema` is the default example and sends a dynamic
 strict schema whose ID enum and item count match the current batch. vLLM-native
 `structured_outputs`, strict ordered `regex`, legacy `json_object`, and `none`

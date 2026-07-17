@@ -212,6 +212,68 @@ class BBoxRecoveryReviewerTests(unittest.TestCase):
         self.assertEqual(result["items"][0]["recovery_source"], "local_pixel_ink")
         self.assertEqual(result["batches"][0]["status"], "local_pixel_recovery")
 
+    def test_table_orphan_recovery_finds_text_below_all_cells(self):
+        from PIL import Image, ImageDraw
+
+        fake_httpx = FakeHttpx()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            image = Image.new("RGB", (240, 140), "white")
+            draw = ImageDraw.Draw(image)
+            draw.rectangle([10, 10, 230, 130], outline="black")
+            draw.line([10, 60, 230, 60], fill="black")
+            draw.text((20, 82), "Delivery Option", fill="black")
+            draw.text((20, 103), "Via Consultant", fill="black")
+            image.save(image_path)
+            image.close()
+            reviewer = OpenAIBBoxRecoveryReviewer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "mineru-claim-forms",
+                    "render_scale": 1.0,
+                    "table_orphan_recovery_enabled": True,
+                },
+            )
+            reviewer.httpx = fake_httpx
+            try:
+                result = reviewer(
+                    0,
+                    [240, 140],
+                    [
+                        {
+                            "id": "p0-table-0",
+                            "bbox": [10, 10, 230, 130],
+                            "cells": [
+                                {
+                                    "id": "p0-t0-c0",
+                                    "bbox": [10, 10, 230, 60],
+                                    "row_end": 0,
+                                    "text": "Covered header",
+                                    "existing": [
+                                        {
+                                            "id": "p0-t0-c0-b0",
+                                            "bbox": [20, 20, 120, 32],
+                                            "text": "Covered header",
+                                        }
+                                    ],
+                                    "reasons": [],
+                                }
+                            ],
+                        }
+                    ],
+                )
+            finally:
+                reviewer.close()
+
+        self.assertEqual(fake_httpx.requests, [])
+        self.assertEqual(result["requests"], 0)
+        self.assertEqual(result["orphan_tables_analyzed"], 1)
+        self.assertEqual(result["orphan_proposals"], 2)
+        self.assertEqual(len(result["items"]), 2)
+        self.assertTrue(all(item["action"] == "add_orphan" for item in result["items"]))
+        self.assertTrue(all(item["bbox"][1] > 60 for item in result["items"]))
+
     def test_blank_cells_do_not_trigger_vlm_request(self):
         from PIL import Image
 

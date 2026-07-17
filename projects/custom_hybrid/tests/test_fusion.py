@@ -272,6 +272,123 @@ class FusionTests(unittest.TestCase):
             report["recovery_invariants"]["table_and_cell_geometry_unchanged"]
         )
 
+    def test_bbox_vlm_recovery_adds_and_transcribes_table_orphan(self):
+        pipeline = structured_middle(
+            "table",
+            html="<table><tr><td>Header</td></tr></table>",
+            table_cells=[
+                {
+                    "bbox": [10, 10, 190, 40],
+                    "text": "Header",
+                    "content_spans": [
+                        {"bbox": [20, 18, 80, 30], "text": "Header"}
+                    ],
+                    "row_start": 0,
+                    "row_end": 0,
+                    "col_start": 0,
+                    "col_end": 0,
+                }
+            ],
+        )
+
+        def review(_page, _size, _manifest):
+            return {
+                "tables_reviewed": 1,
+                "local_proposals": 1,
+                "orphan_tables_analyzed": 1,
+                "orphan_proposals": 1,
+                "items": [
+                    {
+                        "action": "add_orphan",
+                        "table_id": "p0-table-0",
+                        "cell_id": "p0-t0-c0",
+                        "target_id": "",
+                        "bbox": [20, 60, 180, 75],
+                        "confidence": 0.92,
+                        "recovery_source": "local_table_orphan_ink",
+                    }
+                ],
+            }
+
+        def recognize(_page, _size, candidates):
+            orphan = next(item for item in candidates if not item["ocr_text"])
+            return {
+                "items": [
+                    {
+                        "id": orphan["id"],
+                        "text": "Delivery Option 退回方式",
+                    }
+                ]
+            }
+
+        fused, report = fuse_middle_json(
+            pipeline,
+            pipeline,
+            FusionSettings.from_mapping({"mode": "bbox_vlm_recovery"}),
+            bbox_recovery_reviewer=review,
+            bbox_recognizer=recognize,
+        )
+
+        table_span = fused["pdf_info"][0]["preproc_blocks"][0]["lines"][0][
+            "spans"
+        ][0]
+        cell = table_span["table_cells"][0]
+        orphan = next(
+            item
+            for item in cell["content_spans"]
+            if item.get("fusion_recovery_orphan")
+        )
+        self.assertEqual(orphan["bbox"], [20.0, 60.0, 180.0, 75.0])
+        self.assertEqual(orphan["text"], "Delivery Option 退回方式")
+        self.assertIn("Delivery Option 退回方式", table_span["html"])
+        self.assertEqual(report["counts"]["bbox_recovery_orphan_added"], 1)
+        self.assertEqual(
+            report["counts"]["bbox_recovery_orphan_tables_analyzed"],
+            1,
+        )
+        self.assertTrue(
+            report["recovery_invariants"]["table_and_cell_geometry_unchanged"]
+        )
+
+    def test_bbox_recovery_rejects_orphan_inside_existing_cell(self):
+        page = structured_middle(
+            "table",
+            html="<table><tr><td>Header</td></tr></table>",
+            table_cells=[
+                {
+                    "bbox": [10, 10, 190, 80],
+                    "text": "Header",
+                    "row_start": 0,
+                    "row_end": 0,
+                    "col_start": 0,
+                    "col_end": 0,
+                }
+            ],
+        )["pdf_info"][0]
+
+        stats, decisions, _batches, unchanged = apply_bbox_recovery_proposals(
+            page,
+            0,
+            {
+                "items": [
+                    {
+                        "action": "add_orphan",
+                        "table_id": "p0-table-0",
+                        "cell_id": "p0-t0-c0",
+                        "target_id": "",
+                        "bbox": [20, 20, 170, 40],
+                        "confidence": 0.95,
+                    }
+                ]
+            },
+            FusionSettings.from_mapping({"mode": "bbox_vlm_recovery"}),
+            remaining_document_budget=10,
+        )
+
+        self.assertEqual(stats["accepted"], 0)
+        self.assertEqual(decisions[0]["reason"], "orphan_cell_overlap_guard")
+        self.assertTrue(unchanged)
+
     def test_bbox_recovery_enforces_confidence_area_and_document_budgets(self):
         page = structured_middle(
             "table",

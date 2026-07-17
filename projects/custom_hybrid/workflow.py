@@ -250,6 +250,7 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         "skip_vlm_for_mineru_models",
         "disable_after_invalid_schema",
         "share_recognizer_page_cache",
+        "table_orphan_recovery_enabled",
     ):
         field = recovery.get(key)
         if field is not None and not isinstance(field, bool):
@@ -277,21 +278,45 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         "min_ink_ratio",
         "min_uncovered_ink_ratio",
         "local_pixel_confidence",
+        "table_orphan_confidence",
+        "table_orphan_max_cell_overlap",
+        "table_orphan_horizontal_line_ratio",
+        "table_orphan_vertical_line_ratio",
+        "table_orphan_max_line_height_ratio",
+        "table_orphan_min_ink_density",
+        "table_orphan_max_ink_density",
     ):
         field = recovery.get(key)
         if field is not None and (
             not isinstance(field, (int, float)) or not 0 <= float(field) <= 1
         ):
             raise WorkflowConfigError(f"fusion.recovery.{key} must be between 0 and 1")
+    for key, default in (
+        ("table_orphan_horizontal_line_ratio", 0.5),
+        ("table_orphan_vertical_line_ratio", 0.5),
+        ("table_orphan_max_line_height_ratio", 0.07),
+        ("table_orphan_min_ink_density", 0.01),
+    ):
+        if float(recovery.get(key, default)) <= 0:
+            raise WorkflowConfigError(
+                f"fusion.recovery.{key} must be greater than 0"
+            )
     if float(recovery.get("max_area_ratio", 0.95)) < float(
         recovery.get("min_area_ratio", 0.001)
     ):
         raise WorkflowConfigError("fusion.recovery area ratios must be ordered")
+    if float(recovery.get("table_orphan_max_ink_density", 0.7)) < float(
+        recovery.get("table_orphan_min_ink_density", 0.01)
+    ):
+        raise WorkflowConfigError(
+            "fusion.recovery Table orphan ink-density limits must be ordered"
+        )
     for key in (
         "max_tables_per_document",
         "max_proposals_per_document",
         "max_proposals_per_table",
         "max_requests_per_document",
+        "table_orphan_max_boxes_per_table",
     ):
         field = recovery.get(key)
         if field is not None and (
@@ -315,6 +340,33 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         ):
             raise WorkflowConfigError(
                 f"fusion.recovery.{key} must be a positive integer"
+            )
+    orphan_min_row_ink = recovery.get("table_orphan_min_row_ink_pixels", 4)
+    if (
+        isinstance(orphan_min_row_ink, bool)
+        or not isinstance(orphan_min_row_ink, int)
+        or orphan_min_row_ink < 1
+    ):
+        raise WorkflowConfigError(
+            "fusion.recovery.table_orphan_min_row_ink_pixels must be a "
+            "positive integer"
+        )
+    for key, default, allow_zero in (
+        ("table_orphan_cell_padding", 1.5, True),
+        ("table_orphan_line_gap", 0.75, True),
+        ("table_orphan_min_line_height", 4.0, False),
+        ("table_orphan_min_dark_height", 2.0, False),
+        ("table_orphan_min_line_width", 20.0, False),
+    ):
+        field = recovery.get(key, default)
+        if (
+            isinstance(field, bool)
+            or not isinstance(field, (int, float))
+            or (float(field) < 0 if allow_zero else float(field) <= 0)
+        ):
+            qualifier = "non-negative" if allow_zero else "positive"
+            raise WorkflowConfigError(
+                f"fusion.recovery.{key} must be {qualifier}"
             )
     recovery_structured_cap = recovery.get("structured_max_tokens_cap", 768)
     if (
@@ -2695,6 +2747,9 @@ def run_doctor(config: Mapping[str, Any]) -> dict[str, Any]:
         "capability_trial_required": recovery_enabled,
         "share_recognizer_page_cache": bool(
             recovery_config.get("share_recognizer_page_cache", True)
+        ),
+        "table_orphan_recovery_enabled": bool(
+            recovery_config.get("table_orphan_recovery_enabled", True)
         ),
     }
     if recovery_enabled:

@@ -130,6 +130,7 @@ class FusionSettings:
     bbox_recovery_max_area_ratio: float = 0.95
     bbox_recovery_duplicate_iou: float = 0.6
     bbox_recovery_adjust_min_iou: float = 0.05
+    bbox_recovery_orphan_max_cell_overlap: float = 0.25
     bbox_recovery_max_tables_per_document: int = 10
     bbox_recovery_max_proposals_per_document: int = 100
     bbox_recovery_max_proposals_per_table: int = 30
@@ -325,6 +326,9 @@ class FusionSettings:
             ),
             bbox_recovery_adjust_min_iou=float(
                 recovery.get("adjust_min_iou", 0.05)
+            ),
+            bbox_recovery_orphan_max_cell_overlap=float(
+                recovery.get("table_orphan_max_cell_overlap", 0.25)
             ),
             bbox_recovery_max_tables_per_document=int(
                 recovery.get("max_tables_per_document", 10)
@@ -828,6 +832,7 @@ def build_bbox_recovery_manifest(
                             "bbox": list(bbox),
                             "text": _content_span_text(span),
                             "source": "content_span",
+                            "orphan": bool(span.get("fusion_recovery_orphan")),
                         }
                     )
             if not existing:
@@ -846,7 +851,11 @@ def build_bbox_recovery_manifest(
                 reasons.append("missing_content_bbox")
             if isinstance(cell.get("text"), str) and cell["text"].strip() and not existing:
                 reasons.append("metadata_text_without_bbox")
-            if any(not _center_inside(item["bbox"], cell_bbox) for item in existing):
+            if any(
+                not item.get("orphan")
+                and not _center_inside(item["bbox"], cell_bbox)
+                for item in existing
+            ):
                 reasons.append("content_bbox_outside_cell")
             cells.append(
                 {
@@ -875,12 +884,23 @@ def build_bbox_recovery_manifest(
 def _bbox_recovery_lookup(
     page: Mapping[str, Any],
     page_index: int,
-) -> tuple[dict[str, dict[str, Any]], dict[str, tuple[dict[str, Any], str]]]:
+) -> tuple[
+    dict[str, tuple[dict[str, Any], tuple[float, float, float, float]]],
+    dict[str, dict[str, Any]],
+    dict[str, tuple[dict[str, Any], str]],
+]:
+    tables: dict[
+        str,
+        tuple[dict[str, Any], tuple[float, float, float, float]],
+    ] = {}
     cells: dict[str, dict[str, Any]] = {}
     boxes: dict[str, tuple[dict[str, Any], str]] = {}
     for table_index, table in enumerate(
         collect_structured_spans(page, page_index, {"table"})
     ):
+        table_id = f"p{page_index}-table-{table_index}"
+        if isinstance(table.span, dict):
+            tables[table_id] = (table.span, table.bbox)
         raw_cells = table.span.get("table_cells", [])
         if not isinstance(raw_cells, list):
             continue
@@ -898,7 +918,7 @@ def _bbox_recovery_lookup(
                         ] = (span, "content_span")
             if _valid_bbox(cell.get("content_bbox")) is not None:
                 boxes[f"{cell_id}-content"] = (cell, "content_bbox")
-    return cells, boxes
+    return tables, cells, boxes
 
 
 def _page_recovery_invariant_snapshot(
@@ -955,6 +975,7 @@ def apply_bbox_recovery_proposals(
         "accepted": 0,
         "added": 0,
         "adjusted": 0,
+        "orphan_added": 0,
         "rejected": 0,
         "errors": 0,
     }
@@ -972,7 +993,7 @@ def apply_bbox_recovery_proposals(
     if not isinstance(raw_items, list):
         stats["errors"] = 1
         return stats, decisions, batches, True
-    cells, boxes = _bbox_recovery_lookup(page, page_index)
+    tables, cells, boxes = _bbox_recovery_lookup(page, page_index)
     table_counts: Counter[str] = Counter()
     accepted_count = 0
     for item in raw_items:
@@ -981,6 +1002,7 @@ def apply_bbox_recovery_proposals(
             continue
         stats["proposals"] += 1
         action = str(item.get("action", ""))
+        table_id = item.get("table_id")
         cell_id = item.get("cell_id")
         target_id = item.get("target_id")
         confidence = item.get("confidence")
@@ -989,6 +1011,7 @@ def apply_bbox_recovery_proposals(
             "kind": "bbox_recovery",
             "page": page_index,
             "action": action,
+            "table_id": table_id,
             "cell_id": cell_id,
             "target_id": target_id,
             "bbox": list(bbox) if bbox is not None else item.get("bbox"),
@@ -998,10 +1021,20 @@ def apply_bbox_recovery_proposals(
         cell = cells.get(cell_id) if isinstance(cell_id, str) else None
         cell_bbox = _valid_bbox(cell.get("bbox")) if cell is not None else None
         table_key = cell_id.rsplit("-c", 1)[0] if isinstance(cell_id, str) else ""
-        if action not in {"add", "adjust"}:
+        expected_table_id = table_key.replace("-t", "-table-")
+        if action != "add_orphan":
+            table_id = expected_table_id
+        table = tables.get(table_id) if isinstance(table_id, str) else None
+        table_bbox = table[1] if table is not None else None
+        decision["table_id"] = table_id
+        if action not in {"add", "adjust", "add_orphan"}:
             reason = "unsupported_action"
         elif cell is None or cell_bbox is None:
             reason = "unknown_cell"
+        elif action == "add_orphan" and (
+            table is None or table_id != expected_table_id
+        ):
+            reason = "unknown_table"
         elif not isinstance(confidence, (int, float)) or float(confidence) < settings.bbox_recovery_min_confidence:
             reason = "low_confidence"
         elif bbox is None:
@@ -1011,17 +1044,61 @@ def apply_bbox_recovery_proposals(
         elif table_counts[table_key] >= settings.bbox_recovery_max_proposals_per_table:
             reason = "table_budget"
         if reason is None:
-            bbox = _clip_bbox_to_outer(bbox, cell_bbox)
+            bbox = _clip_bbox_to_outer(
+                bbox,
+                table_bbox if action == "add_orphan" else cell_bbox,
+            )
             if bbox is None:
-                reason = "bbox_outside_cell"
+                reason = (
+                    "bbox_outside_table"
+                    if action == "add_orphan"
+                    else "bbox_outside_cell"
+                )
         if reason is None:
-            cell_area = (cell_bbox[2] - cell_bbox[0]) * (cell_bbox[3] - cell_bbox[1])
+            outer_bbox = table_bbox if action == "add_orphan" else cell_bbox
+            cell_area = (outer_bbox[2] - outer_bbox[0]) * (
+                outer_bbox[3] - outer_bbox[1]
+            )
             bbox_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
             area_ratio = bbox_area / cell_area if cell_area > 0 else 0.0
             if not settings.bbox_recovery_min_area_ratio <= area_ratio <= settings.bbox_recovery_max_area_ratio:
                 reason = "area_ratio_guard"
+        if reason is None and action == "add_orphan":
+            bbox_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+            related_cell_bboxes = [
+                valid
+                for related_id, related_cell in cells.items()
+                if related_id.startswith(table_key + "-c")
+                for valid in [_valid_bbox(related_cell.get("bbox"))]
+                if valid is not None
+            ]
+            maximum_overlap = max(
+                (
+                    _intersection_area(bbox, related_bbox) / bbox_area
+                    for related_bbox in related_cell_bboxes
+                ),
+                default=0.0,
+            )
+            if maximum_overlap > settings.bbox_recovery_orphan_max_cell_overlap:
+                reason = "orphan_cell_overlap_guard"
         existing_bboxes = []
-        if cell is not None:
+        if action == "add_orphan":
+            for related_id, related_cell in cells.items():
+                if not related_id.startswith(table_key + "-c"):
+                    continue
+                raw_spans = related_cell.get("content_spans", [])
+                if isinstance(raw_spans, list):
+                    existing_bboxes.extend(
+                        valid
+                        for span in raw_spans
+                        if isinstance(span, Mapping)
+                        for valid in [_valid_bbox(span.get("bbox"))]
+                        if valid is not None
+                    )
+                content_bbox = _valid_bbox(related_cell.get("content_bbox"))
+                if content_bbox is not None:
+                    existing_bboxes.append(content_bbox)
+        elif cell is not None:
             raw_spans = cell.get("content_spans", [])
             if isinstance(raw_spans, list):
                 existing_bboxes.extend(
@@ -1035,12 +1112,12 @@ def apply_bbox_recovery_proposals(
             if content_bbox is not None:
                 existing_bboxes.append(content_bbox)
         target = boxes.get(target_id) if isinstance(target_id, str) else None
-        if reason is None and action == "add" and any(
+        if reason is None and action in {"add", "add_orphan"} and any(
             _bbox_iou(bbox, existing) >= settings.bbox_recovery_duplicate_iou
             for existing in existing_bboxes
         ):
             reason = "duplicate_bbox"
-        if reason is None and action == "add" and target_id not in {"", None}:
+        if reason is None and action in {"add", "add_orphan"} and target_id not in {"", None}:
             reason = "unexpected_add_target"
         if reason is None and action == "adjust":
             if (
@@ -1072,8 +1149,10 @@ def apply_bbox_recovery_proposals(
             ),
             "fusion_recovery_confidence": float(confidence),
             "fusion_recovery_action": action,
+            "fusion_recovery_table_id": table_id,
+            "fusion_recovery_orphan": action == "add_orphan",
         }
-        if action == "add":
+        if action in {"add", "add_orphan"}:
             raw_spans = cell.setdefault("content_spans", [])
             if not isinstance(raw_spans, list):
                 raw_spans = []
@@ -1086,6 +1165,8 @@ def apply_bbox_recovery_proposals(
                 }
             )
             stats["added"] += 1
+            if action == "add_orphan":
+                stats["orphan_added"] += 1
         else:
             raw_target, target_source = target
             if target_source == "content_span":
@@ -1114,6 +1195,7 @@ def apply_bbox_recovery_proposals(
         stats["accepted"] = 0
         stats["added"] = 0
         stats["adjusted"] = 0
+        stats["orphan_added"] = 0
         stats["rejected"] += rolled_back
         stats["errors"] += 1
         for decision in decisions:
@@ -3107,6 +3189,8 @@ def fuse_middle_json(
         "bbox_recovery_protocol_failures": 0,
         "bbox_recovery_protocol_skips": 0,
         "bbox_recovery_local_only_tables": 0,
+        "bbox_recovery_orphan_tables_analyzed": 0,
+        "bbox_recovery_orphan_proposals": 0,
         "bbox_recovery_pixel_cells_analyzed": 0,
         "bbox_recovery_pixel_cells_skipped": 0,
         "bbox_recovery_pixel_analysis_ms": 0.0,
@@ -3115,6 +3199,7 @@ def fuse_middle_json(
         "bbox_recovery_accepted": 0,
         "bbox_recovery_added": 0,
         "bbox_recovery_adjusted": 0,
+        "bbox_recovery_orphan_added": 0,
         "bbox_recovery_rejected": 0,
         "bbox_recovery_errors": 0,
         "table_targets": 0,
@@ -3231,6 +3316,11 @@ def fuse_middle_json(
                         ("protocol_failures", "bbox_recovery_protocol_failures"),
                         ("protocol_skips", "bbox_recovery_protocol_skips"),
                         ("local_only_tables", "bbox_recovery_local_only_tables"),
+                        (
+                            "orphan_tables_analyzed",
+                            "bbox_recovery_orphan_tables_analyzed",
+                        ),
+                        ("orphan_proposals", "bbox_recovery_orphan_proposals"),
                         ("pixel_cells_analyzed", "bbox_recovery_pixel_cells_analyzed"),
                         ("pixel_cells_skipped", "bbox_recovery_pixel_cells_skipped"),
                     ):
@@ -3264,6 +3354,7 @@ def fuse_middle_json(
                         "accepted",
                         "added",
                         "adjusted",
+                        "orphan_added",
                         "rejected",
                         "errors",
                     ):
