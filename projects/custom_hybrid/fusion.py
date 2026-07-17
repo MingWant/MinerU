@@ -131,6 +131,10 @@ class FusionSettings:
     bbox_recovery_duplicate_iou: float = 0.6
     bbox_recovery_adjust_min_iou: float = 0.05
     bbox_recovery_orphan_max_cell_overlap: float = 0.25
+    bbox_recovery_checkbox_min_size: float = 4.0
+    bbox_recovery_checkbox_max_size: float = 20.0
+    bbox_recovery_checkbox_min_aspect: float = 0.65
+    bbox_recovery_checkbox_max_aspect: float = 1.4
     bbox_recovery_max_tables_per_document: int = 10
     bbox_recovery_max_proposals_per_document: int = 100
     bbox_recovery_max_proposals_per_table: int = 30
@@ -329,6 +333,18 @@ class FusionSettings:
             ),
             bbox_recovery_orphan_max_cell_overlap=float(
                 recovery.get("table_orphan_max_cell_overlap", 0.25)
+            ),
+            bbox_recovery_checkbox_min_size=float(
+                recovery.get("checkbox_apply_min_size", 4.0)
+            ),
+            bbox_recovery_checkbox_max_size=float(
+                recovery.get("checkbox_apply_max_size", 20.0)
+            ),
+            bbox_recovery_checkbox_min_aspect=float(
+                recovery.get("checkbox_apply_min_aspect", 0.65)
+            ),
+            bbox_recovery_checkbox_max_aspect=float(
+                recovery.get("checkbox_apply_max_aspect", 1.4)
             ),
             bbox_recovery_max_tables_per_document=int(
                 recovery.get("max_tables_per_document", 10)
@@ -833,6 +849,7 @@ def build_bbox_recovery_manifest(
                             "text": _content_span_text(span),
                             "source": "content_span",
                             "orphan": bool(span.get("fusion_recovery_orphan")),
+                            "checkbox": bool(span.get("fusion_recovery_checkbox")),
                         }
                     )
             if not existing:
@@ -853,6 +870,7 @@ def build_bbox_recovery_manifest(
                 reasons.append("metadata_text_without_bbox")
             if any(
                 not item.get("orphan")
+                and not item.get("checkbox")
                 and not _center_inside(item["bbox"], cell_bbox)
                 for item in existing
             ):
@@ -976,6 +994,7 @@ def apply_bbox_recovery_proposals(
         "added": 0,
         "adjusted": 0,
         "orphan_added": 0,
+        "checkbox_added": 0,
         "rejected": 0,
         "errors": 0,
     }
@@ -1022,16 +1041,17 @@ def apply_bbox_recovery_proposals(
         cell_bbox = _valid_bbox(cell.get("bbox")) if cell is not None else None
         table_key = cell_id.rsplit("-c", 1)[0] if isinstance(cell_id, str) else ""
         expected_table_id = table_key.replace("-t", "-table-")
-        if action != "add_orphan":
+        detached_actions = {"add_orphan", "add_checkbox"}
+        if action not in detached_actions:
             table_id = expected_table_id
         table = tables.get(table_id) if isinstance(table_id, str) else None
         table_bbox = table[1] if table is not None else None
         decision["table_id"] = table_id
-        if action not in {"add", "adjust", "add_orphan"}:
+        if action not in {"add", "adjust", "add_orphan", "add_checkbox"}:
             reason = "unsupported_action"
         elif cell is None or cell_bbox is None:
             reason = "unknown_cell"
-        elif action == "add_orphan" and (
+        elif action in detached_actions and (
             table is None or table_id != expected_table_id
         ):
             reason = "unknown_table"
@@ -1046,23 +1066,40 @@ def apply_bbox_recovery_proposals(
         if reason is None:
             bbox = _clip_bbox_to_outer(
                 bbox,
-                table_bbox if action == "add_orphan" else cell_bbox,
+                table_bbox if action in detached_actions else cell_bbox,
             )
             if bbox is None:
                 reason = (
                     "bbox_outside_table"
-                    if action == "add_orphan"
+                    if action in detached_actions
                     else "bbox_outside_cell"
                 )
         if reason is None:
-            outer_bbox = table_bbox if action == "add_orphan" else cell_bbox
+            outer_bbox = table_bbox if action in detached_actions else cell_bbox
             cell_area = (outer_bbox[2] - outer_bbox[0]) * (
                 outer_bbox[3] - outer_bbox[1]
             )
             bbox_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
-            area_ratio = bbox_area / cell_area if cell_area > 0 else 0.0
-            if not settings.bbox_recovery_min_area_ratio <= area_ratio <= settings.bbox_recovery_max_area_ratio:
-                reason = "area_ratio_guard"
+            if action == "add_checkbox":
+                width = bbox[2] - bbox[0]
+                height = bbox[3] - bbox[1]
+                aspect = width / height if height > 0 else 0.0
+                if not (
+                    settings.bbox_recovery_checkbox_min_size
+                    <= width
+                    <= settings.bbox_recovery_checkbox_max_size
+                    and settings.bbox_recovery_checkbox_min_size
+                    <= height
+                    <= settings.bbox_recovery_checkbox_max_size
+                    and settings.bbox_recovery_checkbox_min_aspect
+                    <= aspect
+                    <= settings.bbox_recovery_checkbox_max_aspect
+                ):
+                    reason = "checkbox_geometry_guard"
+            else:
+                area_ratio = bbox_area / cell_area if cell_area > 0 else 0.0
+                if not settings.bbox_recovery_min_area_ratio <= area_ratio <= settings.bbox_recovery_max_area_ratio:
+                    reason = "area_ratio_guard"
         if reason is None and action == "add_orphan":
             bbox_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
             related_cell_bboxes = [
@@ -1082,7 +1119,7 @@ def apply_bbox_recovery_proposals(
             if maximum_overlap > settings.bbox_recovery_orphan_max_cell_overlap:
                 reason = "orphan_cell_overlap_guard"
         existing_bboxes = []
-        if action == "add_orphan":
+        if action in detached_actions:
             for related_id, related_cell in cells.items():
                 if not related_id.startswith(table_key + "-c"):
                     continue
@@ -1112,12 +1149,12 @@ def apply_bbox_recovery_proposals(
             if content_bbox is not None:
                 existing_bboxes.append(content_bbox)
         target = boxes.get(target_id) if isinstance(target_id, str) else None
-        if reason is None and action in {"add", "add_orphan"} and any(
+        if reason is None and action in {"add", "add_orphan", "add_checkbox"} and any(
             _bbox_iou(bbox, existing) >= settings.bbox_recovery_duplicate_iou
             for existing in existing_bboxes
         ):
             reason = "duplicate_bbox"
-        if reason is None and action in {"add", "add_orphan"} and target_id not in {"", None}:
+        if reason is None and action in {"add", "add_orphan", "add_checkbox"} and target_id not in {"", None}:
             reason = "unexpected_add_target"
         if reason is None and action == "adjust":
             if (
@@ -1151,8 +1188,20 @@ def apply_bbox_recovery_proposals(
             "fusion_recovery_action": action,
             "fusion_recovery_table_id": table_id,
             "fusion_recovery_orphan": action == "add_orphan",
+            "fusion_recovery_checkbox": action == "add_checkbox",
         }
-        if action in {"add", "add_orphan"}:
+        if action == "add_checkbox":
+            recovery_metadata.update(
+                {
+                    "fusion_checkbox_state": str(
+                        item.get("checkbox_state") or "ambiguous"
+                    ),
+                    "fusion_checkbox_interior_density": item.get(
+                        "checkbox_interior_density"
+                    ),
+                }
+            )
+        if action in {"add", "add_orphan", "add_checkbox"}:
             raw_spans = cell.setdefault("content_spans", [])
             if not isinstance(raw_spans, list):
                 raw_spans = []
@@ -1160,13 +1209,17 @@ def apply_bbox_recovery_proposals(
             raw_spans.append(
                 {
                     "bbox": list(bbox),
-                    "text": "",
+                    "text": str(item.get("text", ""))
+                    if action == "add_checkbox"
+                    else "",
                     **recovery_metadata,
                 }
             )
             stats["added"] += 1
             if action == "add_orphan":
                 stats["orphan_added"] += 1
+            elif action == "add_checkbox":
+                stats["checkbox_added"] += 1
         else:
             raw_target, target_source = target
             if target_source == "content_span":
@@ -1196,6 +1249,7 @@ def apply_bbox_recovery_proposals(
         stats["added"] = 0
         stats["adjusted"] = 0
         stats["orphan_added"] = 0
+        stats["checkbox_added"] = 0
         stats["rejected"] += rolled_back
         stats["errors"] += 1
         for decision in decisions:
@@ -3191,6 +3245,12 @@ def fuse_middle_json(
         "bbox_recovery_local_only_tables": 0,
         "bbox_recovery_orphan_tables_analyzed": 0,
         "bbox_recovery_orphan_proposals": 0,
+        "bbox_recovery_checkbox_tables_analyzed": 0,
+        "bbox_recovery_checkbox_candidates": 0,
+        "bbox_recovery_checkbox_proposals": 0,
+        "bbox_recovery_checkbox_checked": 0,
+        "bbox_recovery_checkbox_unchecked": 0,
+        "bbox_recovery_checkbox_ambiguous": 0,
         "bbox_recovery_pixel_cells_analyzed": 0,
         "bbox_recovery_pixel_cells_skipped": 0,
         "bbox_recovery_pixel_analysis_ms": 0.0,
@@ -3200,6 +3260,7 @@ def fuse_middle_json(
         "bbox_recovery_added": 0,
         "bbox_recovery_adjusted": 0,
         "bbox_recovery_orphan_added": 0,
+        "bbox_recovery_checkbox_added": 0,
         "bbox_recovery_rejected": 0,
         "bbox_recovery_errors": 0,
         "table_targets": 0,
@@ -3321,6 +3382,15 @@ def fuse_middle_json(
                             "bbox_recovery_orphan_tables_analyzed",
                         ),
                         ("orphan_proposals", "bbox_recovery_orphan_proposals"),
+                        (
+                            "checkbox_tables_analyzed",
+                            "bbox_recovery_checkbox_tables_analyzed",
+                        ),
+                        ("checkbox_candidates", "bbox_recovery_checkbox_candidates"),
+                        ("checkbox_proposals", "bbox_recovery_checkbox_proposals"),
+                        ("checkbox_checked", "bbox_recovery_checkbox_checked"),
+                        ("checkbox_unchecked", "bbox_recovery_checkbox_unchecked"),
+                        ("checkbox_ambiguous", "bbox_recovery_checkbox_ambiguous"),
                         ("pixel_cells_analyzed", "bbox_recovery_pixel_cells_analyzed"),
                         ("pixel_cells_skipped", "bbox_recovery_pixel_cells_skipped"),
                     ):
@@ -3355,6 +3425,7 @@ def fuse_middle_json(
                         "added",
                         "adjusted",
                         "orphan_added",
+                        "checkbox_added",
                         "rejected",
                         "errors",
                     ):

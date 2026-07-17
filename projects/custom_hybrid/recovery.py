@@ -54,6 +54,16 @@ def _bbox_overlap_ratio(
     return width * height / area if area > 0 else 0.0
 
 
+def _bbox_iou(left: Sequence[float], right: Sequence[float]) -> float:
+    width = max(0.0, min(left[2], right[2]) - max(left[0], right[0]))
+    height = max(0.0, min(left[3], right[3]) - max(left[1], right[1]))
+    intersection = width * height
+    left_area = max(0.0, left[2] - left[0]) * max(0.0, left[3] - left[1])
+    right_area = max(0.0, right[2] - right[0]) * max(0.0, right[3] - right[1])
+    union = left_area + right_area - intersection
+    return intersection / union if union > 0 else 0.0
+
+
 def _parse_json_object(content: Any) -> dict[str, Any] | None:
     if isinstance(content, list):
         content = "".join(
@@ -106,6 +116,12 @@ class OpenAIBBoxRecoveryReviewer:
         self.pixel_cells_skipped = 0
         self.orphan_tables_analyzed = 0
         self.orphan_boxes_proposed = 0
+        self.checkbox_tables_analyzed = 0
+        self.checkbox_candidates = 0
+        self.checkbox_boxes_proposed = 0
+        self.checkbox_checked = 0
+        self.checkbox_unchecked = 0
+        self.checkbox_ambiguous = 0
         self._owns_provider = page_provider is None
         self.provider = page_provider or PageCropProvider(
             document_path,
@@ -549,6 +565,377 @@ class OpenAIBBoxRecoveryReviewer:
         finally:
             crop.close()
 
+    def _table_checkbox_proposals(
+        self,
+        image,
+        page_size: Sequence[float],
+        table: Mapping[str, Any],
+        max_items: int,
+    ) -> list[dict[str, Any]]:
+        """Detect small square form controls independently of OCR text boxes."""
+        if (
+            not self.config.get("checkbox_recovery_enabled", True)
+            or max_items <= 0
+        ):
+            return []
+        try:
+            import cv2
+        except ImportError:
+            return []
+        table_bbox = _valid_bbox(table.get("bbox"))
+        cells = [
+            cell
+            for cell in table.get("cells", [])
+            if isinstance(cell, Mapping)
+            and _valid_bbox(cell.get("bbox")) is not None
+        ]
+        if table_bbox is None or not cells:
+            return []
+        scale_x, scale_y = self._page_scale(image, page_size)
+        crop_box = (
+            max(0, int(math.floor(table_bbox[0] * scale_x))),
+            max(0, int(math.floor(table_bbox[1] * scale_y))),
+            min(image.width, int(math.ceil(table_bbox[2] * scale_x))),
+            min(image.height, int(math.ceil(table_bbox[3] * scale_y))),
+        )
+        if crop_box[2] <= crop_box[0] or crop_box[3] <= crop_box[1]:
+            return []
+        crop = image.crop(crop_box).convert("L")
+        self.checkbox_tables_analyzed += 1
+        try:
+            pixels = np.asarray(crop, dtype=np.uint8)
+            _threshold, binary = cv2.threshold(
+                pixels,
+                0,
+                255,
+                cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+            )
+            contours, _hierarchy = cv2.findContours(
+                binary,
+                cv2.RETR_LIST,
+                cv2.CHAIN_APPROX_SIMPLE,
+            )
+            minimum_size = float(self.config.get("checkbox_min_size", 5.0))
+            maximum_size = float(self.config.get("checkbox_max_size", 16.0))
+            minimum_aspect = float(self.config.get("checkbox_min_aspect", 0.75))
+            maximum_aspect = float(self.config.get("checkbox_max_aspect", 1.25))
+            minimum_side_density = float(
+                self.config.get("checkbox_min_side_density", 0.35)
+            )
+            maximum_vertices = max(
+                int(self.config.get("checkbox_max_vertices", 5)),
+                4,
+            )
+            ambiguous_maximum_vertices = max(
+                int(self.config.get("checkbox_ambiguous_max_vertices", 4)),
+                4,
+            )
+            left_clearance = float(
+                self.config.get("checkbox_left_clearance", 8.0)
+            )
+            left_ink_limit = float(
+                self.config.get("checkbox_max_left_ink_ratio", 0.08)
+            )
+            left_edge_allowance = float(
+                self.config.get("checkbox_table_edge_allowance", 12.0)
+            )
+            right_context = float(
+                self.config.get("checkbox_right_context", 30.0)
+            )
+            right_ink_minimum = float(
+                self.config.get("checkbox_min_right_ink_ratio", 0.01)
+            )
+            right_separator_search = float(
+                self.config.get("checkbox_right_separator_search", 6.0)
+            )
+            minimum_right_separator = float(
+                self.config.get("checkbox_min_right_separator", 1.5)
+            )
+            right_column_ink_ratio = float(
+                self.config.get("checkbox_right_column_ink_ratio", 0.05)
+            )
+            unchecked_threshold = float(
+                self.config.get("checkbox_unchecked_interior_ratio", 0.03)
+            )
+            checked_threshold = float(
+                self.config.get("checkbox_checked_interior_ratio", 0.12)
+            )
+            raw_candidates = []
+            for contour in contours:
+                x, y, width, height = cv2.boundingRect(contour)
+                width_points = width / scale_x
+                height_points = height / scale_y
+                if not (
+                    minimum_size <= width_points <= maximum_size
+                    and minimum_size <= height_points <= maximum_size
+                ):
+                    continue
+                aspect = width_points / height_points if height_points > 0 else 0.0
+                if not minimum_aspect <= aspect <= maximum_aspect:
+                    continue
+                perimeter = cv2.arcLength(contour, True)
+                vertices = len(
+                    cv2.approxPolyDP(contour, 0.04 * perimeter, True)
+                )
+                if vertices < 3 or vertices > maximum_vertices:
+                    continue
+                roi = binary[y : y + height, x : x + width] > 0
+                edge = max(1, int(min(width, height) * 0.18))
+                side_densities = (
+                    float(roi[:edge, :].mean()),
+                    float(roi[-edge:, :].mean()),
+                    float(roi[:, :edge].mean()),
+                    float(roi[:, -edge:].mean()),
+                )
+                if min(side_densities) < minimum_side_density:
+                    continue
+                page_left = (crop_box[0] + x) / scale_x
+                page_top = (crop_box[1] + y) / scale_y
+                page_right = (crop_box[0] + x + width) / scale_x
+                page_bottom = (crop_box[1] + y + height) / scale_y
+                context_top = max(0, y - height // 2)
+                context_bottom = min(crop.height, y + height + height // 2)
+                left_end = max(0, x - 1)
+                left_start = max(0, x - int(left_clearance * scale_x))
+                left_region = binary[
+                    context_top:context_bottom,
+                    left_start:left_end,
+                ]
+                near_table_edge = page_left - table_bbox[0] <= left_edge_allowance
+                if (
+                    not near_table_edge
+                    and left_region.size
+                    and float((left_region > 0).mean()) > left_ink_limit
+                ):
+                    continue
+                right_start = min(crop.width, x + width + 1)
+                right_end = min(
+                    crop.width,
+                    x + width + int(right_context * scale_x),
+                )
+                right_region = binary[
+                    context_top:context_bottom,
+                    right_start:right_end,
+                ]
+                if (
+                    not right_region.size
+                    or float((right_region > 0).mean()) < right_ink_minimum
+                ):
+                    continue
+                # A form control is visually separated from its label.  A
+                # connected tick may protrude beyond the square, so looking
+                # only at the first dark pixel rejects valid checked boxes.
+                # Instead, require a short run of fully separating columns
+                # near the control.  Capital D/Q glyphs that otherwise look
+                # square remain joined to the rest of their word and fail
+                # this test.
+                aligned_right_end = min(
+                    crop.width,
+                    x + width + int(math.ceil(right_context * scale_x)),
+                )
+                aligned_right_region = binary[
+                    y : y + height,
+                    x + width : aligned_right_end,
+                ]
+                separator_width = min(
+                    aligned_right_region.shape[1],
+                    int(math.ceil(right_separator_search * scale_x)),
+                )
+                separator_region = aligned_right_region[:, :separator_width]
+                if not separator_region.size:
+                    continue
+                aligned_ink_columns = (
+                    (aligned_right_region > 0).mean(axis=0)
+                    > right_column_ink_ratio
+                )
+                ink_columns = aligned_ink_columns[:separator_width]
+                minimum_separator_pixels = max(
+                    1,
+                    int(math.ceil(minimum_right_separator * scale_x)),
+                )
+                has_separator_before_label = False
+                separator_start = None
+                for column_index, has_ink in enumerate(ink_columns):
+                    if not has_ink and separator_start is None:
+                        separator_start = column_index
+                    elif has_ink and separator_start is not None:
+                        if (
+                            column_index - separator_start
+                            >= minimum_separator_pixels
+                            and aligned_ink_columns[column_index:].any()
+                        ):
+                            has_separator_before_label = True
+                            break
+                        separator_start = None
+                if separator_start is not None:
+                    separator_end = len(ink_columns)
+                    if (
+                        separator_end - separator_start
+                        >= minimum_separator_pixels
+                        and aligned_ink_columns[separator_end:].any()
+                    ):
+                        has_separator_before_label = True
+                if not has_separator_before_label:
+                    continue
+                interior_edge = max(1, int(min(width, height) * 0.28))
+                interior = roi[
+                    interior_edge : height - interior_edge,
+                    interior_edge : width - interior_edge,
+                ]
+                interior_density = (
+                    float(interior.mean()) if interior.size else float(roi.mean())
+                )
+                if interior_density <= unchecked_threshold:
+                    state = "unchecked"
+                    text = "☐"
+                elif interior_density >= checked_threshold:
+                    state = "checked"
+                    text = "☑"
+                else:
+                    state = "ambiguous"
+                    text = ""
+                if (
+                    state == "ambiguous"
+                    and vertices > ambiguous_maximum_vertices
+                ):
+                    continue
+                bbox = _clip_bbox(
+                    (page_left, page_top, page_right, page_bottom),
+                    table_bbox,
+                )
+                if bbox is None:
+                    continue
+                raw_candidates.append(
+                    {
+                        "bbox": bbox,
+                        "state": state,
+                        "text": text,
+                        "interior_density": interior_density,
+                    }
+                )
+
+            raw_candidates.sort(
+                key=lambda item: -(
+                    (item["bbox"][2] - item["bbox"][0])
+                    * (item["bbox"][3] - item["bbox"][1])
+                )
+            )
+            candidates = []
+            for candidate in raw_candidates:
+                if any(
+                    _bbox_iou(candidate["bbox"], existing["bbox"]) >= 0.5
+                    for existing in candidates
+                ):
+                    continue
+                candidates.append(candidate)
+            self.checkbox_candidates += len(candidates)
+
+            existing_bboxes = [
+                valid
+                for cell in cells
+                for box in cell.get("existing", [])
+                if isinstance(box, Mapping)
+                for valid in [_valid_bbox(box.get("bbox"))]
+                if valid is not None
+            ]
+            proposals = []
+            cells_with_bbox = [
+                (cell, _valid_bbox(cell.get("bbox"))) for cell in cells
+            ]
+            tight_scale = float(
+                self.config.get("checkbox_existing_tight_scale", 2.0)
+            )
+            for candidate in sorted(
+                candidates,
+                key=lambda item: (item["bbox"][1], item["bbox"][0]),
+            ):
+                bbox = candidate["bbox"]
+                width = bbox[2] - bbox[0]
+                height = bbox[3] - bbox[1]
+                already_boxed = any(
+                    _bbox_overlap_ratio(bbox, existing) >= 0.7
+                    and existing[2] - existing[0] <= width * tight_scale
+                    and existing[3] - existing[1] <= height * tight_scale
+                    for existing in existing_bboxes
+                )
+                if already_boxed:
+                    continue
+                center_x = (bbox[0] + bbox[2]) / 2
+                center_y = (bbox[1] + bbox[3]) / 2
+
+                def cell_distance(
+                    item: tuple[Mapping[str, Any], tuple[float, float, float, float] | None]
+                ) -> tuple[int, float, float]:
+                    cell, cell_bbox = item
+                    if cell_bbox is None:
+                        return (1, float("inf"), float("inf"))
+                    contains = (
+                        cell_bbox[0] <= center_x <= cell_bbox[2]
+                        and cell_bbox[1] <= center_y <= cell_bbox[3]
+                    )
+                    distance_x = max(
+                        cell_bbox[0] - center_x,
+                        0.0,
+                        center_x - cell_bbox[2],
+                    )
+                    distance_y = max(
+                        cell_bbox[1] - center_y,
+                        0.0,
+                        center_y - cell_bbox[3],
+                    )
+                    area = (cell_bbox[2] - cell_bbox[0]) * (
+                        cell_bbox[3] - cell_bbox[1]
+                    )
+                    return (0 if contains else 1, distance_x + distance_y, area)
+
+                nearest_cell, _nearest_bbox = min(
+                    cells_with_bbox,
+                    key=cell_distance,
+                )
+                cell_id = nearest_cell.get("id")
+                table_id = table.get("id")
+                if not isinstance(cell_id, str) or not isinstance(table_id, str):
+                    continue
+                state = str(candidate["state"])
+                confidence = float(
+                    self.config.get(
+                        "checkbox_ambiguous_confidence"
+                        if state == "ambiguous"
+                        else "checkbox_confidence",
+                        0.9 if state == "ambiguous" else 0.95,
+                    )
+                )
+                proposals.append(
+                    {
+                        "action": "add_checkbox",
+                        "table_id": table_id,
+                        "cell_id": cell_id,
+                        "target_id": "",
+                        "bbox": list(bbox),
+                        "confidence": confidence,
+                        "text": candidate["text"],
+                        "checkbox_state": state,
+                        "checkbox_interior_density": round(
+                            float(candidate["interior_density"]),
+                            6,
+                        ),
+                        "recovery_reasons": ["missing_checkbox_bbox"],
+                        "recovery_source": "local_checkbox_detector",
+                    }
+                )
+                if state == "checked":
+                    self.checkbox_checked += 1
+                elif state == "unchecked":
+                    self.checkbox_unchecked += 1
+                else:
+                    self.checkbox_ambiguous += 1
+                if len(proposals) >= max_items:
+                    break
+            self.checkbox_boxes_proposed += len(proposals)
+            return proposals
+        finally:
+            crop.close()
+
     def _overlay_data_url(
         self,
         image,
@@ -875,6 +1262,12 @@ class OpenAIBBoxRecoveryReviewer:
         skipped_before = self.pixel_cells_skipped
         orphan_tables_before = self.orphan_tables_analyzed
         orphan_boxes_before = self.orphan_boxes_proposed
+        checkbox_tables_before = self.checkbox_tables_analyzed
+        checkbox_candidates_before = self.checkbox_candidates
+        checkbox_boxes_before = self.checkbox_boxes_proposed
+        checkbox_checked_before = self.checkbox_checked
+        checkbox_unchecked_before = self.checkbox_unchecked
+        checkbox_ambiguous_before = self.checkbox_ambiguous
         pixel_analysis_seconds = 0.0
         image = self.provider.get_page(page_index)
         resolved_model = None
@@ -940,9 +1333,40 @@ class OpenAIBBoxRecoveryReviewer:
                 suspicious,
                 min(remaining_proposals, per_table_limit),
             )
-            orphan_limit = min(
+            checkbox_limit = min(
                 max(remaining_proposals - len(missing_items), 0),
                 max(per_table_limit - len(missing_items), 0),
+                max(
+                    int(
+                        self.config.get(
+                            "checkbox_max_boxes_per_table",
+                            40,
+                        )
+                    ),
+                    0,
+                ),
+            )
+            pixel_started = time.monotonic()
+            try:
+                checkbox_items = self._table_checkbox_proposals(
+                    image,
+                    page_size,
+                    table,
+                    checkbox_limit,
+                )
+            finally:
+                pixel_analysis_seconds += time.monotonic() - pixel_started
+            orphan_limit = min(
+                max(
+                    remaining_proposals
+                    - len(missing_items)
+                    - len(checkbox_items),
+                    0,
+                ),
+                max(
+                    per_table_limit - len(missing_items) - len(checkbox_items),
+                    0,
+                ),
                 max(
                     int(
                         self.config.get(
@@ -963,7 +1387,7 @@ class OpenAIBBoxRecoveryReviewer:
                 )
             finally:
                 pixel_analysis_seconds += time.monotonic() - pixel_started
-            local_items = missing_items + orphan_items
+            local_items = missing_items + checkbox_items + orphan_items
             if not suspicious and not local_items:
                 batches.append(
                     {
@@ -988,6 +1412,7 @@ class OpenAIBBoxRecoveryReviewer:
                         "suspicious_cells": len(suspicious),
                         "proposals": local_count,
                         "orphan_proposals": len(orphan_items),
+                        "checkbox_proposals": len(checkbox_items),
                     }
                 )
                 if not self.config.get("review_after_local_recovery", False):
@@ -1107,6 +1532,14 @@ class OpenAIBBoxRecoveryReviewer:
                 self.orphan_tables_analyzed - orphan_tables_before
             ),
             "orphan_proposals": self.orphan_boxes_proposed - orphan_boxes_before,
+            "checkbox_tables_analyzed": (
+                self.checkbox_tables_analyzed - checkbox_tables_before
+            ),
+            "checkbox_candidates": self.checkbox_candidates - checkbox_candidates_before,
+            "checkbox_proposals": self.checkbox_boxes_proposed - checkbox_boxes_before,
+            "checkbox_checked": self.checkbox_checked - checkbox_checked_before,
+            "checkbox_unchecked": self.checkbox_unchecked - checkbox_unchecked_before,
+            "checkbox_ambiguous": self.checkbox_ambiguous - checkbox_ambiguous_before,
             "pixel_cells_analyzed": (
                 self.pixel_cells_analyzed - analyzed_before
             ),

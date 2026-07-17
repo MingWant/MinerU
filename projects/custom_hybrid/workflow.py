@@ -251,6 +251,7 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         "disable_after_invalid_schema",
         "share_recognizer_page_cache",
         "table_orphan_recovery_enabled",
+        "checkbox_recovery_enabled",
     ):
         field = recovery.get(key)
         if field is not None and not isinstance(field, bool):
@@ -285,10 +286,20 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         "table_orphan_max_line_height_ratio",
         "table_orphan_min_ink_density",
         "table_orphan_max_ink_density",
+        "checkbox_confidence",
+        "checkbox_ambiguous_confidence",
+        "checkbox_min_side_density",
+        "checkbox_max_left_ink_ratio",
+        "checkbox_min_right_ink_ratio",
+        "checkbox_right_column_ink_ratio",
+        "checkbox_unchecked_interior_ratio",
+        "checkbox_checked_interior_ratio",
     ):
         field = recovery.get(key)
         if field is not None and (
-            not isinstance(field, (int, float)) or not 0 <= float(field) <= 1
+            isinstance(field, bool)
+            or not isinstance(field, (int, float))
+            or not 0 <= float(field) <= 1
         ):
             raise WorkflowConfigError(f"fusion.recovery.{key} must be between 0 and 1")
     for key, default in (
@@ -317,6 +328,7 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         "max_proposals_per_table",
         "max_requests_per_document",
         "table_orphan_max_boxes_per_table",
+        "checkbox_max_boxes_per_table",
     ):
         field = recovery.get(key)
         if field is not None and (
@@ -367,6 +379,69 @@ def _validate_fusion_config(fusion_config: Any) -> None:
             qualifier = "non-negative" if allow_zero else "positive"
             raise WorkflowConfigError(
                 f"fusion.recovery.{key} must be {qualifier}"
+            )
+    checkbox_max_vertices = recovery.get("checkbox_max_vertices", 5)
+    if (
+        isinstance(checkbox_max_vertices, bool)
+        or not isinstance(checkbox_max_vertices, int)
+        or checkbox_max_vertices < 4
+    ):
+        raise WorkflowConfigError(
+            "fusion.recovery.checkbox_max_vertices must be an integer of at "
+            "least 4"
+        )
+    checkbox_ambiguous_max_vertices = recovery.get(
+        "checkbox_ambiguous_max_vertices", 4
+    )
+    if (
+        isinstance(checkbox_ambiguous_max_vertices, bool)
+        or not isinstance(checkbox_ambiguous_max_vertices, int)
+        or checkbox_ambiguous_max_vertices < 4
+        or checkbox_ambiguous_max_vertices > checkbox_max_vertices
+    ):
+        raise WorkflowConfigError(
+            "fusion.recovery.checkbox_ambiguous_max_vertices must be an "
+            "integer between 4 and checkbox_max_vertices"
+        )
+    for key, default in (
+        ("checkbox_min_size", 5.0),
+        ("checkbox_max_size", 16.0),
+        ("checkbox_min_aspect", 0.75),
+        ("checkbox_max_aspect", 1.25),
+        ("checkbox_left_clearance", 8.0),
+        ("checkbox_table_edge_allowance", 12.0),
+        ("checkbox_right_context", 30.0),
+        ("checkbox_right_separator_search", 6.0),
+        ("checkbox_min_right_separator", 1.5),
+        ("checkbox_existing_tight_scale", 2.0),
+        ("checkbox_apply_min_size", 4.0),
+        ("checkbox_apply_max_size", 20.0),
+        ("checkbox_apply_min_aspect", 0.65),
+        ("checkbox_apply_max_aspect", 1.4),
+    ):
+        field = recovery.get(key, default)
+        if (
+            isinstance(field, bool)
+            or not isinstance(field, (int, float))
+            or float(field) <= 0
+        ):
+            raise WorkflowConfigError(f"fusion.recovery.{key} must be positive")
+    for lower, upper, defaults in (
+        ("checkbox_min_size", "checkbox_max_size", (5.0, 16.0)),
+        ("checkbox_min_aspect", "checkbox_max_aspect", (0.75, 1.25)),
+        ("checkbox_apply_min_size", "checkbox_apply_max_size", (4.0, 20.0)),
+        ("checkbox_apply_min_aspect", "checkbox_apply_max_aspect", (0.65, 1.4)),
+        (
+            "checkbox_unchecked_interior_ratio",
+            "checkbox_checked_interior_ratio",
+            (0.03, 0.12),
+        ),
+    ):
+        if float(recovery.get(lower, defaults[0])) >= float(
+            recovery.get(upper, defaults[1])
+        ):
+            raise WorkflowConfigError(
+                f"fusion.recovery {lower}/{upper} limits must be ordered"
             )
     recovery_structured_cap = recovery.get("structured_max_tokens_cap", 768)
     if (
@@ -2750,6 +2825,9 @@ def run_doctor(config: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "table_orphan_recovery_enabled": bool(
             recovery_config.get("table_orphan_recovery_enabled", True)
+        ),
+        "checkbox_recovery_enabled": bool(
+            recovery_config.get("checkbox_recovery_enabled", True)
         ),
     }
     if recovery_enabled:

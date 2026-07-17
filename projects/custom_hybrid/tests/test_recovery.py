@@ -274,6 +274,88 @@ class BBoxRecoveryReviewerTests(unittest.TestCase):
         self.assertTrue(all(item["action"] == "add_orphan" for item in result["items"]))
         self.assertTrue(all(item["bbox"][1] > 60 for item in result["items"]))
 
+    def test_checkbox_recovery_adds_missing_checked_and_unchecked_boxes(self):
+        from PIL import Image, ImageDraw
+
+        fake_httpx = FakeHttpx()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            image = Image.new("RGB", (240, 140), "white")
+            draw = ImageDraw.Draw(image)
+            draw.rectangle([10, 10, 230, 130], outline="black")
+            draw.rectangle([20, 25, 32, 37], outline="black", width=2)
+            draw.text((42, 25), "Already boxed", fill="black")
+            draw.rectangle([20, 60, 32, 72], outline="black", width=2)
+            draw.text((42, 60), "Unchecked option", fill="black")
+            draw.rectangle([20, 95, 32, 107], outline="black", width=2)
+            draw.line([23, 100, 26, 104, 30, 98], fill="black", width=2)
+            draw.text((42, 95), "Checked option", fill="black")
+            # Square-looking capital glyphs can satisfy the contour and
+            # four-side checks. Keep their following stroke close enough to
+            # model the D/Q-to-next-letter spacing seen in real forms.
+            draw.rectangle([150, 60, 162, 72], outline="black", width=2)
+            draw.rectangle([164, 60, 170, 72], fill="black")
+            draw.rectangle([150, 95, 162, 107], outline="black", width=2)
+            draw.line([160, 105, 165, 110], fill="black", width=2)
+            draw.rectangle([164, 95, 170, 107], fill="black")
+            image.save(image_path)
+            image.close()
+            reviewer = OpenAIBBoxRecoveryReviewer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "mineru-claim-forms",
+                    "render_scale": 1.0,
+                    "table_orphan_recovery_enabled": False,
+                    "checkbox_recovery_enabled": True,
+                    "checkbox_min_size": 8.0,
+                    "checkbox_max_size": 18.0,
+                },
+            )
+            reviewer.httpx = fake_httpx
+            try:
+                result = reviewer(
+                    0,
+                    [240, 140],
+                    [
+                        {
+                            "id": "p0-table-0",
+                            "bbox": [10, 10, 230, 130],
+                            "cells": [
+                                {
+                                    "id": "p0-t0-c0",
+                                    "bbox": [10, 10, 230, 130],
+                                    "row_end": 0,
+                                    "text": "Options",
+                                    "existing": [
+                                        {
+                                            "id": "p0-t0-c0-b0",
+                                            "bbox": [19, 24, 33, 38],
+                                            "text": "☐",
+                                        }
+                                    ],
+                                    "reasons": [],
+                                }
+                            ],
+                        }
+                    ],
+                )
+            finally:
+                reviewer.close()
+
+        checkbox_items = [
+            item for item in result["items"] if item["action"] == "add_checkbox"
+        ]
+        self.assertEqual(fake_httpx.requests, [])
+        self.assertEqual(result["checkbox_tables_analyzed"], 1)
+        self.assertEqual(len(checkbox_items), 2)
+        self.assertEqual(
+            {item["checkbox_state"] for item in checkbox_items},
+            {"checked", "unchecked"},
+        )
+        self.assertTrue(all(item["bbox"][1] >= 60 for item in checkbox_items))
+        self.assertTrue(all(item["bbox"][0] < 100 for item in checkbox_items))
+
     def test_blank_cells_do_not_trigger_vlm_request(self):
         from PIL import Image
 

@@ -274,6 +274,18 @@ where visible text remains inside the Table but below or beside every detected
 Cell. Orphan boxes may be attached to the nearest Cell for text/HTML ownership,
 but the original Table and Cell bboxes remain immutable.
 
+`checkbox_recovery_enabled=true` runs a separate local contour detector for
+small square form controls. It accepts both empty and tick-connected outlines,
+requires four-sided border evidence, nearby label ink, and a short whitespace
+separator before that label. The separator rejects square-looking capital
+letters such as D/Q without rejecting a tick that protrudes beyond its box. The
+ambiguous path additionally requires a standard four-corner outline, rejecting
+handwritten box-like glyphs. The detector ignores tight OCR boxes that already
+cover the control and attaches a new content-tight cyan box to the containing/
+nearest Cell. Clear states are stored locally as checked or unchecked and do
+not require a model request; only ambiguous interiors retain empty OCR text and
+enter the normal bounded native-recognition queue.
+
 `structured_output_mode=json_schema` is the default example and sends a dynamic
 strict schema whose ID enum and item count match the current batch. vLLM-native
 `structured_outputs`, strict ordered `regex`, legacy `json_object`, and `none`

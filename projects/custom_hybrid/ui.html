@@ -488,6 +488,10 @@
           <div class="coverage-metric"><strong id="recoveryPixelMsValue">-</strong><span>Recovery Pixel Time</span></div>
           <div class="coverage-metric"><strong id="orphanTablesValue">-</strong><span>Orphan Tables Scanned</span></div>
           <div class="coverage-metric"><strong id="orphanBoxesValue">-</strong><span>Orphan Boxes Added</span></div>
+          <div class="coverage-metric"><strong id="checkboxBoxesValue">-</strong><span>Checkbox Boxes Added</span></div>
+          <div class="coverage-metric"><strong id="checkboxCheckedValue">-</strong><span>Checked Controls</span></div>
+          <div class="coverage-metric"><strong id="checkboxUncheckedValue">-</strong><span>Unchecked Controls</span></div>
+          <div class="coverage-metric"><strong id="checkboxAmbiguousValue">-</strong><span>Ambiguous Controls</span></div>
           <div class="coverage-metric"><strong id="recoveryAddedValue">-</strong><span>Recovered Boxes Added</span></div>
           <div class="coverage-metric"><strong id="recoveryAdjustedValue">-</strong><span>Recovered Boxes Adjusted</span></div>
           <div class="coverage-metric"><strong id="recoveryRejectedValue">-</strong><span>Recovery Proposals Rejected</span></div>
@@ -956,7 +960,7 @@
   }
 
   function renderCoverageSummary(report) {
-    const totals = {total: 0, matched: 0, recovered: 0, uncovered: 0, unreliableTables: 0, keyValuePairs: 0, vlmRecognized: 0, ocrRetained: 0, protocolEchoes: 0, invalidRecognition: 0, recognitionErrors: 0, recognitionRebatches: 0, nativeRecognitionRequests: 0, nativeRecognitionSkipped: 0, nativeCacheHits: 0, nativeCacheMisses: 0, nativeBudgetSkipped: 0, recognitionCircuitBreakers: 0, recoveryTables: 0, localRecovery: 0, recoveryCellsAnalyzed: 0, recoveryCellsSkipped: 0, recoveryPixelMs: 0, orphanTables: 0, orphanBoxes: 0, recoveryAdded: 0, recoveryAdjusted: 0, recoveryRejected: 0};
+    const totals = {total: 0, matched: 0, recovered: 0, uncovered: 0, unreliableTables: 0, keyValuePairs: 0, vlmRecognized: 0, ocrRetained: 0, protocolEchoes: 0, invalidRecognition: 0, recognitionErrors: 0, recognitionRebatches: 0, nativeRecognitionRequests: 0, nativeRecognitionSkipped: 0, nativeCacheHits: 0, nativeCacheMisses: 0, nativeBudgetSkipped: 0, recognitionCircuitBreakers: 0, recoveryTables: 0, localRecovery: 0, recoveryCellsAnalyzed: 0, recoveryCellsSkipped: 0, recoveryPixelMs: 0, orphanTables: 0, orphanBoxes: 0, checkboxBoxes: 0, checkboxChecked: 0, checkboxUnchecked: 0, checkboxAmbiguous: 0, recoveryAdded: 0, recoveryAdjusted: 0, recoveryRejected: 0};
     const documents = report && report.documents ? Object.values(report.documents) : [];
     documents.forEach(documentResult => {
       const counts = documentResult && documentResult.counts ? documentResult.counts : {};
@@ -985,6 +989,10 @@
       totals.recoveryPixelMs += Number(counts.bbox_recovery_pixel_analysis_ms || 0);
       totals.orphanTables += Number(counts.bbox_recovery_orphan_tables_analyzed || 0);
       totals.orphanBoxes += Number(counts.bbox_recovery_orphan_added || 0);
+      totals.checkboxBoxes += Number(counts.bbox_recovery_checkbox_added || 0);
+      totals.checkboxChecked += Number(counts.bbox_recovery_checkbox_checked || 0);
+      totals.checkboxUnchecked += Number(counts.bbox_recovery_checkbox_unchecked || 0);
+      totals.checkboxAmbiguous += Number(counts.bbox_recovery_checkbox_ambiguous || 0);
       totals.recoveryAdded += Number(counts.bbox_recovery_added || 0);
       totals.recoveryAdjusted += Number(counts.bbox_recovery_adjusted || 0);
       totals.recoveryRejected += Number(counts.bbox_recovery_rejected || 0);
@@ -1014,6 +1022,10 @@
     document.querySelector('#recoveryPixelMsValue').textContent = `${totals.recoveryPixelMs.toFixed(1)} ms`;
     document.querySelector('#orphanTablesValue').textContent = String(totals.orphanTables);
     document.querySelector('#orphanBoxesValue').textContent = String(totals.orphanBoxes);
+    document.querySelector('#checkboxBoxesValue').textContent = String(totals.checkboxBoxes);
+    document.querySelector('#checkboxCheckedValue').textContent = String(totals.checkboxChecked);
+    document.querySelector('#checkboxUncheckedValue').textContent = String(totals.checkboxUnchecked);
+    document.querySelector('#checkboxAmbiguousValue').textContent = String(totals.checkboxAmbiguous);
     document.querySelector('#recoveryAddedValue').textContent = String(totals.recoveryAdded);
     document.querySelector('#recoveryAdjustedValue').textContent = String(totals.recoveryAdjusted);
     document.querySelector('#recoveryRejectedValue').textContent = String(totals.recoveryRejected);

@@ -389,6 +389,78 @@ class FusionTests(unittest.TestCase):
         self.assertEqual(decisions[0]["reason"], "orphan_cell_overlap_guard")
         self.assertTrue(unchanged)
 
+    def test_bbox_recovery_adds_local_checkbox_without_vlm_request(self):
+        pipeline = structured_middle(
+            "table",
+            html="<table><tr><td>Option</td></tr></table>",
+            table_cells=[
+                {
+                    "bbox": [10, 10, 190, 80],
+                    "text": "Option",
+                    "content_spans": [
+                        {"bbox": [40, 20, 100, 32], "text": "Option"}
+                    ],
+                    "row_start": 0,
+                    "row_end": 0,
+                    "col_start": 0,
+                    "col_end": 0,
+                }
+            ],
+        )
+
+        def review(_page, _size, _manifest):
+            return {
+                "tables_reviewed": 1,
+                "checkbox_tables_analyzed": 1,
+                "checkbox_candidates": 1,
+                "checkbox_proposals": 1,
+                "checkbox_unchecked": 1,
+                "items": [
+                    {
+                        "action": "add_checkbox",
+                        "table_id": "p0-table-0",
+                        "cell_id": "p0-t0-c0",
+                        "target_id": "",
+                        "bbox": [20, 20, 30, 30],
+                        "confidence": 0.95,
+                        "text": "☐",
+                        "checkbox_state": "unchecked",
+                        "checkbox_interior_density": 0.0,
+                        "recovery_source": "local_checkbox_detector",
+                    }
+                ],
+            }
+
+        def recognize(_page, _size, candidates):
+            checkbox = next(item for item in candidates if item["ocr_text"] == "☐")
+            self.assertLess(checkbox["bbox"][3] - checkbox["bbox"][1], 20)
+            return {"items": [], "native_requests": 0}
+
+        fused, report = fuse_middle_json(
+            pipeline,
+            pipeline,
+            FusionSettings.from_mapping({"mode": "bbox_vlm_recovery"}),
+            bbox_recovery_reviewer=review,
+            bbox_recognizer=recognize,
+        )
+
+        cell = fused["pdf_info"][0]["preproc_blocks"][0]["lines"][0]["spans"][0][
+            "table_cells"
+        ][0]
+        checkbox = next(
+            item
+            for item in cell["content_spans"]
+            if item.get("fusion_recovery_checkbox")
+        )
+        self.assertEqual(checkbox["bbox"], [20.0, 20.0, 30.0, 30.0])
+        self.assertEqual(checkbox["text"], "☐")
+        self.assertEqual(checkbox["fusion_checkbox_state"], "unchecked")
+        self.assertEqual(report["counts"]["bbox_recovery_checkbox_added"], 1)
+        self.assertEqual(report["counts"]["bbox_recovery_checkbox_unchecked"], 1)
+        self.assertTrue(
+            report["recovery_invariants"]["table_and_cell_geometry_unchanged"]
+        )
+
     def test_bbox_recovery_enforces_confidence_area_and_document_budgets(self):
         page = structured_middle(
             "table",

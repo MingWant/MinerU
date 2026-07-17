@@ -381,10 +381,10 @@ def _normalize_task_parameters(
                     else 3,
                     "max_proposals_per_document": 100
                     if cost_profile == "quality"
-                    else 30,
+                    else 100,
                     "max_proposals_per_table": 30
                     if cost_profile == "quality"
-                    else 10,
+                    else 30,
                     "max_requests_per_document": 10
                     if cost_profile == "quality"
                     else 3,
