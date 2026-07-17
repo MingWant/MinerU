@@ -3,6 +3,8 @@ import io
 import json
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -144,6 +146,76 @@ class ImageLimitFakeHttpx(FakeHttpx):
             self.requests.append(json)
             return ImageLimitResponse({"detail": ImageLimitResponse.text})
         return super().post(*_args, json=json, **kwargs)
+
+
+class NativeMinerUFakeHttpx:
+    def __init__(self):
+        self.requests = []
+
+    def get(self, *_args, **_kwargs):
+        return Response(
+            {
+                "data": [
+                    {"id": "mineru-claim-forms", "max_model_len": 8192}
+                ]
+            }
+        )
+
+    def post(self, *_args, json=None, headers=None, **_kwargs):
+        self.requests.append({"json": json, "headers": headers})
+        return Response(
+            {
+                "choices": [
+                    {
+                        "message": {"content": "Blaine<|im_end|>"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 30, "completion_tokens": 4},
+            }
+        )
+
+
+class InvalidSchemaFakeHttpx(FakeHttpx):
+    def post(self, *_args, json=None, **_kwargs):
+        self.requests.append(json)
+        return Response(
+            {
+                "choices": [
+                    {
+                        "message": {"content": "not valid json"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        )
+
+
+class ConcurrentNativeFakeHttpx(NativeMinerUFakeHttpx):
+    def __init__(self):
+        super().__init__()
+        self.lock = threading.Lock()
+        self.active = 0
+        self.max_active = 0
+
+    def post(self, *_args, json=None, headers=None, **_kwargs):
+        with self.lock:
+            self.requests.append({"json": json, "headers": headers})
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        time.sleep(0.04)
+        with self.lock:
+            self.active -= 1
+        return Response(
+            {
+                "choices": [
+                    {
+                        "message": {"content": "Recognized<|im_end|>"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        )
 
 
 json_module = json
@@ -311,7 +383,7 @@ class BBoxRecognitionTests(unittest.TestCase):
         )
         self.assertEqual(result["items"][0]["text"], "Blaine")
         self.assertEqual(fake_httpx.requests[0]["model"], "vision-recognizer")
-        self.assertEqual(fake_httpx.requests[0]["max_tokens"], 6144)
+        self.assertEqual(fake_httpx.requests[0]["max_tokens"], 1024)
         self.assertEqual(
             fake_httpx.requests[0]["response_format"],
             {"type": "json_object"},
@@ -330,6 +402,248 @@ class BBoxRecognitionTests(unittest.TestCase):
         self.assertEqual(result["errors"], 0)
         self.assertEqual(result["batches"][0]["finish_reason"], "stop")
         self.assertEqual(result["batches"][0]["completion_tokens"], 30)
+
+    def test_auto_protocol_uses_native_mineru_text_recognition_and_filters_small_print(self):
+        from PIL import Image
+
+        fake_httpx = NativeMinerUFakeHttpx()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            Image.new("RGB", (400, 200), "white").save(image_path)
+            recognizer = OpenAIBBoxRecognizer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": None,
+                    "protocol": "auto",
+                    "native_min_bbox_height": 16.0,
+                    "native_max_tokens": 256,
+                    "target_render_scale": 1.0,
+                },
+            )
+            recognizer.httpx = fake_httpx
+            candidates = [
+                {
+                    "id": "p0-bbox-0",
+                    "bbox": [10, 10, 100, 35],
+                    "ocr_text": "B1aine",
+                    "type": "table_ocr",
+                    "contexts": {"target": [10, 10, 100, 35]},
+                },
+                {
+                    "id": "p0-bbox-1",
+                    "bbox": [10, 40, 100, 50],
+                    "ocr_text": "Printed label",
+                    "type": "table_ocr",
+                    "contexts": {"target": [10, 40, 100, 50]},
+                },
+            ]
+            try:
+                result = recognizer(0, [200, 100], candidates)
+            finally:
+                recognizer.close()
+
+        self.assertEqual(result["items"], [{"id": "p0-bbox-0", "text": "Blaine"}])
+        self.assertEqual(result["native_requests"], 1)
+        self.assertEqual(result["native_skipped"], 1)
+        request = fake_httpx.requests[0]
+        self.assertEqual(
+            request["json"]["messages"][1]["content"][1]["text"],
+            "\nText Recognition:",
+        )
+        self.assertNotIn("response_format", request["json"])
+        self.assertEqual(request["json"]["max_tokens"], 256)
+        self.assertEqual(
+            request["headers"]["X-Custom-Hybrid-Max-Tokens"],
+            "256",
+        )
+        self.assertEqual(
+            request["headers"]["X-Custom-Hybrid-Protocol"],
+            "mineru_native",
+        )
+
+    def test_structured_protocol_stops_after_repeated_invalid_schema(self):
+        from PIL import Image
+
+        fake_httpx = InvalidSchemaFakeHttpx()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            Image.new("RGB", (400, 300), "white").save(image_path)
+            recognizer = OpenAIBBoxRecognizer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "vision-recognizer",
+                    "protocol": "structured",
+                    "max_images_per_request": 1,
+                    "max_consecutive_invalid_schema": 2,
+                    "include_row_image": False,
+                    "target_render_scale": 1.0,
+                },
+            )
+            recognizer.httpx = fake_httpx
+            candidates = [
+                {
+                    "id": f"p0-bbox-{index}",
+                    "bbox": [10, 10 + index * 30, 100, 30 + index * 30],
+                    "ocr_text": f"Value {index}",
+                    "type": "text",
+                    "contexts": {
+                        "target": [10, 10 + index * 30, 100, 30 + index * 30]
+                    },
+                }
+                for index in range(4)
+            ]
+            try:
+                result = recognizer(0, [400, 300], candidates)
+            finally:
+                recognizer.close()
+
+        self.assertEqual(len(fake_httpx.requests), 2)
+        self.assertEqual(result["circuit_breaker_trips"], 1)
+        self.assertTrue(
+            any(
+                batch["status"] == "structured_circuit_breaker"
+                for batch in result["batches"]
+            )
+        )
+
+    def test_native_cache_reuses_crop_across_recognizer_instances(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            image_path = root / "page.png"
+            cache_dir = root / "cache"
+            Image.new("RGB", (200, 100), "white").save(image_path)
+            config = {
+                "model": "mineru-claim-forms",
+                "max_context_tokens": 8192,
+                "protocol": "auto",
+                "native_min_bbox_height": 0,
+                "native_cache_enabled": True,
+                "native_cache_dir": str(cache_dir),
+                "native_max_concurrency": 1,
+                "target_render_scale": 1.0,
+            }
+            candidate = {
+                "id": "p0-bbox-0",
+                "bbox": [10, 10, 100, 30],
+                "ocr_text": "B1aine",
+                "type": "table_ocr",
+                "contexts": {"target": [10, 10, 100, 30]},
+            }
+            first_httpx = NativeMinerUFakeHttpx()
+            first = OpenAIBBoxRecognizer(
+                "http://vision.test", image_path, config
+            )
+            first.httpx = first_httpx
+            try:
+                first_result = first(0, [200, 100], [candidate])
+            finally:
+                first.close()
+            second_httpx = NativeMinerUFakeHttpx()
+            second = OpenAIBBoxRecognizer(
+                "http://vision.test", image_path, config
+            )
+            second.httpx = second_httpx
+            try:
+                second_result = second(0, [200, 100], [candidate])
+            finally:
+                second.close()
+
+            cache_files = list(cache_dir.rglob("*.json"))
+
+        self.assertEqual(len(first_httpx.requests), 1)
+        self.assertEqual(first_result["native_cache_writes"], 1)
+        self.assertEqual(second_httpx.requests, [])
+        self.assertEqual(second_result["native_cache_hits"], 1)
+        self.assertEqual(
+            second_result["items"],
+            [{"id": "p0-bbox-0", "text": "Blaine"}],
+        )
+        self.assertEqual(len(cache_files), 1)
+
+    def test_native_memory_cache_honors_ttl(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            image_path = root / "page.png"
+            Image.new("RGB", (20, 20), "white").save(image_path)
+            recognizer = OpenAIBBoxRecognizer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "mineru-claim-forms",
+                    "max_context_tokens": 8192,
+                    "native_cache_enabled": True,
+                    "native_cache_dir": str(root / "cache"),
+                    "native_cache_ttl_seconds": 1,
+                    "target_render_scale": 1.0,
+                },
+            )
+            try:
+                self.assertTrue(recognizer._native_cache_put("a" * 64, "value"))
+                recognizer._native_cache_memory["a" * 64] = (
+                    time.time() - 2,
+                    "stale",
+                )
+                recognizer._native_cache_path("a" * 64).unlink()
+                self.assertIsNone(recognizer._native_cache_get("a" * 64))
+            finally:
+                recognizer.close()
+
+    def test_native_requests_use_bounded_concurrency_and_page_budget(self):
+        from PIL import Image, ImageDraw
+
+        fake_httpx = ConcurrentNativeFakeHttpx()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            image = Image.new("RGB", (400, 200), "white")
+            draw = ImageDraw.Draw(image)
+            for index, shade in enumerate((20, 70, 120, 170)):
+                draw.rectangle(
+                    [10 + index * 90, 20, 80 + index * 90, 80],
+                    fill=(shade, shade, shade),
+                )
+            image.save(image_path)
+            image.close()
+            recognizer = OpenAIBBoxRecognizer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "mineru-claim-forms",
+                    "max_context_tokens": 8192,
+                    "protocol": "auto",
+                    "native_min_bbox_height": 0,
+                    "native_max_requests_per_page": 3,
+                    "native_max_concurrency": 2,
+                    "target_render_scale": 1.0,
+                },
+            )
+            recognizer.httpx = fake_httpx
+            candidates = [
+                {
+                    "id": f"p0-bbox-{index}",
+                    "bbox": [5 + index * 45, 5, 45 + index * 45, 45],
+                    "ocr_text": f"Value {index}",
+                    "type": "table_ocr",
+                    "contexts": {
+                        "target": [5 + index * 45, 5, 45 + index * 45, 45]
+                    },
+                }
+                for index in range(4)
+            ]
+            try:
+                result = recognizer(0, [200, 100], candidates)
+            finally:
+                recognizer.close()
+
+        self.assertEqual(result["native_requests"], 3)
+        self.assertEqual(result["native_budget_skipped"], 1)
+        self.assertEqual(fake_httpx.max_active, 2)
+        self.assertEqual(len(result["items"]), 3)
 
     def test_json_schema_mode_constrains_ids_and_item_count(self):
         from PIL import Image

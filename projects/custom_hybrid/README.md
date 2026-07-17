@@ -197,6 +197,16 @@ Settings**. Fusion reports record reviewed Tables, requests, accepted/added/
 adjusted/rejected proposals, reviewer batches, decisions, and the Table/Cell
 geometry invariant.
 
+Recovery first handles Cells that visibly contain ink but have no content bbox
+with deterministic local pixel refinement. These proposals require no VLM
+request and are still subject to the normal confidence, area, duplicate, Cell,
+and Table-grid safety gates. When the configured model name contains `mineru`,
+geometry-review chat requests are skipped because MinerU extraction checkpoints
+use their own constrained decoding protocol and do not reliably emit arbitrary
+JSON coordinate schemas. An invalid structured response also opens a protocol
+circuit breaker so later Tables retain the local/Pipeline geometry without
+repeating expensive failed requests.
+
 `fusion.recognizer.enabled=false` is the default. When explicitly enabled, the
 recognizer runs before structured fusion and treats Pipeline OCR geometry as
 immutable: the Vision model receives existing bbox IDs and crops, then returns
@@ -218,6 +228,44 @@ an `At most N image(s)` error, the recognizer learns that limit for the failed
 batch, repartitions it, and retries up to `max_image_limit_retries`. Other HTTP
 400 responses are not retried blindly.
 
+`recognizer.protocol=auto` detects MinerU model IDs and switches to the official
+single-crop `Text Recognition:` protocol. It sends only empty or visually tall
+targets by default (`native_min_bbox_height=16`), preserving small printed OCR
+labels and focusing requests on handwriting and filled values. Native responses
+are raw text rather than JSON, use a 512-token stage cap, and never request row,
+column, or whole-Table images. This avoids the failure mode where a MinerU model
+generates thousands of tokens while attempting to satisfy an incompatible JSON
+schema. Set `protocol=structured` for a general instruction-following VLM or
+`protocol=mineru_native` to force the native path.
+
+Native requests run in bounded waves (`native_max_concurrency=2` by default).
+The Balanced API profile prioritizes empty and taller value crops, caps each
+page at 12 network requests and each document at 50, uses render scale 3 and
+JPEG quality 85, and limits native output to 256 tokens. Quality uses the wider
+16-point height threshold, up to 24 requests per page, render scale 4, and a
+512-token cap. Repeated native failures open a circuit breaker before later
+waves are submitted.
+
+`native_cache_enabled=true` stores successful native transcriptions in a
+content-addressed cache keyed by model, prompt, token cap, and exact rendered
+crop. Cache hits do not consume request budgets. Files are created with private
+directory/file permissions and expire after `native_cache_ttl_seconds` (30 days
+in the example). The default path is
+`~/.cache/mineru/custom-hybrid/native-recognition`; it contains extracted text,
+so deployments with stricter data-retention requirements should disable it or
+point it at an encrypted/ephemeral volume.
+
+For MinerU local-only Recovery, Cells that already have content boxes are not
+pixel-scanned. Remaining grayscale masks are evaluated with NumPy instead of
+per-pixel Python loops. Reports and the English UI expose analyzed/skipped Cell
+counts, pixel-analysis time, cache hits/misses, request-budget skips, and native
+network requests.
+
+In `bbox_vlm_recovery` mode, Recovery reuses the recognizer's rendered-page
+cache by default (`share_recognizer_page_cache=true`). Recovery still performs
+its own Cell-local ink analysis and never changes Table/Cell geometry, but it no
+longer renders the same PDF page a second time before native transcription.
+
 `structured_output_mode=json_schema` is the default example and sends a dynamic
 strict schema whose ID enum and item count match the current batch. vLLM-native
 `structured_outputs`, strict ordered `regex`, legacy `json_object`, and `none`
@@ -228,6 +276,10 @@ Constrained modes hide real bbox IDs from the prompt and expose only ordinal
 image slots, preventing protocol-token copying; returned bbox-ID-shaped text is
 always rejected as an echo and falls back to OCR.
 Unsupported strict modes fail closed and retain OCR.
+After repeated invalid structured batches, `max_consecutive_invalid_schema`
+opens a document-level circuit breaker and skips the remaining recognition
+requests. Stage-specific token caps remain effective even when a task-level
+`max_tokens` override is larger.
 
 Candidate selection is conservative:
 
@@ -456,17 +508,19 @@ enable the Pipeline BBox + local VLM path; this task override re-enables only th
 required Table recognizer and disables the unrelated verifier/reconciliation
 requests. Submit `extraction_mode=bbox_vlm_recovery` to add the selective
 geometry-review and pixel-refinement pass before transcription. In BBox VLM
-mode, `balanced` sends target and row crops while keeping
-whole-Table images off; `quality` also enables the whole-Table context image.
-Both profiles enforce the eight-image request budget. Submit
+mode with a general structured VLM, `balanced` sends target and row crops while
+keeping whole-Table images off; `quality` also enables the whole-Table context
+image. MinerU-native recognition always sends one target crop only. Both
+structured profiles enforce the eight-image request budget. Submit
 `cost_profile=quality` to use the corresponding workflow configuration instead.
 Each task may safely override `effort`,
 parse method, language, `temperature`, `top_p`, `seed`, `max_tokens`, and
 `repetition_penalty`; the API validates their types and ranges. Task generation
-values are applied after prompt-specific workflow rules, so the submitted values
-are the final values forwarded to vLLM. In `bbox_vlm` mode, temperature, top-p,
-seed, and max-token overrides are also copied into the local bbox recognizer so
-they still apply when it uses a separately configured compatible endpoint.
+values are applied after prompt-specific workflow rules. In `bbox_vlm` mode,
+temperature, top-p, seed, and max-token overrides are also copied into a
+separately configured general bbox recognizer. MinerU-native requests deliberately
+pin temperature/top-p to `0.0/0.01` and enforce their stage token cap; the task
+seed remains part of the request and cache key.
 Upstream URL, credentials, proxy binding,
 fusion thresholds, and arbitrary vLLM arguments remain server-controlled. Tasks
 run serially because each extraction owns a local parameter-proxy port and local

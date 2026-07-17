@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 REPOSITORY_ROOT = Path(__file__).parents[3]
@@ -66,6 +67,19 @@ json_module = json
 
 
 class BBoxRecoveryReviewerTests(unittest.TestCase):
+    def test_shared_page_provider_is_not_closed_by_reviewer(self):
+        provider = mock.Mock()
+        reviewer = OpenAIBBoxRecoveryReviewer(
+            "http://vision.test",
+            "unused.pdf",
+            {"model": "mineru-claim-forms"},
+            page_provider=provider,
+        )
+
+        reviewer.close()
+
+        provider.close.assert_not_called()
+
     def test_reviews_only_visible_missing_content_and_refines_to_pixels(self):
         from PIL import Image, ImageDraw
 
@@ -85,6 +99,7 @@ class BBoxRecoveryReviewerTests(unittest.TestCase):
                     "render_scale": 2.0,
                     "min_ink_ratio": 0.002,
                     "min_uncovered_ink_ratio": 0.15,
+                    "local_missing_enabled": False,
                 },
             )
             reviewer.httpx = fake_httpx
@@ -131,6 +146,71 @@ class BBoxRecoveryReviewerTests(unittest.TestCase):
         evidence = json.loads(prompt.split("evidence_data=", 1)[1])
         self.assertEqual(len(evidence["cells"]), 1)
         self.assertEqual(evidence["cells"][0]["cell_id"], "p0-t0-c0")
+
+    def test_visible_missing_content_uses_local_pixel_recovery_without_vlm(self):
+        from PIL import Image, ImageDraw
+
+        fake_httpx = FakeHttpx()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            image = Image.new("RGB", (200, 100), "white")
+            ImageDraw.Draw(image).rectangle([20, 20, 80, 40], fill="black")
+            image.save(image_path)
+            image.close()
+            reviewer = OpenAIBBoxRecoveryReviewer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "mineru-claim-forms",
+                    "render_scale": 1.0,
+                    "local_missing_enabled": True,
+                },
+            )
+            reviewer.httpx = fake_httpx
+            try:
+                result = reviewer(
+                    0,
+                    [200, 100],
+                    [
+                        {
+                            "id": "p0-table-0",
+                            "bbox": [0, 0, 200, 100],
+                            "cells": [
+                                {
+                                    "id": "p0-t0-c0",
+                                    "bbox": [0, 0, 100, 50],
+                                    "text": "",
+                                    "existing": [],
+                                    "reasons": ["missing_content_bbox"],
+                                },
+                                {
+                                    "id": "p0-t0-c1",
+                                    "bbox": [100, 0, 200, 50],
+                                    "text": "Already covered",
+                                    "existing": [
+                                        {
+                                            "id": "p0-t0-c1-b0",
+                                            "bbox": [110, 10, 190, 40],
+                                            "text": "Already covered",
+                                        }
+                                    ],
+                                    "reasons": [],
+                                }
+                            ],
+                        }
+                    ],
+                )
+            finally:
+                reviewer.close()
+
+        self.assertEqual(fake_httpx.requests, [])
+        self.assertEqual(result["requests"], 0)
+        self.assertEqual(result["local_proposals"], 1)
+        self.assertEqual(result["pixel_cells_analyzed"], 1)
+        self.assertEqual(result["pixel_cells_skipped"], 1)
+        self.assertEqual(len(result["items"]), 1)
+        self.assertEqual(result["items"][0]["recovery_source"], "local_pixel_ink")
+        self.assertEqual(result["batches"][0]["status"], "local_pixel_recovery")
 
     def test_blank_cells_do_not_trigger_vlm_request(self):
         from PIL import Image
@@ -189,6 +269,7 @@ class BBoxRecoveryReviewerTests(unittest.TestCase):
                     "model": "vision-reviewer",
                     "render_scale": 1.0,
                     "max_tables_per_document": 0,
+                    "local_missing_enabled": False,
                 },
             )
             reviewer.httpx = fake_httpx

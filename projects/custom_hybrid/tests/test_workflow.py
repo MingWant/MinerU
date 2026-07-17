@@ -350,6 +350,27 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(applied.body["max_tokens"], 4096)
         self.assertEqual(applied.changed_parameters["max_tokens"], 4096)
 
+    def test_generation_policy_honors_internal_stage_token_cap(self):
+        policy = {
+            "task_overrides": {
+                "max_tokens": 8192,
+                "max_completion_tokens": 8192,
+            }
+        }
+
+        applied = apply_generation_policy(
+            "/v1/chat/completions",
+            {"model": "mineru", "max_tokens": 2048},
+            policy,
+            request_max_tokens_cap=512,
+            request_protocol="mineru_native",
+        )
+
+        self.assertEqual(applied.body["max_tokens"], 512)
+        self.assertEqual(applied.body["max_completion_tokens"], 512)
+        self.assertEqual(applied.body["temperature"], 0.0)
+        self.assertEqual(applied.body["top_p"], 0.01)
+
     def test_proxy_config_discovers_remote_model_context_length(self):
         config = load_config(Path(__file__).parents[1] / "workflow.example.json")
         response = mock.Mock()
@@ -906,6 +927,40 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(report["recognizer"]["max_model_len"], 8192)
         self.assertTrue(report["recognizer"]["capability_trial_required"])
 
+    def test_doctor_uses_native_protocol_for_mineru_model_without_openapi_probe(self):
+        class Response:
+            def __init__(self, payload):
+                self.status_code = 200
+                self.is_success = True
+                self.payload = payload
+
+            def json(self):
+                return self.payload
+
+        config = load_config(Path(__file__).parents[1] / "workflow.example.json")
+        config["vllm"]["upstream_url"] = "http://vision.test"
+        config["fusion"]["mode"] = "bbox_vlm_recovery"
+        models = Response(
+            {
+                "data": [
+                    {"id": "mineru-claim-forms", "max_model_len": 8192}
+                ]
+            }
+        )
+
+        with mock.patch("httpx.get", side_effect=[models, models, models]) as get:
+            report = run_doctor(config)
+
+        self.assertEqual(get.call_count, 3)
+        self.assertTrue(report["recognizer"]["ready"])
+        self.assertEqual(report["recognizer"]["protocol"], "mineru_native")
+        self.assertEqual(
+            report["recognizer"]["structured_output_mode"],
+            "mineru_native",
+        )
+        self.assertTrue(report["recovery"]["ready"])
+        self.assertEqual(report["recovery"]["protocol"], "local_pixel")
+
     def test_doctor_checks_recovery_endpoint_model_and_json_schema(self):
         class Response:
             def __init__(self, payload):
@@ -1313,6 +1368,7 @@ class WorkflowTests(unittest.TestCase):
         recognizer = mock.Mock(
             return_value={"items": [], "requests": 0, "errors": 0}
         )
+        recognizer.target_crop_provider = mock.sentinel.shared_page_provider
         reviewer = mock.Mock(
             return_value={
                 "items": [],
@@ -1359,6 +1415,7 @@ class WorkflowTests(unittest.TestCase):
             "http://recovery.test",
             input_pdf.resolve(),
             effective,
+            page_provider=mock.sentinel.shared_page_provider,
         )
         reviewer.assert_called_once()
         reviewer.close.assert_called_once_with()

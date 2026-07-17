@@ -1067,7 +1067,9 @@ def apply_bbox_recovery_proposals(
             decisions.append(decision)
             continue
         recovery_metadata = {
-            "fusion_recovery_source": "vlm_geometry_reviewer",
+            "fusion_recovery_source": str(
+                item.get("recovery_source") or "vlm_geometry_reviewer"
+            ),
             "fusion_recovery_confidence": float(confidence),
             "fusion_recovery_action": action,
         }
@@ -1688,6 +1690,14 @@ def apply_bbox_recognition(
         "invalid_outputs": 0,
         "errors": 0,
         "rebatches": 0,
+        "native_requests": 0,
+        "native_skipped": 0,
+        "native_budget_skipped": 0,
+        "native_cache_hits": 0,
+        "native_cache_misses": 0,
+        "native_cache_writes": 0,
+        "native_deduplicated_candidates": 0,
+        "circuit_breaker_trips": 0,
         "high_risk_fallbacks": 0,
         "protocol_echoes": 0,
         "batch_quality_fallbacks": 0,
@@ -1706,7 +1716,20 @@ def apply_bbox_recognition(
         batches.append({"page": page_index, "status": "error", "error": type(exc).__name__})
     if not isinstance(response, Mapping):
         response = {}
-    for key in ("requests", "invalid_outputs", "errors", "rebatches"):
+    for key in (
+        "requests",
+        "invalid_outputs",
+        "errors",
+        "rebatches",
+        "native_requests",
+        "native_skipped",
+        "native_budget_skipped",
+        "native_cache_hits",
+        "native_cache_misses",
+        "native_cache_writes",
+        "native_deduplicated_candidates",
+        "circuit_breaker_trips",
+    ):
         value = response.get(key)
         if isinstance(value, int) and value > 0:
             stats[key] += value
@@ -3060,6 +3083,14 @@ def fuse_middle_json(
         "bbox_recognition_invalid_outputs": 0,
         "bbox_recognition_errors": 0,
         "bbox_recognition_rebatches": 0,
+        "bbox_recognition_native_requests": 0,
+        "bbox_recognition_native_skipped": 0,
+        "bbox_recognition_native_budget_skipped": 0,
+        "bbox_recognition_native_cache_hits": 0,
+        "bbox_recognition_native_cache_misses": 0,
+        "bbox_recognition_native_cache_writes": 0,
+        "bbox_recognition_native_deduplicated_candidates": 0,
+        "bbox_recognition_circuit_breaker_trips": 0,
         "bbox_recognition_high_risk_fallbacks": 0,
         "bbox_recognition_protocol_echoes": 0,
         "bbox_recognition_batch_quality_fallbacks": 0,
@@ -3072,6 +3103,13 @@ def fuse_middle_json(
         "bbox_recovery_tables_reviewed": 0,
         "bbox_recovery_table_budget_skips": 0,
         "bbox_recovery_proposal_budget_skips": 0,
+        "bbox_recovery_local_proposals": 0,
+        "bbox_recovery_protocol_failures": 0,
+        "bbox_recovery_protocol_skips": 0,
+        "bbox_recovery_local_only_tables": 0,
+        "bbox_recovery_pixel_cells_analyzed": 0,
+        "bbox_recovery_pixel_cells_skipped": 0,
+        "bbox_recovery_pixel_analysis_ms": 0.0,
         "bbox_recovery_requests": 0,
         "bbox_recovery_proposals": 0,
         "bbox_recovery_accepted": 0,
@@ -3188,6 +3226,22 @@ def fuse_middle_json(
                     response_errors = recovery_response.get("errors")
                     if isinstance(response_errors, int) and response_errors > 0:
                         counts["bbox_recovery_errors"] += response_errors
+                    for response_key, count_key in (
+                        ("local_proposals", "bbox_recovery_local_proposals"),
+                        ("protocol_failures", "bbox_recovery_protocol_failures"),
+                        ("protocol_skips", "bbox_recovery_protocol_skips"),
+                        ("local_only_tables", "bbox_recovery_local_only_tables"),
+                        ("pixel_cells_analyzed", "bbox_recovery_pixel_cells_analyzed"),
+                        ("pixel_cells_skipped", "bbox_recovery_pixel_cells_skipped"),
+                    ):
+                        value = recovery_response.get(response_key)
+                        if isinstance(value, int) and value > 0:
+                            counts[count_key] += value
+                    pixel_analysis_ms = recovery_response.get("pixel_analysis_ms")
+                    if isinstance(pixel_analysis_ms, (int, float)):
+                        counts["bbox_recovery_pixel_analysis_ms"] += float(
+                            pixel_analysis_ms
+                        )
                     remaining_proposals = max(
                         settings.bbox_recovery_max_proposals_per_document
                         - recovery_proposals_accepted,
@@ -3304,6 +3358,14 @@ def fuse_middle_json(
                     "invalid_outputs",
                     "errors",
                     "rebatches",
+                    "native_requests",
+                    "native_skipped",
+                    "native_budget_skipped",
+                    "native_cache_hits",
+                    "native_cache_misses",
+                    "native_cache_writes",
+                    "native_deduplicated_candidates",
+                    "circuit_breaker_trips",
                     "high_risk_fallbacks",
                     "protocol_echoes",
                     "batch_quality_fallbacks",
@@ -3677,6 +3739,10 @@ def fuse_middle_json(
         / counts["ocr_recall_lines_total"],
         6,
     ) if counts["ocr_recall_lines_total"] else 1.0
+    counts["bbox_recovery_pixel_analysis_ms"] = round(
+        float(counts["bbox_recovery_pixel_analysis_ms"]),
+        3,
+    )
 
     fused["_fusion"] = {
         "version": 1,

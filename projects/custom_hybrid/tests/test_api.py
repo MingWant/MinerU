@@ -456,6 +456,24 @@ class CustomHybridApiTests(unittest.TestCase):
         self.assertFalse(fusion["recognizer"]["include_table_image"])
         self.assertEqual(fusion["recognizer"]["max_images_per_request"], 8)
         self.assertEqual(fusion["recognizer"]["max_image_limit_retries"], 2)
+        self.assertEqual(fusion["recognizer"]["native_min_bbox_height"], 20.0)
+        self.assertEqual(fusion["recognizer"]["native_max_tokens"], 256)
+        self.assertEqual(
+            fusion["recognizer"]["native_max_requests_per_page"],
+            12,
+        )
+        self.assertEqual(
+            fusion["recognizer"]["native_max_candidates_per_page"],
+            12,
+        )
+        self.assertEqual(
+            fusion["recognizer"]["max_requests_per_document"],
+            50,
+        )
+        self.assertEqual(fusion["recognizer"]["target_render_scale"], 3.0)
+        self.assertEqual(fusion["recognizer"]["jpeg_quality"], 85)
+        self.assertEqual(fusion["recognizer"]["native_max_concurrency"], 2)
+        self.assertTrue(fusion["recognizer"]["native_cache_enabled"])
         self.assertEqual(fusion["recognizer"]["temperature"], 0.2)
         self.assertEqual(fusion["recognizer"]["top_p"], 0.9)
         self.assertEqual(fusion["recognizer"]["seed"], 123)
@@ -469,6 +487,14 @@ class CustomHybridApiTests(unittest.TestCase):
         )
         self.assertTrue(
             quality["fusion"]["recognizer"]["include_table_image"]
+        )
+        self.assertEqual(
+            quality["fusion"]["recognizer"]["native_min_bbox_height"],
+            16.0,
+        )
+        self.assertEqual(
+            quality["fusion"]["recognizer"]["native_max_requests_per_page"],
+            24,
         )
         recovery = _normalize_task_parameters(
             cost_profile="balanced",

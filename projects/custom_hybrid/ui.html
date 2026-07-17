@@ -475,7 +475,17 @@
           <div class="coverage-metric"><strong id="invalidRecognitionValue">-</strong><span>Invalid VLM Outputs</span></div>
           <div class="coverage-metric"><strong id="recognitionErrorsValue">-</strong><span>Recognition Errors</span></div>
           <div class="coverage-metric"><strong id="recognitionRebatchesValue">-</strong><span>Image-Limit Rebatches</span></div>
+          <div class="coverage-metric"><strong id="nativeRecognitionRequestsValue">-</strong><span>Native MinerU Requests</span></div>
+          <div class="coverage-metric"><strong id="nativeRecognitionSkippedValue">-</strong><span>Native OCR-Preserved</span></div>
+          <div class="coverage-metric"><strong id="nativeCacheHitsValue">-</strong><span>Native Cache Hits</span></div>
+          <div class="coverage-metric"><strong id="nativeCacheMissesValue">-</strong><span>Native Cache Misses</span></div>
+          <div class="coverage-metric"><strong id="nativeBudgetSkippedValue">-</strong><span>Native Budget Skips</span></div>
+          <div class="coverage-metric"><strong id="recognitionCircuitBreakersValue">-</strong><span>Protocol Circuit Breakers</span></div>
           <div class="coverage-metric"><strong id="recoveryTablesValue">-</strong><span>Recovery Tables Reviewed</span></div>
+          <div class="coverage-metric"><strong id="localRecoveryValue">-</strong><span>Local Pixel Proposals</span></div>
+          <div class="coverage-metric"><strong id="recoveryCellsAnalyzedValue">-</strong><span>Recovery Cells Analyzed</span></div>
+          <div class="coverage-metric"><strong id="recoveryCellsSkippedValue">-</strong><span>Recovery Cells Skipped</span></div>
+          <div class="coverage-metric"><strong id="recoveryPixelMsValue">-</strong><span>Recovery Pixel Time</span></div>
           <div class="coverage-metric"><strong id="recoveryAddedValue">-</strong><span>Recovered Boxes Added</span></div>
           <div class="coverage-metric"><strong id="recoveryAdjustedValue">-</strong><span>Recovered Boxes Adjusted</span></div>
           <div class="coverage-metric"><strong id="recoveryRejectedValue">-</strong><span>Recovery Proposals Rejected</span></div>
@@ -944,7 +954,7 @@
   }
 
   function renderCoverageSummary(report) {
-    const totals = {total: 0, matched: 0, recovered: 0, uncovered: 0, unreliableTables: 0, keyValuePairs: 0, vlmRecognized: 0, ocrRetained: 0, protocolEchoes: 0, invalidRecognition: 0, recognitionErrors: 0, recognitionRebatches: 0, recoveryTables: 0, recoveryAdded: 0, recoveryAdjusted: 0, recoveryRejected: 0};
+    const totals = {total: 0, matched: 0, recovered: 0, uncovered: 0, unreliableTables: 0, keyValuePairs: 0, vlmRecognized: 0, ocrRetained: 0, protocolEchoes: 0, invalidRecognition: 0, recognitionErrors: 0, recognitionRebatches: 0, nativeRecognitionRequests: 0, nativeRecognitionSkipped: 0, nativeCacheHits: 0, nativeCacheMisses: 0, nativeBudgetSkipped: 0, recognitionCircuitBreakers: 0, recoveryTables: 0, localRecovery: 0, recoveryCellsAnalyzed: 0, recoveryCellsSkipped: 0, recoveryPixelMs: 0, recoveryAdded: 0, recoveryAdjusted: 0, recoveryRejected: 0};
     const documents = report && report.documents ? Object.values(report.documents) : [];
     documents.forEach(documentResult => {
       const counts = documentResult && documentResult.counts ? documentResult.counts : {};
@@ -960,7 +970,17 @@
       totals.invalidRecognition += Number(counts.bbox_recognition_invalid_outputs || 0);
       totals.recognitionErrors += Number(counts.bbox_recognition_errors || 0);
       totals.recognitionRebatches += Number(counts.bbox_recognition_rebatches || 0);
+      totals.nativeRecognitionRequests += Number(counts.bbox_recognition_native_requests || 0);
+      totals.nativeRecognitionSkipped += Number(counts.bbox_recognition_native_skipped || 0);
+      totals.nativeCacheHits += Number(counts.bbox_recognition_native_cache_hits || 0);
+      totals.nativeCacheMisses += Number(counts.bbox_recognition_native_cache_misses || 0);
+      totals.nativeBudgetSkipped += Number(counts.bbox_recognition_native_budget_skipped || 0);
+      totals.recognitionCircuitBreakers += Number(counts.bbox_recognition_circuit_breaker_trips || 0);
       totals.recoveryTables += Number(counts.bbox_recovery_tables_reviewed || 0);
+      totals.localRecovery += Number(counts.bbox_recovery_local_proposals || 0);
+      totals.recoveryCellsAnalyzed += Number(counts.bbox_recovery_pixel_cells_analyzed || 0);
+      totals.recoveryCellsSkipped += Number(counts.bbox_recovery_pixel_cells_skipped || 0);
+      totals.recoveryPixelMs += Number(counts.bbox_recovery_pixel_analysis_ms || 0);
       totals.recoveryAdded += Number(counts.bbox_recovery_added || 0);
       totals.recoveryAdjusted += Number(counts.bbox_recovery_adjusted || 0);
       totals.recoveryRejected += Number(counts.bbox_recovery_rejected || 0);
@@ -977,7 +997,17 @@
     document.querySelector('#invalidRecognitionValue').textContent = String(totals.invalidRecognition);
     document.querySelector('#recognitionErrorsValue').textContent = String(totals.recognitionErrors);
     document.querySelector('#recognitionRebatchesValue').textContent = String(totals.recognitionRebatches);
+    document.querySelector('#nativeRecognitionRequestsValue').textContent = String(totals.nativeRecognitionRequests);
+    document.querySelector('#nativeRecognitionSkippedValue').textContent = String(totals.nativeRecognitionSkipped);
+    document.querySelector('#nativeCacheHitsValue').textContent = String(totals.nativeCacheHits);
+    document.querySelector('#nativeCacheMissesValue').textContent = String(totals.nativeCacheMisses);
+    document.querySelector('#nativeBudgetSkippedValue').textContent = String(totals.nativeBudgetSkipped);
+    document.querySelector('#recognitionCircuitBreakersValue').textContent = String(totals.recognitionCircuitBreakers);
     document.querySelector('#recoveryTablesValue').textContent = String(totals.recoveryTables);
+    document.querySelector('#localRecoveryValue').textContent = String(totals.localRecovery);
+    document.querySelector('#recoveryCellsAnalyzedValue').textContent = String(totals.recoveryCellsAnalyzed);
+    document.querySelector('#recoveryCellsSkippedValue').textContent = String(totals.recoveryCellsSkipped);
+    document.querySelector('#recoveryPixelMsValue').textContent = `${totals.recoveryPixelMs.toFixed(1)} ms`;
     document.querySelector('#recoveryAddedValue').textContent = String(totals.recoveryAdded);
     document.querySelector('#recoveryAdjustedValue').textContent = String(totals.recoveryAdjusted);
     document.querySelector('#recoveryRejectedValue').textContent = String(totals.recoveryRejected);

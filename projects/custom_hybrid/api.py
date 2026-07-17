@@ -347,6 +347,31 @@ def _normalize_task_parameters(
             bbox_vlm_overrides["recognizer"]["include_table_image"] = (
                 cost_profile == "quality"
             )
+            bbox_vlm_overrides["recognizer"].update(
+                {
+                    "native_min_bbox_height": 16.0
+                    if cost_profile == "quality"
+                    else 20.0,
+                    "native_max_tokens": 512
+                    if cost_profile == "quality"
+                    else 256,
+                    "native_max_requests_per_page": 24
+                    if cost_profile == "quality"
+                    else 12,
+                    "native_max_candidates_per_page": 24
+                    if cost_profile == "quality"
+                    else 12,
+                    "max_requests_per_document": 80
+                    if cost_profile == "quality"
+                    else 50,
+                    "target_render_scale": 4.0
+                    if cost_profile == "quality"
+                    else 3.0,
+                    "jpeg_quality": 92 if cost_profile == "quality" else 85,
+                    "native_max_concurrency": 2,
+                    "native_cache_enabled": True,
+                }
+            )
             if extraction_mode == "bbox_vlm_recovery":
                 bbox_vlm_overrides["mode"] = "bbox_vlm_recovery"
                 bbox_vlm_overrides["recovery"] = {

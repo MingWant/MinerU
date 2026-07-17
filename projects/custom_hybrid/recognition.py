@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import re
+import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -67,6 +70,24 @@ class OpenAIBBoxRecognizer:
         self.model = config.get("model")
         self.max_context_tokens = config.get("max_context_tokens")
         self.requests_made = 0
+        self._native_cache_memory: dict[str, tuple[float, str]] = {}
+        self._native_cache_lock = threading.Lock()
+        self.native_cache_dir = None
+        if config.get("native_cache_enabled", False):
+            cache_dir = Path(
+                str(
+                    config.get(
+                        "native_cache_dir",
+                        "~/.cache/mineru/custom-hybrid/native-recognition",
+                    )
+                )
+            ).expanduser()
+            try:
+                cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+                cache_dir.chmod(0o700)
+                self.native_cache_dir = cache_dir.resolve()
+            except OSError:
+                self.native_cache_dir = None
         self.target_crop_provider = PageCropProvider(
             document_path,
             scale=float(config.get("target_render_scale", 4.0)),
@@ -122,6 +143,498 @@ class OpenAIBBoxRecognizer:
         if isinstance(configured, str) and configured:
             return configured
         return "json_object" if self.config.get("json_mode", True) else "none"
+
+    def _recognition_protocol(self) -> str:
+        configured = str(self.config.get("protocol", "auto")).strip().casefold()
+        if configured not in {"auto", "structured", "mineru_native"}:
+            raise ValueError(
+                "fusion.recognizer.protocol must be auto, structured, or "
+                "mineru_native"
+            )
+        if configured != "auto":
+            return configured
+        model = self._resolve_model_and_context().casefold()
+        return "mineru_native" if "mineru" in model else "structured"
+
+    @staticmethod
+    def _native_text(content: Any) -> str | None:
+        if isinstance(content, list):
+            content = "".join(
+                item.get("text", "") if isinstance(item, Mapping) else str(item)
+                for item in content
+            )
+        if not isinstance(content, str):
+            return None
+        text = content.strip()
+        for token in ("<|im_end|>", "<|endoftext|>"):
+            if text.endswith(token):
+                text = text[: -len(token)].rstrip()
+        if text.startswith("```") and text.endswith("```"):
+            text = re.sub(r"^```(?:text)?\s*|\s*```$", "", text).strip()
+        if any(
+            token in text
+            for token in (
+                "<|box_start|>",
+                "<|box_end|>",
+                "<|ref_start|>",
+                "<|ref_end|>",
+            )
+        ):
+            return None
+        return text
+
+    def _native_candidate_selected(self, candidate: Mapping[str, Any]) -> bool:
+        if self.config.get("native_all_candidates", False):
+            return True
+        if not str(candidate.get("ocr_text", "")).strip():
+            return True
+        bbox = candidate.get("bbox")
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            return False
+        try:
+            height = float(bbox[3]) - float(bbox[1])
+        except (TypeError, ValueError):
+            return False
+        return height >= float(self.config.get("native_min_bbox_height", 16.0))
+
+    def _native_cache_key(self, image_url: str) -> str:
+        payload = {
+            "version": 1,
+            "model": self._resolve_model_and_context(),
+            "prompt": str(self.config.get("native_prompt", "\nText Recognition:")),
+            "system_prompt": str(
+                self.config.get(
+                    "native_system_prompt",
+                    "You are a helpful assistant.",
+                )
+            ),
+            "max_tokens": max(int(self.config.get("native_max_tokens", 512)), 1),
+            "temperature": float(self.config.get("native_temperature", 0.0)),
+            "top_p": float(self.config.get("native_top_p", 0.01)),
+            "seed": self.config.get("seed"),
+            "image_sha256": hashlib.sha256(
+                image_url.encode("ascii")
+            ).hexdigest(),
+        }
+        serialized = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    def _native_cache_path(self, key: str) -> Path | None:
+        if self.native_cache_dir is None:
+            return None
+        return self.native_cache_dir / key[:2] / f"{key}.json"
+
+    def _native_cache_get(self, key: str) -> str | None:
+        ttl = max(int(self.config.get("native_cache_ttl_seconds", 2592000)), 0)
+        now = time.time()
+        with self._native_cache_lock:
+            memory_entry = self._native_cache_memory.get(key)
+            if memory_entry is not None:
+                cached_at, memory_value = memory_entry
+                if not ttl or now - cached_at <= ttl:
+                    return memory_value
+                self._native_cache_memory.pop(key, None)
+        path = self._native_cache_path(key)
+        if path is None:
+            return None
+        try:
+            modified_at = path.stat().st_mtime
+            if ttl and now - modified_at > ttl:
+                path.unlink(missing_ok=True)
+                return None
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return None
+        text = payload.get("text") if isinstance(payload, Mapping) else None
+        if not isinstance(text, str) or not text.strip():
+            return None
+        with self._native_cache_lock:
+            self._native_cache_memory[key] = (modified_at, text)
+        return text
+
+    def _native_cache_put(self, key: str, text: str) -> bool:
+        if not text.strip():
+            return False
+        with self._native_cache_lock:
+            self._native_cache_memory[key] = (time.time(), text)
+        path = self._native_cache_path(key)
+        if path is None:
+            return False
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            path.parent.chmod(0o700)
+            temp_path = path.with_name(
+                f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+            )
+            temp_path.write_text(
+                json.dumps(
+                    {"version": 1, "text": text},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+            temp_path.chmod(0o600)
+            temp_path.replace(path)
+            path.chmod(0o600)
+            return True
+        except OSError:
+            return False
+
+    def _post_mineru_native(
+        self,
+        image_url: str,
+    ) -> tuple[str | None, dict[str, Any]]:
+        token_cap = max(int(self.config.get("native_max_tokens", 512)), 1)
+        payload = {
+            "model": self._resolve_model_and_context(),
+            "messages": [
+                {
+                    "role": "system",
+                    "content": str(
+                        self.config.get(
+                            "native_system_prompt",
+                            "You are a helpful assistant.",
+                        )
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_url},
+                        },
+                        {
+                            "type": "text",
+                            "text": str(
+                                self.config.get(
+                                    "native_prompt",
+                                    "\nText Recognition:",
+                                )
+                            ),
+                        },
+                    ],
+                },
+            ],
+            "temperature": float(self.config.get("native_temperature", 0.0)),
+            "top_p": float(self.config.get("native_top_p", 0.01)),
+            "max_tokens": token_cap,
+            "max_completion_tokens": token_cap,
+            "skip_special_tokens": False,
+        }
+        seed = self.config.get("seed")
+        if isinstance(seed, int):
+            payload["seed"] = seed
+        request_headers = dict(self.headers)
+        request_headers["X-Custom-Hybrid-Max-Tokens"] = str(token_cap)
+        request_headers["X-Custom-Hybrid-Protocol"] = "mineru_native"
+        response = self.httpx.post(
+            self.base_url + "/v1/chat/completions",
+            headers=request_headers,
+            json=payload,
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        response_payload = response.json()
+        choice = response_payload["choices"][0]
+        usage = response_payload.get("usage", {})
+        finish_reason = choice.get("finish_reason")
+        content = self._native_text(choice["message"].get("content"))
+        if finish_reason != "stop":
+            content = None
+        audit = {
+            "finish_reason": finish_reason,
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+        }
+        return content, {
+            key: value for key, value in audit.items() if value is not None
+        }
+
+    def _call_mineru_native(
+        self,
+        page_index: int,
+        page_size: Sequence[float],
+        candidates: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        max_requests = max(int(self.config.get("max_requests_per_document", 80)), 0)
+        result_items = []
+        batches = []
+        requests = 0
+        invalid_outputs = 0
+        errors = 0
+        skipped = 0
+        cache_hits = 0
+        cache_misses = 0
+        cache_writes = 0
+        deduplicated_candidates = 0
+        budget_skipped = 0
+        circuit_breaker_trips = 0
+
+        def priority(item: tuple[int, Mapping[str, Any]]) -> tuple[int, float, int]:
+            index, candidate = item
+            bbox = candidate.get("bbox")
+            try:
+                height = float(bbox[3]) - float(bbox[1])
+            except (TypeError, ValueError, IndexError):
+                height = 0.0
+            empty = not str(candidate.get("ocr_text", "")).strip()
+            return (0 if empty else 1, -height, index)
+
+        selected = [
+            item
+            for item in enumerate(candidates)
+            if self._native_candidate_selected(item[1])
+        ]
+        skipped = len(candidates) - len(selected)
+        selected.sort(key=priority)
+        page_candidate_limit = max(
+            int(self.config.get("native_max_candidates_per_page", 0)),
+            0,
+        )
+        if page_candidate_limit and len(selected) > page_candidate_limit:
+            limited_out = selected[page_candidate_limit:]
+            selected = selected[:page_candidate_limit]
+            limited_ids = [
+                str(candidate.get("id", ""))
+                for _index, candidate in limited_out
+            ]
+            budget_skipped += len(limited_ids)
+            batches.append(
+                {
+                    "page": page_index,
+                    "ids": limited_ids,
+                    "status": "native_candidate_limit",
+                    "protocol": "mineru_native",
+                    "candidates": len(limited_ids),
+                }
+            )
+        pending_by_key: dict[str, dict[str, Any]] = {}
+        for _index, candidate in selected:
+            candidate_id = str(candidate.get("id", ""))
+            contexts = candidate.get("contexts", {})
+            target_bbox = (
+                contexts.get("target") if isinstance(contexts, Mapping) else None
+            )
+            if not isinstance(target_bbox, list) or len(target_bbox) != 4:
+                invalid_outputs += 1
+                continue
+            try:
+                image_url = self._crop_url(
+                    page_index,
+                    page_size,
+                    target_bbox,
+                    "target",
+                )
+                cache_key = self._native_cache_key(image_url)
+                cached_text = self._native_cache_get(cache_key)
+                if cached_text is not None:
+                    cache_hits += 1
+                    result_items.append({"id": candidate_id, "text": cached_text})
+                    batches.append(
+                        {
+                            "page": page_index,
+                            "ids": [candidate_id],
+                            "status": "native_cache_hit",
+                            "protocol": "mineru_native",
+                            "responses": 1,
+                            "candidates": 1,
+                            "images": 0,
+                            "invalid_outputs": 0,
+                            "missing_ids": [],
+                            "quality_guard_evaluated": False,
+                            "latency_ms": 0.0,
+                        }
+                    )
+                    continue
+                cache_misses += 1
+                pending = pending_by_key.get(cache_key)
+                if pending is None:
+                    pending_by_key[cache_key] = {
+                        "key": cache_key,
+                        "image_url": image_url,
+                        "candidates": [(candidate_id, candidate)],
+                    }
+                else:
+                    pending["candidates"].append((candidate_id, candidate))
+                    deduplicated_candidates += 1
+            except Exception as exc:
+                errors += 1
+                batches.append(
+                    {
+                        "page": page_index,
+                        "ids": [candidate_id],
+                        "status": "native_crop_error",
+                        "protocol": "mineru_native",
+                        "error": type(exc).__name__,
+                    }
+                )
+
+        pending = list(pending_by_key.values())
+        page_request_limit = max(
+            int(self.config.get("native_max_requests_per_page", 0)),
+            0,
+        )
+        available_requests = max(max_requests - self.requests_made, 0)
+        request_slots = available_requests
+        if page_request_limit:
+            request_slots = min(request_slots, page_request_limit)
+        scheduled = pending[:request_slots]
+        unscheduled = pending[request_slots:]
+        for entry in unscheduled:
+            ids = [candidate_id for candidate_id, _candidate in entry["candidates"]]
+            budget_skipped += len(ids)
+            batches.append(
+                {
+                    "page": page_index,
+                    "ids": ids,
+                    "status": "native_budget_limit",
+                    "protocol": "mineru_native",
+                    "candidates": len(ids),
+                }
+            )
+
+        max_concurrency = max(
+            int(self.config.get("native_max_concurrency", 2)),
+            1,
+        )
+        max_failures = max(
+            int(self.config.get("native_max_consecutive_failures", 3)),
+            1,
+        )
+        consecutive_failures = 0
+
+        def execute(entry: Mapping[str, Any]) -> tuple[Any, dict[str, Any], Exception | None, float]:
+            started = time.monotonic()
+            try:
+                text, audit = self._post_mineru_native(str(entry["image_url"]))
+                return text, audit, None, (time.monotonic() - started) * 1000
+            except Exception as exc:
+                return None, {}, exc, (time.monotonic() - started) * 1000
+
+        for wave_start in range(0, len(scheduled), max_concurrency):
+            wave = scheduled[wave_start : wave_start + max_concurrency]
+            self.requests_made += len(wave)
+            requests += len(wave)
+            with ThreadPoolExecutor(max_workers=min(max_concurrency, len(wave))) as executor:
+                wave_results = list(executor.map(execute, wave))
+            for entry, (text, response_audit, error, latency_ms) in zip(
+                wave,
+                wave_results,
+            ):
+                ids = [
+                    candidate_id
+                    for candidate_id, _candidate in entry["candidates"]
+                ]
+                if error is not None:
+                    errors += 1
+                    consecutive_failures += 1
+                    batches.append(
+                        {
+                            "page": page_index,
+                            "ids": ids,
+                            "status": "native_error",
+                            "protocol": "mineru_native",
+                            "error": type(error).__name__,
+                            "latency_ms": round(latency_ms, 3),
+                        }
+                    )
+                    continue
+                valid = (
+                    isinstance(text, str)
+                    and bool(text.strip())
+                    and len(text)
+                    <= int(self.config.get("candidate_text_max_chars", 512))
+                )
+                if valid:
+                    consecutive_failures = 0
+                    for candidate_id in ids:
+                        result_items.append({"id": candidate_id, "text": text})
+                    if self._native_cache_put(str(entry["key"]), text):
+                        cache_writes += 1
+                else:
+                    invalid_outputs += len(ids)
+                    consecutive_failures += 1
+                batches.append(
+                    {
+                        "page": page_index,
+                        "ids": ids,
+                        "status": "native_ok" if valid else "native_invalid",
+                        "protocol": "mineru_native",
+                        "responses": len(ids) if valid else 0,
+                        "candidates": len(ids),
+                        "images": 1,
+                        "invalid_outputs": 0 if valid else len(ids),
+                        "missing_ids": [] if valid else ids,
+                        "quality_guard_evaluated": False,
+                        "latency_ms": round(latency_ms, 3),
+                        **response_audit,
+                    }
+                )
+            if consecutive_failures >= max_failures:
+                remaining = scheduled[wave_start + len(wave) :]
+                remaining_candidates = sum(
+                    len(entry["candidates"]) for entry in remaining
+                )
+                budget_skipped += remaining_candidates
+                circuit_breaker_trips += 1
+                batches.append(
+                    {
+                        "page": page_index,
+                        "status": "native_circuit_breaker",
+                        "protocol": "mineru_native",
+                        "skipped_candidates": remaining_candidates,
+                    }
+                )
+                break
+        if skipped:
+            batches.append(
+                {
+                    "page": page_index,
+                    "status": "native_filter",
+                    "protocol": "mineru_native",
+                    "skipped_candidates": skipped,
+                }
+            )
+        batches.append(
+            {
+                "page": page_index,
+                "status": "native_runtime",
+                "protocol": "mineru_native",
+                "selected_candidates": len(selected),
+                "network_requests": requests,
+                "cache_enabled": self.native_cache_dir is not None,
+                "cache_hits": cache_hits,
+                "cache_misses": cache_misses,
+                "cache_writes": cache_writes,
+                "max_concurrency": max_concurrency,
+                "page_request_limit": page_request_limit,
+                "page_candidate_limit": page_candidate_limit,
+            }
+        )
+        return {
+            "items": result_items,
+            "batches": batches,
+            "requests": requests,
+            "invalid_outputs": invalid_outputs,
+            "errors": errors,
+            "rebatches": 0,
+            "native_requests": requests,
+            "native_skipped": skipped,
+            "native_budget_skipped": budget_skipped,
+            "native_cache_hits": cache_hits,
+            "native_cache_misses": cache_misses,
+            "native_cache_writes": cache_writes,
+            "native_deduplicated_candidates": deduplicated_candidates,
+            "native_max_concurrency": max_concurrency,
+            "circuit_breaker_trips": circuit_breaker_trips,
+        }
 
     @staticmethod
     def _response_schema(candidate_ids: Sequence[str]) -> dict[str, Any]:
@@ -383,6 +896,10 @@ class OpenAIBBoxRecognizer:
         image_urls: Sequence[str],
         candidate_ids: Sequence[str],
     ) -> tuple[Any, dict[str, Any]]:
+        token_limit = min(
+            self._output_token_limit(),
+            max(int(self.config.get("structured_max_tokens_cap", 1024)), 1),
+        )
         payload = {
             "model": self._resolve_model_and_context(),
             "messages": [
@@ -402,7 +919,7 @@ class OpenAIBBoxRecognizer:
             ],
             "temperature": float(self.config.get("temperature", 0.0)),
             "top_p": float(self.config.get("top_p", 1.0)),
-            "max_tokens": self._output_token_limit(),
+            "max_tokens": token_limit,
         }
         seed = self.config.get("seed")
         if isinstance(seed, int):
@@ -435,9 +952,11 @@ class OpenAIBBoxRecognizer:
             }
         elif structured_output_mode == "json_object":
             payload["response_format"] = {"type": "json_object"}
+        request_headers = dict(self.headers)
+        request_headers["X-Custom-Hybrid-Max-Tokens"] = str(token_limit)
         response = self.httpx.post(
             self.base_url + "/v1/chat/completions",
-            headers=self.headers,
+            headers=request_headers,
             json=payload,
             timeout=self.timeout,
         )
@@ -460,6 +979,12 @@ class OpenAIBBoxRecognizer:
         page_size: Sequence[float],
         candidates: Sequence[Mapping[str, Any]],
     ) -> dict[str, Any]:
+        if self._recognition_protocol() == "mineru_native":
+            return self._call_mineru_native(
+                page_index,
+                page_size,
+                candidates,
+            )
         max_batch_size = max(int(self.config.get("max_batch_size", 8)), 1)
         max_images = max(int(self.config.get("max_images_per_request", 8)), 1)
         max_image_limit_retries = max(
@@ -473,6 +998,12 @@ class OpenAIBBoxRecognizer:
         errors = 0
         requests = 0
         rebatches = 0
+        circuit_breaker_trips = 0
+        consecutive_invalid_schema = 0
+        max_consecutive_invalid_schema = max(
+            int(self.config.get("max_consecutive_invalid_schema", 2)),
+            1,
+        )
         pending = deque(
             {
                 "candidates": batch,
@@ -580,6 +1111,30 @@ class OpenAIBBoxRecognizer:
                 batch_audit.append(batch_record)
                 invalid_outputs += batch_invalid_outputs
                 invalid_outputs += int(not container_valid)
+                if container_valid:
+                    consecutive_invalid_schema = 0
+                else:
+                    consecutive_invalid_schema += 1
+                    if (
+                        consecutive_invalid_schema
+                        >= max_consecutive_invalid_schema
+                    ):
+                        skipped_batches = len(pending)
+                        skipped_candidates = sum(
+                            len(item["candidates"]) for item in pending
+                        )
+                        pending.clear()
+                        circuit_breaker_trips += 1
+                        batch_record["circuit_breaker_tripped"] = True
+                        batch_audit.append(
+                            {
+                                "page": page_index,
+                                "status": "structured_circuit_breaker",
+                                "protocol": "structured",
+                                "skipped_batches": skipped_batches,
+                                "skipped_candidates": skipped_candidates,
+                            }
+                        )
             except Exception as exc:
                 detected_limit = self._server_image_limit(exc)
                 can_retry = (
@@ -636,6 +1191,9 @@ class OpenAIBBoxRecognizer:
             "invalid_outputs": invalid_outputs,
             "errors": errors,
             "rebatches": rebatches,
+            "native_requests": 0,
+            "native_skipped": 0,
+            "circuit_breaker_trips": circuit_breaker_trips,
         }
 
     def close(self) -> None:

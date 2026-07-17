@@ -156,6 +156,7 @@ class FusionTests(unittest.TestCase):
                         "target_id": "",
                         "bbox": [20, 18, 85, 32],
                         "confidence": 0.95,
+                        "recovery_source": "local_pixel_ink",
                     },
                     {
                         "action": "add",
@@ -187,6 +188,10 @@ class FusionTests(unittest.TestCase):
         ][0]["content_spans"][0]
         self.assertEqual(recovered["bbox"], [20.0, 18.0, 85.0, 32.0])
         self.assertEqual(recovered["fusion_recovery_confidence"], 0.95)
+        self.assertEqual(
+            recovered["fusion_recovery_source"],
+            "local_pixel_ink",
+        )
         adjusted = page["preproc_blocks"][0]["lines"][0]["spans"][0][
             "table_cells"
         ][1]["content_spans"][0]
@@ -217,6 +222,11 @@ class FusionTests(unittest.TestCase):
             return {
                 "tables_reviewed": 1,
                 "requests": 1,
+                "local_proposals": 1,
+                "local_only_tables": 1,
+                "pixel_cells_analyzed": 1,
+                "pixel_cells_skipped": 4,
+                "pixel_analysis_ms": 2.5,
                 "items": [
                     {
                         "action": "add",
@@ -233,7 +243,13 @@ class FusionTests(unittest.TestCase):
             self.assertEqual(len(candidates), 1)
             self.assertEqual(candidates[0]["bbox"], [20.0, 18.0, 170.0, 32.0])
             return {
-                "items": [{"id": candidates[0]["id"], "text": "Recovered Value"}]
+                "items": [{"id": candidates[0]["id"], "text": "Recovered Value"}],
+                "native_requests": 0,
+                "native_cache_hits": 1,
+                "native_cache_misses": 0,
+                "native_cache_writes": 0,
+                "native_budget_skipped": 0,
+                "native_deduplicated_candidates": 0,
             }
 
         fused, report = fuse_middle_json(
@@ -247,7 +263,11 @@ class FusionTests(unittest.TestCase):
         span = fused["pdf_info"][0]["preproc_blocks"][0]["lines"][0]["spans"][0]
         self.assertIn("<td>Recovered Value</td>", span["html"])
         self.assertEqual(report["counts"]["bbox_recovery_added"], 1)
+        self.assertEqual(report["counts"]["bbox_recovery_local_proposals"], 1)
+        self.assertEqual(report["counts"]["bbox_recovery_pixel_cells_skipped"], 4)
+        self.assertEqual(report["counts"]["bbox_recovery_pixel_analysis_ms"], 2.5)
         self.assertEqual(report["counts"]["bbox_recognition_vlm_selected"], 1)
+        self.assertEqual(report["counts"]["bbox_recognition_native_cache_hits"], 1)
         self.assertTrue(
             report["recovery_invariants"]["table_and_cell_geometry_unchanged"]
         )

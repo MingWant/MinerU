@@ -11,6 +11,8 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+import numpy as np
+
 from projects.custom_hybrid.fusion import PageCropProvider
 
 
@@ -70,6 +72,8 @@ class OpenAIBBoxRecoveryReviewer:
         base_url: str,
         document_path: str | Path,
         config: Mapping[str, Any],
+        *,
+        page_provider: PageCropProvider | None = None,
     ):
         try:
             import httpx
@@ -87,7 +91,11 @@ class OpenAIBBoxRecoveryReviewer:
         self.requests_made = 0
         self.tables_reviewed = 0
         self.proposals_returned = 0
-        self.provider = PageCropProvider(
+        self.protocol_disabled = False
+        self.pixel_cells_analyzed = 0
+        self.pixel_cells_skipped = 0
+        self._owns_provider = page_provider is None
+        self.provider = page_provider or PageCropProvider(
             document_path,
             scale=float(config.get("render_scale", 2.0)),
             cache_pages=int(config.get("cache_pages", 2)),
@@ -153,9 +161,12 @@ class OpenAIBBoxRecoveryReviewer:
                     background = value
                     break
             threshold = max(40, min(220, background - 25))
-            pixels = crop.load()
-            dark_points = []
-            uncovered = 0
+            pixels = np.asarray(crop, dtype=np.uint8)
+            dark_mask = pixels < threshold
+            dark_y, dark_x = np.nonzero(dark_mask)
+            dark_count = int(dark_x.size)
+            if dark_count == 0:
+                return {"ink_ratio": 0.0, "uncovered_ratio": 0.0, "ink_bbox": None}
             existing_bboxes = [
                 valid
                 for item in existing
@@ -163,36 +174,45 @@ class OpenAIBBoxRecoveryReviewer:
                 for valid in [_valid_bbox(item.get("bbox"))]
                 if valid is not None
             ]
-            for y in range(crop.height):
-                for x in range(crop.width):
-                    if pixels[x, y] >= threshold:
-                        continue
-                    page_x = (crop_box[0] + x) / scale_x
-                    page_y = (crop_box[1] + y) / scale_y
-                    dark_points.append((page_x, page_y))
-                    if not any(
-                        box[0] <= page_x <= box[2] and box[1] <= page_y <= box[3]
-                        for box in existing_bboxes
-                    ):
-                        uncovered += 1
-            if not dark_points:
-                return {"ink_ratio": 0.0, "uncovered_ratio": 0.0, "ink_bbox": None}
-            xs = [point[0] for point in dark_points]
-            ys = [point[1] for point in dark_points]
-            padding_x = max(1.5 / scale_x, (max(xs) - min(xs)) * 0.02)
-            padding_y = max(1.5 / scale_y, (max(ys) - min(ys)) * 0.08)
+            covered_mask = np.zeros_like(dark_mask, dtype=bool)
+            for existing_bbox in existing_bboxes:
+                left = max(
+                    0,
+                    int(math.floor(existing_bbox[0] * scale_x)) - crop_box[0],
+                )
+                top = max(
+                    0,
+                    int(math.floor(existing_bbox[1] * scale_y)) - crop_box[1],
+                )
+                right = min(
+                    crop.width,
+                    int(math.ceil(existing_bbox[2] * scale_x)) - crop_box[0] + 1,
+                )
+                bottom = min(
+                    crop.height,
+                    int(math.ceil(existing_bbox[3] * scale_y)) - crop_box[1] + 1,
+                )
+                if right > left and bottom > top:
+                    covered_mask[top:bottom, left:right] = True
+            uncovered = int(np.count_nonzero(dark_mask & ~covered_mask))
+            min_x = float((crop_box[0] + int(dark_x.min())) / scale_x)
+            max_x = float((crop_box[0] + int(dark_x.max())) / scale_x)
+            min_y = float((crop_box[1] + int(dark_y.min())) / scale_y)
+            max_y = float((crop_box[1] + int(dark_y.max())) / scale_y)
+            padding_x = max(1.5 / scale_x, (max_x - min_x) * 0.02)
+            padding_y = max(1.5 / scale_y, (max_y - min_y) * 0.08)
             ink_bbox = _clip_bbox(
                 (
-                    min(xs) - padding_x,
-                    min(ys) - padding_y,
-                    max(xs) + padding_x,
-                    max(ys) + padding_y,
+                    min_x - padding_x,
+                    min_y - padding_y,
+                    max_x + padding_x,
+                    max_y + padding_y,
                 ),
                 bbox,
             )
             return {
-                "ink_ratio": len(dark_points) / total_pixels,
-                "uncovered_ratio": uncovered / len(dark_points),
+                "ink_ratio": dark_count / total_pixels,
+                "uncovered_ratio": uncovered / dark_count,
                 "ink_bbox": list(ink_bbox) if ink_bbox is not None else None,
             }
         finally:
@@ -203,6 +223,8 @@ class OpenAIBBoxRecoveryReviewer:
         image,
         page_size: Sequence[float],
         table: Mapping[str, Any],
+        *,
+        missing_only: bool = False,
     ) -> list[dict[str, Any]]:
         min_ink_ratio = float(self.config.get("min_ink_ratio", 0.002))
         min_uncovered_ratio = float(self.config.get("min_uncovered_ink_ratio", 0.15))
@@ -210,6 +232,11 @@ class OpenAIBBoxRecoveryReviewer:
         for cell in table.get("cells", []):
             if not isinstance(cell, Mapping):
                 continue
+            existing = cell.get("existing", [])
+            if missing_only and existing:
+                self.pixel_cells_skipped += 1
+                continue
+            self.pixel_cells_analyzed += 1
             analysis = self._ink_analysis(
                 image,
                 page_size,
@@ -221,7 +248,6 @@ class OpenAIBBoxRecoveryReviewer:
                 for reason in cell.get("reasons", [])
                 if isinstance(reason, str) and reason != "missing_content_bbox"
             )
-            existing = cell.get("existing", [])
             if (
                 not existing
                 and analysis["ink_ratio"] >= min_ink_ratio
@@ -420,6 +446,7 @@ class OpenAIBBoxRecoveryReviewer:
             "or Cell boundaries.\n"
             f"evidence_data={json.dumps(evidence, ensure_ascii=False)}"
         )
+        token_cap = max(int(self.config.get("structured_max_tokens_cap", 768)), 1)
         payload = {
             "model": self._resolve_model(),
             "messages": [
@@ -433,7 +460,10 @@ class OpenAIBBoxRecoveryReviewer:
             ],
             "temperature": float(self.config.get("temperature", 0.0)),
             "top_p": float(self.config.get("top_p", 1.0)),
-            "max_tokens": int(self.config.get("max_tokens", 1024)),
+            "max_tokens": min(
+                int(self.config.get("max_tokens", 1024)),
+                token_cap,
+            ),
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
@@ -455,15 +485,20 @@ class OpenAIBBoxRecoveryReviewer:
         if isinstance(seed, int):
             payload["seed"] = seed
         started = time.monotonic()
+        request_headers = dict(self.headers)
+        request_headers["X-Custom-Hybrid-Max-Tokens"] = str(
+            payload["max_tokens"]
+        )
         response = self.httpx.post(
             self.base_url + "/v1/chat/completions",
-            headers=self.headers,
+            headers=request_headers,
             json=payload,
             timeout=self.timeout,
         )
         response.raise_for_status()
         response_payload = response.json()
-        content = response_payload["choices"][0]["message"]["content"]
+        choice = response_payload["choices"][0]
+        content = choice["message"]["content"]
         parsed = _parse_json_object(content)
         raw_items = parsed.get("items", []) if isinstance(parsed, Mapping) else []
         by_cell = {str(cell.get("id")): cell for cell in suspicious}
@@ -522,7 +557,41 @@ class OpenAIBBoxRecoveryReviewer:
             "latency_ms": round((time.monotonic() - started) * 1000, 3),
             "prompt_tokens": usage.get("prompt_tokens"),
             "completion_tokens": usage.get("completion_tokens"),
+            "finish_reason": choice.get("finish_reason"),
         }
+
+    def _local_missing_proposals(
+        self,
+        suspicious: Sequence[Mapping[str, Any]],
+        max_items: int,
+    ) -> list[dict[str, Any]]:
+        if not self.config.get("local_missing_enabled", True) or max_items <= 0:
+            return []
+        proposals = []
+        for cell in suspicious:
+            reasons = cell.get("reasons", [])
+            if not isinstance(reasons, list) or "missing_content_bbox" not in reasons:
+                continue
+            bbox = _valid_bbox(cell.get("pixel_ink_bbox"))
+            cell_id = cell.get("id")
+            if bbox is None or not isinstance(cell_id, str):
+                continue
+            proposals.append(
+                {
+                    "action": "add",
+                    "cell_id": cell_id,
+                    "target_id": "",
+                    "bbox": list(bbox),
+                    "confidence": float(
+                        self.config.get("local_pixel_confidence", 0.95)
+                    ),
+                    "recovery_reasons": sorted(set(reasons)),
+                    "recovery_source": "local_pixel_ink",
+                }
+            )
+            if len(proposals) >= max_items:
+                break
+        return proposals
 
     def __call__(
         self,
@@ -530,7 +599,23 @@ class OpenAIBBoxRecoveryReviewer:
         page_size: Sequence[float],
         tables: Sequence[Mapping[str, Any]],
     ) -> dict[str, Any]:
+        analyzed_before = self.pixel_cells_analyzed
+        skipped_before = self.pixel_cells_skipped
+        pixel_analysis_seconds = 0.0
         image = self.provider.get_page(page_index)
+        resolved_model = None
+        model_resolution_error = None
+        try:
+            resolved_model = self._resolve_model().casefold()
+        except Exception as exc:
+            model_resolution_error = type(exc).__name__
+        mineru_local_only = bool(
+            isinstance(resolved_model, str)
+            and "mineru" in resolved_model
+            and self.config.get("local_missing_enabled", True)
+            and self.config.get("skip_vlm_for_mineru_models", True)
+            and not self.config.get("review_after_local_recovery", False)
+        )
         max_requests = max(int(self.config.get("max_requests_per_document", 10)), 0)
         max_tables = max(int(self.config.get("max_tables_per_document", 10)), 0)
         max_proposals = max(
@@ -544,35 +629,29 @@ class OpenAIBBoxRecoveryReviewer:
         errors = 0
         table_budget_skips = 0
         proposal_budget_skips = 0
+        local_proposals = 0
+        protocol_failures = 0
+        protocol_skips = 0
+        local_only_tables = 0
         for table in tables:
-            suspicious = self._suspicious_cells(image, page_size, table)
+            if mineru_local_only:
+                local_only_tables += 1
+            pixel_started = time.monotonic()
+            try:
+                suspicious = self._suspicious_cells(
+                    image,
+                    page_size,
+                    table,
+                    missing_only=mineru_local_only,
+                )
+            finally:
+                pixel_analysis_seconds += time.monotonic() - pixel_started
             if not suspicious:
                 batches.append(
                     {
                         "page": page_index,
                         "table_id": table.get("id"),
                         "status": "not_suspicious",
-                    }
-                )
-                continue
-            if self.requests_made >= max_requests:
-                batches.append(
-                    {
-                        "page": page_index,
-                        "table_id": table.get("id"),
-                        "status": "request_limit",
-                        "suspicious_cells": len(suspicious),
-                    }
-                )
-                continue
-            if self.tables_reviewed >= max_tables:
-                table_budget_skips += 1
-                batches.append(
-                    {
-                        "page": page_index,
-                        "table_id": table.get("id"),
-                        "status": "table_limit",
-                        "suspicious_cells": len(suspicious),
                     }
                 )
                 continue
@@ -584,6 +663,96 @@ class OpenAIBBoxRecoveryReviewer:
                         "page": page_index,
                         "table_id": table.get("id"),
                         "status": "proposal_limit",
+                        "suspicious_cells": len(suspicious),
+                    }
+                )
+                continue
+            per_table_limit = max(
+                int(self.config.get("max_proposals_per_table", 30)),
+                0,
+            )
+            local_items = self._local_missing_proposals(
+                suspicious,
+                min(remaining_proposals, per_table_limit),
+            )
+            reviewed_locally = bool(local_items)
+            if local_items:
+                items.extend(local_items)
+                local_count = len(local_items)
+                local_proposals += local_count
+                self.proposals_returned += local_count
+                tables_reviewed += 1
+                batches.append(
+                    {
+                        "page": page_index,
+                        "table_id": table.get("id"),
+                        "status": "local_pixel_recovery",
+                        "suspicious_cells": len(suspicious),
+                        "proposals": local_count,
+                    }
+                )
+                if not self.config.get("review_after_local_recovery", False):
+                    continue
+                remaining_proposals = max(
+                    remaining_proposals - local_count,
+                    0,
+                )
+                if remaining_proposals <= 0:
+                    continue
+            if self.tables_reviewed >= max_tables:
+                table_budget_skips += 1
+                batches.append(
+                    {
+                        "page": page_index,
+                        "table_id": table.get("id"),
+                        "status": "table_limit",
+                        "suspicious_cells": len(suspicious),
+                    }
+                )
+                continue
+            if self.protocol_disabled:
+                protocol_skips += 1
+                batches.append(
+                    {
+                        "page": page_index,
+                        "table_id": table.get("id"),
+                        "status": "protocol_circuit_breaker",
+                        "suspicious_cells": len(suspicious),
+                    }
+                )
+                continue
+            if model_resolution_error is not None:
+                errors += 1
+                batches.append(
+                    {
+                        "page": page_index,
+                        "table_id": table.get("id"),
+                        "status": "model_resolution_error",
+                        "error": model_resolution_error,
+                    }
+                )
+                continue
+            if (
+                isinstance(resolved_model, str)
+                and "mineru" in resolved_model
+                and self.config.get("skip_vlm_for_mineru_models", True)
+            ):
+                protocol_skips += 1
+                batches.append(
+                    {
+                        "page": page_index,
+                        "table_id": table.get("id"),
+                        "status": "mineru_geometry_protocol_skipped",
+                        "suspicious_cells": len(suspicious),
+                    }
+                )
+                continue
+            if self.requests_made >= max_requests:
+                batches.append(
+                    {
+                        "page": page_index,
+                        "table_id": table.get("id"),
+                        "status": "request_limit",
                         "suspicious_cells": len(suspicious),
                     }
                 )
@@ -601,10 +770,18 @@ class OpenAIBBoxRecoveryReviewer:
                 )
                 proposals = proposals[:remaining_proposals]
                 self.proposals_returned += len(proposals)
-                tables_reviewed += 1
                 self.tables_reviewed += 1
+                if not reviewed_locally:
+                    tables_reviewed += 1
                 items.extend(proposals)
                 batches.append({"page": page_index, **audit})
+                if audit.get("status") == "invalid_schema":
+                    protocol_failures += 1
+                    if self.config.get(
+                        "disable_after_invalid_schema",
+                        True,
+                    ):
+                        self.protocol_disabled = True
             except Exception as exc:
                 errors += 1
                 batches.append(
@@ -623,7 +800,20 @@ class OpenAIBBoxRecoveryReviewer:
             "errors": errors,
             "table_budget_skips": table_budget_skips,
             "proposal_budget_skips": proposal_budget_skips,
+            "local_proposals": local_proposals,
+            "protocol_failures": protocol_failures,
+            "protocol_skips": protocol_skips,
+            "local_only_tables": local_only_tables,
+            "pixel_cells_analyzed": (
+                self.pixel_cells_analyzed - analyzed_before
+            ),
+            "pixel_cells_skipped": self.pixel_cells_skipped - skipped_before,
+            "pixel_analysis_ms": round(
+                pixel_analysis_seconds * 1000,
+                3,
+            ),
         }
 
     def close(self) -> None:
-        self.provider.close()
+        if self._owns_provider:
+            self.provider.close()

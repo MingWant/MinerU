@@ -44,6 +44,8 @@ from projects.custom_hybrid.table_fusion import extract_table_snapshots
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("workflow.example.json")
 GENERATION_ENDPOINT_SUFFIXES = ("/chat/completions", "/completions")
+INTERNAL_MAX_TOKENS_HEADER = "x-custom-hybrid-max-tokens"
+INTERNAL_PROTOCOL_HEADER = "x-custom-hybrid-protocol"
 FORWARDED_RESPONSE_HEADERS = {
     "cache-control",
     "content-disposition",
@@ -51,7 +53,12 @@ FORWARDED_RESPONSE_HEADERS = {
     "content-type",
     "x-request-id",
 }
-IGNORED_REQUEST_HEADERS = {"content-length", "host"}
+IGNORED_REQUEST_HEADERS = {
+    "content-length",
+    "host",
+    INTERNAL_MAX_TOKENS_HEADER,
+    INTERNAL_PROTOCOL_HEADER,
+}
 AUDITED_GENERATION_PARAMETERS = {
     "temperature",
     "top_p",
@@ -237,6 +244,16 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         raise WorkflowConfigError("fusion.recovery must be a JSON object")
     if not isinstance(recovery.get("enabled", False), bool):
         raise WorkflowConfigError("fusion.recovery.enabled must be a boolean")
+    for key in (
+        "local_missing_enabled",
+        "review_after_local_recovery",
+        "skip_vlm_for_mineru_models",
+        "disable_after_invalid_schema",
+        "share_recognizer_page_cache",
+    ):
+        field = recovery.get(key)
+        if field is not None and not isinstance(field, bool):
+            raise WorkflowConfigError(f"fusion.recovery.{key} must be a boolean")
     recovery_base_url = recovery.get("base_url")
     if recovery_base_url is not None and (
         not isinstance(recovery_base_url, str)
@@ -259,6 +276,7 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         "adjust_min_iou",
         "min_ink_ratio",
         "min_uncovered_ink_ratio",
+        "local_pixel_confidence",
     ):
         field = recovery.get(key)
         if field is not None and (
@@ -298,6 +316,15 @@ def _validate_fusion_config(fusion_config: Any) -> None:
             raise WorkflowConfigError(
                 f"fusion.recovery.{key} must be a positive integer"
             )
+    recovery_structured_cap = recovery.get("structured_max_tokens_cap", 768)
+    if (
+        isinstance(recovery_structured_cap, bool)
+        or not isinstance(recovery_structured_cap, int)
+        or recovery_structured_cap < 1
+    ):
+        raise WorkflowConfigError(
+            "fusion.recovery.structured_max_tokens_cap must be a positive integer"
+        )
     recovery_temperature = recovery.get("temperature", 0.0)
     if (
         isinstance(recovery_temperature, bool)
@@ -339,6 +366,11 @@ def _validate_fusion_config(fusion_config: Any) -> None:
             "fusion.recognizer.selection_policy must be conservative or "
             "vlm_primary"
         )
+    recognizer_protocol = recognizer.get("protocol", "auto")
+    if recognizer_protocol not in {"auto", "structured", "mineru_native"}:
+        raise WorkflowConfigError(
+            "fusion.recognizer.protocol must be auto, structured, or mineru_native"
+        )
     recognizer_base_url = recognizer.get("base_url")
     if recognizer_base_url is not None and (
         not isinstance(recognizer_base_url, str)
@@ -366,6 +398,8 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         "hide_ids_in_prompt_when_constrained",
         "batch_guard_enabled",
         "empty_ocr_enabled",
+        "native_all_candidates",
+        "native_cache_enabled",
     ):
         if not isinstance(recognizer.get(key, False if key == "enabled" else True), bool):
             raise WorkflowConfigError(f"fusion.recognizer.{key} must be a boolean")
@@ -464,6 +498,44 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         raise WorkflowConfigError(
             "fusion.recognizer.max_image_limit_retries must be a "
             "non-negative integer"
+        )
+    for key, default in (
+        ("native_max_tokens", 512),
+        ("structured_max_tokens_cap", 1024),
+        ("max_consecutive_invalid_schema", 2),
+        ("native_max_concurrency", 2),
+        ("native_max_consecutive_failures", 3),
+    ):
+        value = recognizer.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise WorkflowConfigError(
+                f"fusion.recognizer.{key} must be a positive integer"
+            )
+    native_min_bbox_height = recognizer.get("native_min_bbox_height", 16.0)
+    if (
+        isinstance(native_min_bbox_height, bool)
+        or not isinstance(native_min_bbox_height, (int, float))
+        or float(native_min_bbox_height) < 0
+    ):
+        raise WorkflowConfigError(
+            "fusion.recognizer.native_min_bbox_height must be non-negative"
+        )
+    for key, default in (
+        ("native_max_candidates_per_page", 0),
+        ("native_max_requests_per_page", 0),
+        ("native_cache_ttl_seconds", 2592000),
+    ):
+        value = recognizer.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise WorkflowConfigError(
+                f"fusion.recognizer.{key} must be a non-negative integer"
+            )
+    native_cache_dir = recognizer.get("native_cache_dir")
+    if native_cache_dir is not None and (
+        not isinstance(native_cache_dir, str) or not native_cache_dir.strip()
+    ):
+        raise WorkflowConfigError(
+            "fusion.recognizer.native_cache_dir must be null or a non-empty string"
         )
     temperature = recognizer.get("temperature", 0.0)
     if (
@@ -686,6 +758,8 @@ def apply_generation_policy(
     path: str,
     body: Mapping[str, Any],
     generation_config: Mapping[str, Any],
+    request_max_tokens_cap: int | None = None,
+    request_protocol: str | None = None,
 ) -> AppliedGenerationPolicy:
     original = dict(body)
     effective = dict(body)
@@ -699,6 +773,21 @@ def apply_generation_policy(
     task_overrides = generation_config.get("task_overrides", {})
     if isinstance(task_overrides, dict):
         effective.update(task_overrides)
+    if request_protocol == "mineru_native":
+        effective["temperature"] = 0.0
+        effective["top_p"] = 0.01
+    if (
+        isinstance(request_max_tokens_cap, int)
+        and not isinstance(request_max_tokens_cap, bool)
+        and request_max_tokens_cap > 0
+    ):
+        for token_key in ("max_tokens", "max_completion_tokens"):
+            requested_tokens = effective.get(token_key)
+            if isinstance(requested_tokens, (int, float)):
+                effective[token_key] = min(
+                    int(requested_tokens),
+                    request_max_tokens_cap,
+                )
     max_context_tokens = generation_config.get(
         "_resolved_max_context_tokens",
         generation_config.get("max_context_tokens"),
@@ -723,6 +812,8 @@ def apply_generation_policy(
     tracked_keys.update(generation_config.get("overrides", {}))
     tracked_keys.update(generation_config.get("task_overrides", {}))
     tracked_keys.update({"max_tokens", "max_completion_tokens"})
+    if request_protocol == "mineru_native":
+        tracked_keys.update({"temperature", "top_p"})
     tracked_keys.update(generation_config.get("remove", []))
     for rule in generation_config.get("rules", []):
         if rule.get("name") in matched_rules:
@@ -834,6 +925,17 @@ class ParameterProxyASGI:
         raw_body = await self._read_request_body(receive)
         if raw_body is None:
             return
+        incoming_headers = {
+            key.decode("latin-1").lower(): value.decode("latin-1")
+            for key, value in scope.get("headers", [])
+        }
+        request_max_tokens_cap = None
+        raw_token_cap = incoming_headers.get(INTERNAL_MAX_TOKENS_HEADER)
+        if isinstance(raw_token_cap, str) and raw_token_cap.isdigit():
+            parsed_token_cap = int(raw_token_cap)
+            if parsed_token_cap > 0:
+                request_max_tokens_cap = parsed_token_cap
+        request_protocol = incoming_headers.get(INTERNAL_PROTOCOL_HEADER)
         outgoing_body = raw_body
         applied = AppliedGenerationPolicy({}, (), {})
         request_json: dict[str, Any] | None = None
@@ -846,7 +948,13 @@ class ParameterProxyASGI:
                 parsed = None
             if isinstance(parsed, dict):
                 request_json = parsed
-                applied = apply_generation_policy(endpoint_path, parsed, self.generation)
+                applied = apply_generation_policy(
+                    endpoint_path,
+                    parsed,
+                    self.generation,
+                    request_max_tokens_cap=request_max_tokens_cap,
+                    request_protocol=request_protocol,
+                )
                 outgoing_body = json.dumps(applied.body, ensure_ascii=False).encode("utf-8")
 
         headers = {
@@ -1488,10 +1596,23 @@ def fuse_output_trees(
                     or recognizer_config.get("base_url")
                     or proxy_url
                 )
+                recovery_kwargs = {}
+                if (
+                    recognizer is not None
+                    and recovery_config.get("share_recognizer_page_cache", True)
+                ):
+                    shared_provider = getattr(
+                        recognizer,
+                        "target_crop_provider",
+                        None,
+                    )
+                    if shared_provider is not None:
+                        recovery_kwargs["page_provider"] = shared_provider
                 recovery_reviewer = OpenAIBBoxRecoveryReviewer(
                     recovery_base_url,
                     document_path,
                     effective_recovery_config,
+                    **recovery_kwargs,
                 )
             hybrid_middle = json.loads(hybrid_path.read_text(encoding="utf-8"))
             ocr_middle = json.loads(ocr_path.read_text(encoding="utf-8"))
@@ -2467,37 +2588,86 @@ def run_doctor(config: Mapping[str, Any]) -> dict[str, Any]:
             recognizer_status["max_model_len"] = (
                 min(context_lengths) if context_lengths else None
             )
-            openapi_response = httpx.get(
-                recognizer_url + "/openapi.json",
-                headers=recognizer_headers,
-                timeout=3.0,
+            effective_model = (
+                configured_model
+                if isinstance(configured_model, str) and configured_model
+                else model_ids[0] if model_ids else ""
             )
-            openapi = openapi_response.json() if openapi_response.is_success else {}
-            schemas = (
-                openapi.get("components", {}).get("schemas", {})
-                if isinstance(openapi, dict)
-                else {}
-            )
-            request_properties = (
-                schemas.get("ChatCompletionRequest", {}).get("properties", {})
-                if isinstance(schemas, dict)
-                else {}
-            )
-            mode = recognizer_status["structured_output_mode"]
-            if mode == "none":
-                structured_supported = True
-            elif mode in {"structured_outputs", "regex"}:
-                structured_supported = "structured_outputs" in request_properties
-            elif mode == "json_object":
-                structured_supported = "response_format" in request_properties
-            else:
-                response_format_enum = (
-                    schemas.get("ResponseFormat", {})
-                    .get("properties", {})
-                    .get("type", {})
-                    .get("enum", [])
+            protocol = str(recognizer_config.get("protocol", "auto"))
+            if protocol == "auto":
+                protocol = (
+                    "mineru_native"
+                    if "mineru" in effective_model.casefold()
+                    else "structured"
                 )
-                structured_supported = "json_schema" in response_format_enum
+            recognizer_status["protocol"] = protocol
+            recognizer_status["native_runtime"] = {
+                "max_concurrency": recognizer_config.get(
+                    "native_max_concurrency",
+                    2,
+                ),
+                "max_requests_per_page": recognizer_config.get(
+                    "native_max_requests_per_page",
+                    0,
+                ),
+                "max_candidates_per_page": recognizer_config.get(
+                    "native_max_candidates_per_page",
+                    0,
+                ),
+                "max_requests_per_document": recognizer_config.get(
+                    "max_requests_per_document",
+                    80,
+                ),
+                "cache_enabled": recognizer_config.get(
+                    "native_cache_enabled",
+                    False,
+                ),
+                "cache_dir": recognizer_config.get(
+                    "native_cache_dir",
+                    "~/.cache/mineru/custom-hybrid/native-recognition",
+                ),
+                "cache_ttl_seconds": recognizer_config.get(
+                    "native_cache_ttl_seconds",
+                    2592000,
+                ),
+            }
+            if protocol == "mineru_native":
+                recognizer_status["structured_output_mode"] = "mineru_native"
+                structured_supported = True
+            else:
+                openapi_response = httpx.get(
+                    recognizer_url + "/openapi.json",
+                    headers=recognizer_headers,
+                    timeout=3.0,
+                )
+                openapi = (
+                    openapi_response.json() if openapi_response.is_success else {}
+                )
+                schemas = (
+                    openapi.get("components", {}).get("schemas", {})
+                    if isinstance(openapi, dict)
+                    else {}
+                )
+                request_properties = (
+                    schemas.get("ChatCompletionRequest", {}).get("properties", {})
+                    if isinstance(schemas, dict)
+                    else {}
+                )
+                mode = recognizer_status["structured_output_mode"]
+                if mode == "none":
+                    structured_supported = True
+                elif mode in {"structured_outputs", "regex"}:
+                    structured_supported = "structured_outputs" in request_properties
+                elif mode == "json_object":
+                    structured_supported = "response_format" in request_properties
+                else:
+                    response_format_enum = (
+                        schemas.get("ResponseFormat", {})
+                        .get("properties", {})
+                        .get("type", {})
+                        .get("enum", [])
+                    )
+                    structured_supported = "json_schema" in response_format_enum
             recognizer_status["structured_output_supported"] = bool(
                 structured_supported
             )
@@ -2523,6 +2693,9 @@ def run_doctor(config: Mapping[str, Any]) -> dict[str, Any]:
         "enabled": recovery_enabled,
         "ready": not recovery_enabled,
         "capability_trial_required": recovery_enabled,
+        "share_recognizer_page_cache": bool(
+            recovery_config.get("share_recognizer_page_cache", True)
+        ),
     }
     if recovery_enabled:
         recovery_url = str(
@@ -2589,28 +2762,47 @@ def run_doctor(config: Mapping[str, Any]) -> dict[str, Any]:
             recovery_status["max_model_len"] = (
                 min(context_lengths) if context_lengths else None
             )
-            openapi_response = httpx.get(
-                recovery_url + "/openapi.json",
-                headers=recovery_headers,
-                timeout=3.0,
+            effective_recovery_model = (
+                configured_recovery_model
+                if isinstance(configured_recovery_model, str)
+                and configured_recovery_model
+                else model_ids[0] if model_ids else ""
             )
-            openapi = openapi_response.json() if openapi_response.is_success else {}
-            schemas = (
-                openapi.get("components", {}).get("schemas", {})
-                if isinstance(openapi, dict)
-                else {}
+            local_mineru_recovery = bool(
+                "mineru" in effective_recovery_model.casefold()
+                and recovery_config.get("local_missing_enabled", True)
+                and recovery_config.get("skip_vlm_for_mineru_models", True)
             )
-            response_format_enum = (
-                schemas.get("ResponseFormat", {})
-                .get("properties", {})
-                .get("type", {})
-                .get("enum", [])
-                if isinstance(schemas, dict)
-                else []
-            )
-            recovery_status["structured_output_supported"] = (
-                "json_schema" in response_format_enum
-            )
+            if local_mineru_recovery:
+                recovery_status["structured_output_mode"] = "local_pixel"
+                recovery_status["protocol"] = "local_pixel"
+                recovery_status["structured_output_supported"] = True
+            else:
+                openapi_response = httpx.get(
+                    recovery_url + "/openapi.json",
+                    headers=recovery_headers,
+                    timeout=3.0,
+                )
+                openapi = (
+                    openapi_response.json() if openapi_response.is_success else {}
+                )
+                schemas = (
+                    openapi.get("components", {}).get("schemas", {})
+                    if isinstance(openapi, dict)
+                    else {}
+                )
+                response_format_enum = (
+                    schemas.get("ResponseFormat", {})
+                    .get("properties", {})
+                    .get("type", {})
+                    .get("enum", [])
+                    if isinstance(schemas, dict)
+                    else []
+                )
+                recovery_status["protocol"] = "json_schema"
+                recovery_status["structured_output_supported"] = (
+                    "json_schema" in response_format_enum
+                )
             recovery_status["ready"] = bool(
                 recovery_status["reachable"]
                 and recovery_status["model_available"]
