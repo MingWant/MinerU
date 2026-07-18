@@ -254,12 +254,13 @@ def create_ui_app(
         )
 
     @app.get("/api/tasks/{task_id}/preview")
-    async def get_preview(task_id: str):
+    async def get_preview(task_id: str, kind: str = "span"):
         return await streamed_task_request(
             task_id,
             "/preview",
             default_media_type="application/pdf",
-            default_disposition=f'inline; filename="{task_id}-span.pdf"',
+            default_disposition=f'inline; filename="{task_id}-{kind}.pdf"',
+            extra_params={"kind": kind},
         )
 
     return app

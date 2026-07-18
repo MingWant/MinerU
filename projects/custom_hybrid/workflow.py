@@ -37,6 +37,14 @@ from projects.custom_hybrid.fusion import (
     fuse_middle_json,
     recover_table_cell_geometry,
 )
+from projects.custom_hybrid.form_detection import (
+    FORM_DETECTOR_VERSION,
+    FormDetectionSettings,
+)
+from projects.custom_hybrid.form_segmentation import (
+    FORM_SEGMENTER_VERSION,
+    annotate_form_structure,
+)
 from projects.custom_hybrid.recognition import OpenAIBBoxRecognizer
 from projects.custom_hybrid.recovery import OpenAIBBoxRecoveryReviewer
 from projects.custom_hybrid.table_fusion import extract_table_snapshots
@@ -212,6 +220,31 @@ def _validate_fusion_config(fusion_config: Any) -> None:
     if mode in {"bbox_vlm", "bbox_vlm_recovery"} and not fusion_config.get("enabled", False):
         raise WorkflowConfigError(
             "fusion.enabled must be true for BBox VLM extraction modes"
+        )
+    form_detection = fusion_config.get("form_detection", {})
+    if not isinstance(form_detection, dict):
+        raise WorkflowConfigError("fusion.form_detection must be a JSON object")
+    if not isinstance(form_detection.get("enabled", True), bool):
+        raise WorkflowConfigError("fusion.form_detection.enabled must be a boolean")
+    render_scale = form_detection.get("render_scale", 2.0)
+    if (
+        isinstance(render_scale, bool)
+        or not isinstance(render_scale, (int, float))
+        or float(render_scale) <= 0
+    ):
+        raise WorkflowConfigError("fusion.form_detection.render_scale must be positive")
+    table_coverage = form_detection.get(
+        "existing_table_coverage_threshold",
+        0.75,
+    )
+    if (
+        isinstance(table_coverage, bool)
+        or not isinstance(table_coverage, (int, float))
+        or not 0 <= float(table_coverage) <= 1
+    ):
+        raise WorkflowConfigError(
+            "fusion.form_detection.existing_table_coverage_threshold must be "
+            "between 0 and 1"
         )
     if not fusion_config.get("enabled", False):
         return
@@ -1566,6 +1599,8 @@ def _generate_fused_visualizations(
 
     from mineru.utils.draw_bbox import (
         BBOX_RENDERER_VERSION,
+        draw_form_cell_bbox,
+        draw_form_region_bbox,
         draw_layout_bbox,
         draw_span_bbox,
     )
@@ -1578,8 +1613,14 @@ def _generate_fused_visualizations(
     pdf_bytes = source_pdf.read_bytes()
     layout_path = parse_dir / f"{document_stem}_layout.pdf"
     span_path = parse_dir / f"{document_stem}_span.pdf"
+    form_path = parse_dir / f"{document_stem}_forms.pdf"
+    form_cell_path = parse_dir / f"{document_stem}_form_cells.pdf"
     span_temp = parse_dir / f".{document_stem}-{uuid.uuid4().hex}-span.pdf"
     layout_temp = parse_dir / f".{document_stem}-{uuid.uuid4().hex}-layout.pdf"
+    form_temp = parse_dir / f".{document_stem}-{uuid.uuid4().hex}-forms.pdf"
+    form_cell_temp = (
+        parse_dir / f".{document_stem}-{uuid.uuid4().hex}-form-cells.pdf"
+    )
 
     try:
         draw_span_bbox(pdf_info, pdf_bytes, str(parse_dir), span_temp.name)
@@ -1594,6 +1635,35 @@ def _generate_fused_visualizations(
 
     generated = [span_path]
     try:
+        draw_form_region_bbox(
+            pdf_info,
+            pdf_bytes,
+            str(parse_dir),
+            form_temp.name,
+        )
+        _validate_visualization_pdf(form_temp, len(pdf_info))
+        form_temp.replace(form_path)
+        generated.append(form_path)
+    except Exception:
+        # The normal span preview remains usable if this diagnostic overlay fails.
+        form_temp.unlink(missing_ok=True)
+    finally:
+        form_temp.unlink(missing_ok=True)
+    try:
+        draw_form_cell_bbox(
+            pdf_info,
+            pdf_bytes,
+            str(parse_dir),
+            form_cell_temp.name,
+        )
+        _validate_visualization_pdf(form_cell_temp, len(pdf_info))
+        form_cell_temp.replace(form_cell_path)
+        generated.append(form_cell_path)
+    except Exception:
+        form_cell_temp.unlink(missing_ok=True)
+    finally:
+        form_cell_temp.unlink(missing_ok=True)
+    try:
         draw_layout_bbox(pdf_info, pdf_bytes, str(parse_dir), layout_temp.name)
         _validate_visualization_pdf(layout_temp, len(pdf_info))
         layout_temp.replace(layout_path)
@@ -1605,7 +1675,14 @@ def _generate_fused_visualizations(
         layout_temp.unlink(missing_ok=True)
     marker_path = parse_dir / f"{document_stem}_visualization.json"
     marker_path.write_text(
-        json.dumps({"bbox_renderer_version": BBOX_RENDERER_VERSION}, indent=2),
+        json.dumps(
+            {
+                "bbox_renderer_version": BBOX_RENDERER_VERSION,
+                "form_detector_version": FORM_DETECTOR_VERSION,
+                "form_segmenter_version": FORM_SEGMENTER_VERSION,
+            },
+            indent=2,
+        ),
         encoding="utf-8",
     )
     return tuple(generated)
@@ -1619,7 +1696,11 @@ def _visualization_renderer_is_current(parse_dir: Path, stem: str) -> bool:
         marker = json.loads(marker_path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return False
-    return marker.get("bbox_renderer_version") == BBOX_RENDERER_VERSION
+    return (
+        marker.get("bbox_renderer_version") == BBOX_RENDERER_VERSION
+        and marker.get("form_detector_version") == FORM_DETECTOR_VERSION
+        and marker.get("form_segmenter_version") == FORM_SEGMENTER_VERSION
+    )
 
 
 def regenerate_fused_visualizations(
@@ -1633,6 +1714,7 @@ def regenerate_fused_visualizations(
     generated = []
     for stem, middle_path in _index_middle_json(root).items():
         metadata_changed = False
+        fused_middle = None
         ocr_path = ocr_files.get(stem)
         if ocr_path is not None:
             fused_middle = json.loads(middle_path.read_text(encoding="utf-8"))
@@ -1641,16 +1723,33 @@ def regenerate_fused_visualizations(
                 fused_middle,
                 ocr_middle,
             )
-            if metadata_changed:
-                middle_path.write_text(
-                    json.dumps(fused_middle, ensure_ascii=False, indent=4),
-                    encoding="utf-8",
+        document_path = documents.get(stem)
+        if document_path is not None:
+            if fused_middle is None:
+                fused_middle = json.loads(middle_path.read_text(encoding="utf-8"))
+            try:
+                structure_report = annotate_form_structure(
+                    fused_middle,
+                    document_path,
                 )
+                metadata_changed = metadata_changed or structure_report["changed"]
+            except Exception:
+                # Old tasks can still repair their normal previews if detection fails.
+                pass
+        if metadata_changed and fused_middle is not None:
+            middle_path.write_text(
+                json.dumps(fused_middle, ensure_ascii=False, indent=4),
+                encoding="utf-8",
+            )
         span_path = middle_path.parent / f"{stem}_span.pdf"
         layout_path = middle_path.parent / f"{stem}_layout.pdf"
+        form_path = middle_path.parent / f"{stem}_forms.pdf"
+        form_cell_path = middle_path.parent / f"{stem}_form_cells.pdf"
         if (
             metadata_changed
             or not span_path.is_file()
+            or not form_path.is_file()
+            or not form_cell_path.is_file()
             or not _visualization_renderer_is_current(middle_path.parent, stem)
         ):
             generated.extend(
@@ -1664,6 +1763,10 @@ def regenerate_fused_visualizations(
             if layout_path.is_file():
                 generated.append(layout_path)
             generated.append(span_path)
+            if form_path.is_file():
+                generated.append(form_path)
+            if form_cell_path.is_file():
+                generated.append(form_cell_path)
     return tuple(generated)
 
 
@@ -1686,6 +1789,11 @@ def fuse_output_trees(
     verifier_config = fusion_config.get("verifier", {})
     recognizer_config = fusion_config.get("recognizer", {})
     recovery_config = fusion_config.get("recovery", {})
+    form_detection_config = fusion_config.get("form_detection", {})
+    form_detection_enabled = form_detection_config.get("enabled", True)
+    form_detection_settings = FormDetectionSettings.from_mapping(
+        form_detection_config
+    )
     summary = {"documents": {}, "failed": {}}
 
     for stem, hybrid_path in hybrid_files.items():
@@ -1758,6 +1866,36 @@ def fuse_output_trees(
                     recovery_reviewer if recovery_reviewer else None
                 ),
             )
+            if form_detection_enabled:
+                if document_path is None:
+                    report["form_detection"] = {
+                        "status": "skipped",
+                        "reason": "source_document_unavailable",
+                    }
+                    report["form_segmentation"] = {
+                        "status": "skipped",
+                        "reason": "source_document_unavailable",
+                    }
+                else:
+                    try:
+                        structure_report = annotate_form_structure(
+                            fused_middle,
+                            document_path,
+                            form_detection_settings,
+                        )
+                        report["form_detection"] = structure_report[
+                            "form_detection"
+                        ]
+                        report["form_segmentation"] = structure_report[
+                            "form_segmentation"
+                        ]
+                    except Exception as exc:
+                        error_report = {
+                            "status": "error",
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                        report["form_detection"] = error_report
+                        report["form_segmentation"] = dict(error_report)
             fused_path.write_text(
                 json.dumps(fused_middle, ensure_ascii=False, indent=4),
                 encoding="utf-8",
@@ -1776,6 +1914,8 @@ def fuse_output_trees(
                 "middle_json": str(fused_path),
                 "report": str(report_path),
                 "counts": report["counts"],
+                "form_detection": report.get("form_detection"),
+                "form_segmentation": report.get("form_segmentation"),
                 "artifacts": [str(path) for path in generated_files],
             }
         except Exception as exc:

@@ -49,6 +49,7 @@ class CustomHybridApiTests(unittest.TestCase):
         (fused / "images").mkdir()
         (fused / "images" / "page.png").write_bytes(b"image-data")
         (fused / "document_span.pdf").write_bytes(b"bbox-pdf")
+        (fused / "document_form_cells.pdf").write_bytes(b"form-cell-pdf")
         (output_root / "fusion_summary.json").write_text(
             json.dumps({"documents": input_names, "failed": {}}),
             encoding="utf-8",
@@ -139,6 +140,13 @@ class CustomHybridApiTests(unittest.TestCase):
                 self.assertEqual(preview.status_code, 200)
                 self.assertEqual(preview.content, b"bbox-pdf")
                 self.assertEqual(preview.headers["content-type"], "application/pdf")
+                form_cells = client.get(
+                    f"/tasks/{task_id}/preview",
+                    params={"kind": "form_cells"},
+                    headers=headers,
+                )
+                self.assertEqual(form_cells.status_code, 200)
+                self.assertEqual(form_cells.content, b"form-cell-pdf")
                 markdown = client.get(
                     f"/tasks/{task_id}/markdown",
                     headers=headers,

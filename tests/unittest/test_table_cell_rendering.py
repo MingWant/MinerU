@@ -207,3 +207,88 @@ def test_span_bbox_renderer_draws_key_and_value_boxes(monkeypatch, tmp_path):
 
     assert rendered_keys == [[20, 20, 80, 35]]
     assert rendered_values == [[100, 20, 150, 35]]
+
+
+def test_form_region_renderer_draws_only_detected_outer_regions(monkeypatch, tmp_path):
+    rendered_regions = []
+
+    def record_bbox(i, bbox_list, page, pdf_canvas, rgb_config, fill_config):
+        if rgb_config == [128, 0, 255]:
+            rendered_regions.extend(bbox_list[i])
+        return pdf_canvas
+
+    monkeypatch.setattr(draw_bbox_module, "draw_bbox_without_number", record_bbox)
+    pdf_info = [
+        {
+            "form_regions": [
+                {
+                    "bbox": [20, 25, 180, 175],
+                    "confidence": 0.99,
+                    "evidence": {
+                        "horizontal_rules": 8,
+                        "vertical_borders": 2,
+                        "enclosure_ratio": 1.0,
+                    },
+                }
+            ],
+            "preproc_blocks": [
+                {"type": BlockType.TEXT, "bbox": [40, 40, 100, 60]}
+            ],
+        }
+    ]
+
+    draw_bbox_module.draw_form_region_bbox(
+        pdf_info,
+        _blank_pdf_bytes(),
+        str(tmp_path),
+        "form-regions.pdf",
+    )
+
+    assert rendered_regions == [[20, 25, 180, 175]]
+
+
+def test_form_cell_renderer_draws_outer_region_and_cyan_cells(monkeypatch, tmp_path):
+    rendered_regions = []
+    rendered_cells = []
+    rendered_recognition_bboxes = []
+
+    def record_bbox(i, bbox_list, page, pdf_canvas, rgb_config, fill_config):
+        if rgb_config == [128, 0, 255]:
+            rendered_regions.extend(bbox_list[i])
+        elif rgb_config == [0, 180, 255]:
+            rendered_cells.extend(bbox_list[i])
+        elif rgb_config == [30, 90, 255]:
+            rendered_recognition_bboxes.extend(bbox_list[i])
+        return pdf_canvas
+
+    monkeypatch.setattr(draw_bbox_module, "draw_bbox_without_number", record_bbox)
+    pdf_info = [
+        {
+            "form_regions": [{"bbox": [20, 20, 180, 180]}],
+            "form_cells": [
+                {"bbox": [20, 20, 180, 80], "kind": "semantic_row"},
+                {
+                    "bbox": [20, 80, 100, 180],
+                    "recognition_bbox": [20, 75, 108, 180],
+                    "recognition_overflow": True,
+                    "kind": "field_cell",
+                },
+                {"bbox": [100, 80, 180, 180], "kind": "field_cell"},
+            ],
+        }
+    ]
+
+    draw_bbox_module.draw_form_cell_bbox(
+        pdf_info,
+        _blank_pdf_bytes(),
+        str(tmp_path),
+        "form-cells.pdf",
+    )
+
+    assert rendered_regions == [[20, 20, 180, 180]]
+    assert rendered_cells == [
+        [20, 20, 180, 80],
+        [20, 80, 100, 180],
+        [100, 80, 180, 180],
+    ]
+    assert rendered_recognition_bboxes == [[20, 75, 108, 180]]

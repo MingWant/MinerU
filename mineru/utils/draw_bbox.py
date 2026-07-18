@@ -35,7 +35,7 @@ DIRECT_LAYOUT_BBOX_BLOCK_TYPES = TEXT_LIKE_BLOCK_TYPES_FOR_BBOX | {
 
 # span.pdf 从这些结构性 block 中收集内部 span bbox。
 SPAN_SOURCE_BLOCK_TYPES = DIRECT_LAYOUT_BBOX_BLOCK_TYPES
-BBOX_RENDERER_VERSION = 4
+BBOX_RENDERER_VERSION = 6
 
 
 def _get_layout_source_blocks(page):
@@ -180,6 +180,123 @@ def draw_bbox_with_number(i, bbox_list, page, c, rgb_config, fill_config, draw_b
         c.restoreState()
 
     return c
+
+
+def draw_form_region_bbox(pdf_info, pdf_bytes, out_path, filename):
+    """Render only independently detected Form/Table outer regions."""
+
+    form_region_list = []
+    for page_info in pdf_info:
+        page_regions = []
+        for region in page_info.get("form_regions", []):
+            if isinstance(region, dict):
+                page_regions.append(region.get("bbox"))
+        form_region_list.append(_deduplicate_bboxes(page_regions))
+
+    pdf_docs = PdfReader(BytesIO(pdf_bytes))
+    output_pdf = PdfWriter()
+    for page_index, page in enumerate(pdf_docs.pages):
+        page_width, page_height = float(page.cropbox[2]), float(page.cropbox[3])
+        packet = BytesIO()
+        overlay_canvas = canvas.Canvas(packet, pagesize=(page_width, page_height))
+        overlay_canvas.setLineWidth(2)
+        draw_bbox_without_number(
+            page_index,
+            form_region_list,
+            page,
+            overlay_canvas,
+            [128, 0, 255],
+            False,
+        )
+        overlay_canvas.save()
+        packet.seek(0)
+        overlay_pdf = PdfReader(packet)
+        if overlay_pdf.pages:
+            new_page = PageObject(pdf=None)
+            new_page.update(page)
+            page = new_page
+            page.merge_page(overlay_pdf.pages[0])
+        output_pdf.add_page(page)
+
+    with open(f"{out_path}/{filename}", "wb") as stream:
+        output_pdf.write(stream)
+
+
+def draw_form_cell_bbox(pdf_info, pdf_bytes, out_path, filename):
+    """Render Form regions, structural Cells, and expanded recognition crops."""
+
+    form_region_list = []
+    form_cell_list = []
+    recognition_bbox_list = []
+    for page_info in pdf_info:
+        page_regions = [
+            region.get("bbox")
+            for region in page_info.get("form_regions", [])
+            if isinstance(region, dict)
+        ]
+        page_cells = [
+            cell.get("bbox")
+            for cell in page_info.get("form_cells", [])
+            if isinstance(cell, dict)
+        ]
+        page_recognition_bboxes = [
+            cell.get("recognition_bbox")
+            for cell in page_info.get("form_cells", [])
+            if isinstance(cell, dict) and cell.get("recognition_overflow") is True
+        ]
+        form_region_list.append(_deduplicate_bboxes(page_regions))
+        form_cell_list.append(_deduplicate_bboxes(page_cells))
+        recognition_bbox_list.append(
+            _deduplicate_bboxes(page_recognition_bboxes)
+        )
+
+    pdf_docs = PdfReader(BytesIO(pdf_bytes))
+    output_pdf = PdfWriter()
+    for page_index, page in enumerate(pdf_docs.pages):
+        page_width, page_height = float(page.cropbox[2]), float(page.cropbox[3])
+        packet = BytesIO()
+        overlay_canvas = canvas.Canvas(packet, pagesize=(page_width, page_height))
+        overlay_canvas.setLineWidth(2)
+        draw_bbox_without_number(
+            page_index,
+            form_region_list,
+            page,
+            overlay_canvas,
+            [128, 0, 255],
+            False,
+        )
+        overlay_canvas.setLineWidth(1.25)
+        draw_bbox_without_number(
+            page_index,
+            form_cell_list,
+            page,
+            overlay_canvas,
+            [0, 180, 255],
+            False,
+        )
+        overlay_canvas.setLineWidth(1)
+        overlay_canvas.setDash(4, 3)
+        draw_bbox_without_number(
+            page_index,
+            recognition_bbox_list,
+            page,
+            overlay_canvas,
+            [30, 90, 255],
+            False,
+        )
+        overlay_canvas.setDash()
+        overlay_canvas.save()
+        packet.seek(0)
+        overlay_pdf = PdfReader(packet)
+        if overlay_pdf.pages:
+            new_page = PageObject(pdf=None)
+            new_page.update(page)
+            page = new_page
+            page.merge_page(overlay_pdf.pages[0])
+        output_pdf.add_page(page)
+
+    with open(f"{out_path}/{filename}", "wb") as stream:
+        output_pdf.write(stream)
 
 
 def draw_layout_bbox(pdf_info, pdf_bytes, out_path, filename):

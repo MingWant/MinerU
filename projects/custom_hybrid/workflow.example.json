@@ -88,6 +88,11 @@
     "unreliable_table_recovery_enabled": true,
     "unreliable_table_allow_unscored_ocr": true,
     "max_unreliable_table_ocr_blocks_per_document": 1000,
+    "form_detection": {
+      "enabled": true,
+      "render_scale": 2.0,
+      "existing_table_coverage_threshold": 0.75
+    },
     "recognizer": {
       "enabled": false,
       "base_url": null,

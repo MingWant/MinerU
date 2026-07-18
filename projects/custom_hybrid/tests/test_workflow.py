@@ -177,7 +177,11 @@ class WorkflowTests(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
-            self.assertEqual(marker["bbox_renderer_version"], 4)
+            self.assertEqual(marker["bbox_renderer_version"], 6)
+            self.assertEqual(marker["form_detector_version"], 1)
+            self.assertEqual(marker["form_segmenter_version"], 4)
+            self.assertTrue((parse_dir / "renamed_forms.pdf").is_file())
+            self.assertTrue((parse_dir / "renamed_form_cells.pdf").is_file())
             self.assertFalse(list(parse_dir.glob(".*-span.pdf")))
 
     def test_real_proxy_rewrites_openai_request_and_writes_safe_audit(self):
@@ -496,6 +500,24 @@ class WorkflowTests(unittest.TestCase):
             config_path = Path(temp_dir) / "invalid.json"
             config_path.write_text(json.dumps(config), encoding="utf-8")
             with self.assertRaisesRegex(WorkflowConfigError, "Invalid text_regex"):
+                load_config(config_path)
+
+    def test_config_rejects_invalid_form_detection_coverage(self):
+        config = json.loads(
+            (Path(__file__).parents[1] / "workflow.example.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        config["fusion"]["form_detection"][
+            "existing_table_coverage_threshold"
+        ] = 1.1
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "invalid.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(
+                WorkflowConfigError,
+                "existing_table_coverage_threshold",
+            ):
                 load_config(config_path)
 
     def test_config_requires_hybrid_http_client(self):

@@ -636,11 +636,23 @@ selector offers `Hybrid Fusion`, `OCR BBox + VLM`, and
 `OCR BBox + VLM Recovery`. After a task completes, the same
 selected files and parameters remain available and Convert changes to Convert
 Again, so rerunning does not require Clear. For PDF inputs, the fused workflow
-generates both `*_layout.pdf` and `*_span.pdf`; Document Preview automatically
-switches to `*_span.pdf`, where OCR content-tight boxes are cyan. Table Cell
-geometry remains in middle JSON and is intentionally not drawn. Use Original /
-Bounding Boxes to switch views. The UI refuses public binding unless
-`--allow-public-bind` is supplied explicitly.
+generates `*_layout.pdf`, `*_span.pdf`, `*_forms.pdf`, and
+`*_form_cells.pdf`; Document Preview automatically switches to `*_span.pdf`,
+where OCR content-tight boxes are cyan. `*_forms.pdf` is a routing-only
+diagnostic: purple boxes show large ruled Form/Table regions detected
+independently of MinerU block types, while regions already covered by MinerU
+Tables are excluded. `*_form_cells.pdf` keeps the purple outer region and adds
+cyan structural leaf Cells. Blue dashed boxes appear only when handwriting or
+other connected ink crosses a Cell boundary; they show the adaptive
+`recognition_bbox` crop intended for VLM recognition and may overlap adjacent
+Cells without changing the structural grid. Full ruled grids use physical
+vertical separators; sparse forms
+use long horizontal rules, aligned field underlines, and only large OCR vertical
+gaps. Parent bands are stored in `form_rows`, leaf recognition targets in
+`form_cells`, and neither stage rewrites layout blocks, Table HTML, or source OCR
+spans. Existing Table Cell geometry remains in middle JSON and is intentionally
+not drawn in `*_span.pdf`. Use Original / Bounding Boxes to switch views. The UI
+refuses public binding unless `--allow-public-bind` is supplied explicitly.
 
 `span.pdf` generation resolves the source PDF from the uploaded task input first
 and then falls back to the fused `*_origin.pdf` artifact. The preview endpoint

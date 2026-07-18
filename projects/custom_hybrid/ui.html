@@ -279,6 +279,9 @@
       .brand small { display: none; }
       .workspace { grid-template-columns: 1fr; }
       .controls-pane, .viewer-pane, .output-pane { min-height: auto; grid-column: auto; }
+      .viewer-pane .panel-header { align-items: stretch; flex-direction: column; padding: 10px 13px; }
+      .viewer-pane .segmented { width: 100%; }
+      .viewer-pane .segmented button { min-width: 0; flex: 1; padding: 4px 5px; white-space: normal; }
       .preview-body { min-height: 500px; }
       .preview-frame, .preview-image { min-height: 480px; }
       .result-panel { min-height: 500px; }
@@ -428,6 +431,7 @@
         <div class="segmented" aria-label="Document view">
           <button id="viewOriginalButton" class="active" disabled>Original</button>
           <button id="viewBboxButton" disabled>Bounding Boxes</button>
+          <button id="viewFormCellsButton" disabled>Form Cells</button>
         </div>
       </div>
       <div class="preview-body">
@@ -534,6 +538,7 @@
   const previewImage = document.querySelector('#previewImage');
   const viewOriginalButton = document.querySelector('#viewOriginalButton');
   const viewBboxButton = document.querySelector('#viewBboxButton');
+  const viewFormCellsButton = document.querySelector('#viewFormCellsButton');
   const documentSelect = document.querySelector('#documentSelect');
   const downloadButton = document.querySelector('#downloadButton');
   const markdownEmpty = document.querySelector('#markdownEmpty');
@@ -650,11 +655,13 @@
     previewImage.removeAttribute('src');
     viewOriginalButton.classList.add('active');
     viewBboxButton.classList.remove('active');
+    viewFormCellsButton.classList.remove('active');
     if (!selectedFiles.length) {
       previewUrl = null;
       emptyPreview.classList.remove('hidden');
       viewOriginalButton.disabled = true;
       viewBboxButton.disabled = true;
+      viewFormCellsButton.disabled = true;
       return;
     }
     const file = selectedFiles[0];
@@ -670,13 +677,14 @@
     }
   }
 
-  function showBoundingBoxPreview(taskId) {
+  function showProcessedPreview(taskId, kind) {
     previewImage.classList.add('hidden');
     emptyPreview.classList.add('hidden');
-    previewFrame.src = `/api/tasks/${encodeURIComponent(taskId)}/preview`;
+    previewFrame.src = `/api/tasks/${encodeURIComponent(taskId)}/preview?kind=${encodeURIComponent(kind)}`;
     previewFrame.classList.remove('hidden');
     viewOriginalButton.classList.remove('active');
-    viewBboxButton.classList.add('active');
+    viewBboxButton.classList.toggle('active', kind === 'span');
+    viewFormCellsButton.classList.toggle('active', kind === 'form_cells');
   }
 
   function activateResultTab(name) {
@@ -695,6 +703,10 @@
   });
 
   function resetResults() {
+    viewBboxButton.disabled = true;
+    viewBboxButton.onclick = null;
+    viewFormCellsButton.disabled = true;
+    viewFormCellsButton.onclick = null;
     markdownEmpty.classList.remove('hidden');
     markdownRender.classList.add('hidden');
     markdownRender.replaceChildren();
@@ -720,6 +732,8 @@
     activeTaskId = null;
     viewBboxButton.disabled = true;
     viewBboxButton.onclick = null;
+    viewFormCellsButton.disabled = true;
+    viewFormCellsButton.onclick = null;
     resetResults();
     renderFiles();
     renderOriginalPreview();
@@ -1054,8 +1068,10 @@
     const isPdf = firstFile && (firstFile.type === 'application/pdf' || firstFile.name.toLowerCase().endsWith('.pdf'));
     if (isPdf) {
       viewBboxButton.disabled = false;
-      viewBboxButton.onclick = () => showBoundingBoxPreview(taskId);
-      showBoundingBoxPreview(taskId);
+      viewFormCellsButton.disabled = false;
+      viewBboxButton.onclick = () => showProcessedPreview(taskId, 'span');
+      viewFormCellsButton.onclick = () => showProcessedPreview(taskId, 'form_cells');
+      showProcessedPreview(taskId, 'form_cells');
     }
     completeThrough('done');
   }

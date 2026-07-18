@@ -830,8 +830,18 @@ def create_app(
         name="get_task_preview",
         dependencies=[Depends(authorize)],
     )
-    async def get_task_preview(task_id: str):
+    async def get_task_preview(task_id: str, kind: str = "span"):
         record = require_completed_task(task_id)
+        suffixes = {
+            "span": "*_span.pdf",
+            "form_cells": "*_form_cells.pdf",
+        }
+        suffix = suffixes.get(kind)
+        if suffix is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Preview kind must be span or form_cells",
+            )
         try:
             await asyncio.to_thread(
                 regenerate_fused_visualizations,
@@ -843,13 +853,13 @@ def create_app(
                 status_code=500,
                 detail=f"Bounding Box PDF generation failed: {exc}",
             ) from exc
-        previews = sorted((record.output_root / "fused").rglob("*_span.pdf"))
+        previews = sorted((record.output_root / "fused").rglob(suffix))
         if not previews:
             raise HTTPException(
                 status_code=404,
                 detail=(
-                    "No Bounding Box PDF is available; the task has no matching "
-                    "PDF source or origin artifact"
+                    f"No {kind} preview PDF is available; the task has no "
+                    "matching PDF source or generated artifact"
                 ),
             )
         return FileResponse(

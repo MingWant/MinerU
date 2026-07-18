@@ -96,6 +96,7 @@ class CustomHybridUiTests(unittest.TestCase):
                     },
                 )
             if path == "/tasks/abc123/preview":
+                self.assertIn(request.url.params.get("kind"), {"span", "form_cells"})
                 return httpx.Response(
                     200,
                     content=b"bbox-preview",
@@ -120,6 +121,7 @@ class CustomHybridUiTests(unittest.TestCase):
             self.assertIn("dropZone", page.text)
             self.assertIn("Upload & Settings", page.text)
             self.assertIn("Document Preview", page.text)
+            self.assertIn("Form Cells", page.text)
             self.assertIn("Fusion Report", page.text)
             self.assertIn("OCR Spatial Coverage", page.text)
             self.assertIn("Key–Value Pairs", page.text)
@@ -204,6 +206,11 @@ class CustomHybridUiTests(unittest.TestCase):
             self.assertEqual(preview.content, b"bbox-preview")
             self.assertEqual(preview.headers["content-type"], "application/pdf")
             self.assertIn("inline", preview.headers["content-disposition"])
+            form_cells = client.get(
+                "/api/tasks/abc123/preview",
+                params={"kind": "form_cells"},
+            )
+            self.assertEqual(form_cells.status_code, 200)
             self.assertEqual(
                 client.delete("/api/tasks/abc123").json(),
                 {"deleted": True},
