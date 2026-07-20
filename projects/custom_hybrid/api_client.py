@@ -110,7 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cost-profile", choices=("balanced", "quality"))
     parser.add_argument(
         "--extraction-mode",
-        choices=("hybrid_fusion", "bbox_vlm", "bbox_vlm_recovery"),
+        choices=("hybrid_fusion", "bbox_vlm"),
     )
     parser.add_argument("--recovery-max-tables", type=int)
     parser.add_argument("--recovery-max-proposals", type=int)

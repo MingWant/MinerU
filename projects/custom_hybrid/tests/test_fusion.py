@@ -96,10 +96,10 @@ def structured_middle(
 
 
 class FusionTests(unittest.TestCase):
-    def test_bbox_vlm_recovery_settings_enable_reviewer_and_table_recognizer(self):
+    def test_bbox_vlm_settings_enable_repair_and_table_recognizer(self):
         settings = FusionSettings.from_mapping(
             {
-                "mode": "bbox_vlm_recovery",
+                "mode": "bbox_vlm",
                 "recognizer": {"enabled": False, "normal_ocr_enabled": True},
                 "recovery": {"enabled": False},
             }
@@ -110,6 +110,9 @@ class FusionTests(unittest.TestCase):
         self.assertFalse(settings.bbox_recognition_normal_ocr_enabled)
         self.assertTrue(settings.bbox_recognition_table_ocr_enabled)
         self.assertEqual(settings.bbox_recognition_selection_policy, "vlm_primary")
+        legacy = FusionSettings.from_mapping({"mode": "bbox_vlm_recovery"})
+        self.assertEqual(legacy.mode, "bbox_vlm")
+        self.assertTrue(legacy.bbox_recovery_enabled)
 
     def test_bbox_recovery_manifest_and_safety_gate_preserve_table_grid(self):
         cells = [
@@ -144,7 +147,7 @@ class FusionTests(unittest.TestCase):
             "missing_content_bbox",
             "metadata_text_without_bbox",
         ])
-        settings = FusionSettings.from_mapping({"mode": "bbox_vlm_recovery"})
+        settings = FusionSettings.from_mapping({"mode": "bbox_vlm"})
         stats, decisions, _batches, unchanged = apply_bbox_recovery_proposals(
             page,
             0,
@@ -201,7 +204,7 @@ class FusionTests(unittest.TestCase):
             [110, 18, 175, 32],
         )
 
-    def test_bbox_vlm_recovery_adds_box_then_transcribes_isolated_empty_crop(self):
+    def test_bbox_vlm_repairs_box_then_transcribes_isolated_empty_crop(self):
         pipeline = structured_middle(
             "table",
             html="<table><tr><td></td></tr></table>",
@@ -255,7 +258,7 @@ class FusionTests(unittest.TestCase):
         fused, report = fuse_middle_json(
             pipeline,
             pipeline,
-            FusionSettings.from_mapping({"mode": "bbox_vlm_recovery"}),
+            FusionSettings.from_mapping({"mode": "bbox_vlm"}),
             bbox_recovery_reviewer=review,
             bbox_recognizer=recognize,
         )
@@ -272,7 +275,7 @@ class FusionTests(unittest.TestCase):
             report["recovery_invariants"]["table_and_cell_geometry_unchanged"]
         )
 
-    def test_bbox_vlm_recovery_adds_and_transcribes_table_orphan(self):
+    def test_bbox_vlm_repairs_and_transcribes_table_orphan(self):
         pipeline = structured_middle(
             "table",
             html="<table><tr><td>Header</td></tr></table>",
@@ -324,7 +327,7 @@ class FusionTests(unittest.TestCase):
         fused, report = fuse_middle_json(
             pipeline,
             pipeline,
-            FusionSettings.from_mapping({"mode": "bbox_vlm_recovery"}),
+            FusionSettings.from_mapping({"mode": "bbox_vlm"}),
             bbox_recovery_reviewer=review,
             bbox_recognizer=recognize,
         )
@@ -381,7 +384,7 @@ class FusionTests(unittest.TestCase):
                     }
                 ]
             },
-            FusionSettings.from_mapping({"mode": "bbox_vlm_recovery"}),
+            FusionSettings.from_mapping({"mode": "bbox_vlm"}),
             remaining_document_budget=10,
         )
 
@@ -439,7 +442,7 @@ class FusionTests(unittest.TestCase):
         fused, report = fuse_middle_json(
             pipeline,
             pipeline,
-            FusionSettings.from_mapping({"mode": "bbox_vlm_recovery"}),
+            FusionSettings.from_mapping({"mode": "bbox_vlm"}),
             bbox_recovery_reviewer=review,
             bbox_recognizer=recognize,
         )
@@ -476,7 +479,7 @@ class FusionTests(unittest.TestCase):
                 }
             ],
         )["pdf_info"][0]
-        settings = FusionSettings.from_mapping({"mode": "bbox_vlm_recovery"})
+        settings = FusionSettings.from_mapping({"mode": "bbox_vlm"})
         stats, decisions, _batches, unchanged = apply_bbox_recovery_proposals(
             page,
             0,

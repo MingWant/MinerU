@@ -837,10 +837,10 @@ class WorkflowTests(unittest.TestCase):
         )
         stop_proxy.assert_called_once_with(server, thread)
 
-    def test_bbox_vlm_recovery_extract_uses_pipeline_only(self):
+    def test_bbox_vlm_repair_extract_uses_pipeline_only(self):
         config = load_config(Path(__file__).parents[1] / "workflow.example.json")
-        config["fusion"]["mode"] = "bbox_vlm_recovery"
-        config["fusion"]["recovery"]["enabled"] = True
+        config["fusion"]["mode"] = "bbox_vlm"
+        config["fusion"]["recovery"]["enabled"] = False
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             input_path = root / "input.pdf"
@@ -971,7 +971,7 @@ class WorkflowTests(unittest.TestCase):
 
         config = load_config(Path(__file__).parents[1] / "workflow.example.json")
         config["vllm"]["upstream_url"] = "http://vision.test"
-        config["fusion"]["mode"] = "bbox_vlm_recovery"
+        config["fusion"]["mode"] = "bbox_vlm"
         models = Response(
             {
                 "data": [
@@ -1005,7 +1005,7 @@ class WorkflowTests(unittest.TestCase):
 
         config = load_config(Path(__file__).parents[1] / "workflow.example.json")
         config["vllm"]["upstream_url"] = "http://vision.test"
-        config["fusion"]["mode"] = "bbox_vlm_recovery"
+        config["fusion"]["mode"] = "bbox_vlm"
         config["fusion"]["recognizer"]["model"] = "document-vision"
         recovery = config["fusion"]["recovery"]
         recovery["base_url"] = "http://recovery.test"
@@ -1388,7 +1388,7 @@ class WorkflowTests(unittest.TestCase):
             }
 
         config = load_config(Path(__file__).parents[1] / "workflow.example.json")
-        config["fusion"]["mode"] = "bbox_vlm_recovery"
+        config["fusion"]["mode"] = "bbox_vlm"
         config["fusion"]["recognizer"]["base_url"] = "http://vision.test"
         config["fusion"]["recovery"].update(
             {

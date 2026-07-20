@@ -69,7 +69,8 @@ GENERATION_PARAMETER_LIMITS = {
     "repetition_penalty": (0.01, 2.0),
 }
 COST_PROFILES = {"balanced", "quality"}
-EXTRACTION_MODES = {"hybrid_fusion", "bbox_vlm", "bbox_vlm_recovery"}
+EXTRACTION_MODES = {"hybrid_fusion", "bbox_vlm"}
+LEGACY_EXTRACTION_MODE_ALIASES = {"bbox_vlm_recovery": "bbox_vlm"}
 DEFAULT_COST_PROFILE = "balanced"
 BALANCED_FUSION_OVERRIDES = {
     "max_verifications_per_document": 0,
@@ -107,7 +108,15 @@ BBOX_VLM_FUSION_OVERRIDES = {
         "max_image_limit_retries": 2,
     },
     "verifier": {"enabled": False},
-    "recovery": {"enabled": False},
+    # BBox repair is an OCR post-processing stage, not a separate extraction
+    # mode. Keep it on whenever the bbox-conditioned pipeline is selected.
+    "recovery": {
+        "enabled": True,
+        "max_tables_per_document": 3,
+        "max_proposals_per_document": 100,
+        "max_proposals_per_table": 30,
+        "max_requests_per_document": 3,
+    },
     "reconciliation": {"enabled": False},
 }
 
@@ -334,15 +343,18 @@ def _normalize_task_parameters(
             generation["max_tokens"] = 2048
             fusion.update(copy.deepcopy(BALANCED_FUSION_OVERRIDES))
     if extraction_mode is not None:
+        extraction_mode = LEGACY_EXTRACTION_MODE_ALIASES.get(
+            extraction_mode,
+            extraction_mode,
+        )
         if extraction_mode not in EXTRACTION_MODES:
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "extraction_mode must be hybrid_fusion, bbox_vlm, or "
-                    "bbox_vlm_recovery"
+                    "extraction_mode must be hybrid_fusion or bbox_vlm"
                 ),
             )
-        if extraction_mode in {"bbox_vlm", "bbox_vlm_recovery"}:
+        if extraction_mode == "bbox_vlm":
             bbox_vlm_overrides = copy.deepcopy(BBOX_VLM_FUSION_OVERRIDES)
             bbox_vlm_overrides["recognizer"]["include_table_image"] = (
                 cost_profile == "quality"
@@ -372,23 +384,18 @@ def _normalize_task_parameters(
                     "native_cache_enabled": True,
                 }
             )
-            if extraction_mode == "bbox_vlm_recovery":
-                bbox_vlm_overrides["mode"] = "bbox_vlm_recovery"
-                bbox_vlm_overrides["recovery"] = {
-                    "enabled": True,
+            bbox_vlm_overrides["recovery"].update(
+                {
                     "max_tables_per_document": 10
                     if cost_profile == "quality"
                     else 3,
-                    "max_proposals_per_document": 100
-                    if cost_profile == "quality"
-                    else 100,
-                    "max_proposals_per_table": 30
-                    if cost_profile == "quality"
-                    else 30,
+                    "max_proposals_per_document": 100,
+                    "max_proposals_per_table": 30,
                     "max_requests_per_document": 10
                     if cost_profile == "quality"
                     else 3,
                 }
+            )
             fusion.update(bbox_vlm_overrides)
         else:
             fusion["mode"] = "hybrid_fusion"
@@ -445,14 +452,13 @@ def _normalize_task_parameters(
             )
         generation["max_tokens"] = max_tokens
         recognizer_generation["max_tokens"] = max_tokens
-    if extraction_mode in {"bbox_vlm", "bbox_vlm_recovery"} and recognizer_generation:
+    if extraction_mode == "bbox_vlm" and recognizer_generation:
         recognizer_overrides = fusion.setdefault("recognizer", {})
         if isinstance(recognizer_overrides, dict):
             recognizer_overrides.update(recognizer_generation)
-        if extraction_mode == "bbox_vlm_recovery":
-            recovery_overrides = fusion.setdefault("recovery", {})
-            if isinstance(recovery_overrides, dict):
-                recovery_overrides.update(recognizer_generation)
+        recovery_overrides = fusion.setdefault("recovery", {})
+        if isinstance(recovery_overrides, dict):
+            recovery_overrides.update(recognizer_generation)
     recovery_overrides = fusion.setdefault("recovery", {}) if any(
         value is not None
         for value in (
@@ -540,12 +546,17 @@ def _task_parameter_defaults(
             return overrides[name]
         return defaults.get(name)
 
+    configured_mode = effective_config.get("fusion", {}).get(
+        "mode",
+        "hybrid_fusion",
+    )
+    extraction_mode = LEGACY_EXTRACTION_MODE_ALIASES.get(
+        configured_mode,
+        configured_mode,
+    )
     return {
         "cost_profile": cost_profile,
-        "extraction_mode": effective_config.get("fusion", {}).get(
-            "mode",
-            "hybrid_fusion",
-        ),
+        "extraction_mode": extraction_mode,
         "mineru": {
             "effort": mineru_config.get("effort", "medium"),
             "method": mineru_config.get("method", "auto"),

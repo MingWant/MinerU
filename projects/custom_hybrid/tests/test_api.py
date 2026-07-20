@@ -486,6 +486,13 @@ class CustomHybridApiTests(unittest.TestCase):
         self.assertEqual(fusion["recognizer"]["top_p"], 0.9)
         self.assertEqual(fusion["recognizer"]["seed"], 123)
         self.assertEqual(fusion["recognizer"]["max_tokens"], 768)
+        self.assertTrue(fusion["recovery"]["enabled"])
+        self.assertEqual(fusion["recovery"]["max_tables_per_document"], 3)
+        self.assertEqual(fusion["recovery"]["max_requests_per_document"], 3)
+        self.assertEqual(fusion["recovery"]["temperature"], 0.2)
+        self.assertEqual(fusion["recovery"]["top_p"], 0.9)
+        self.assertEqual(fusion["recovery"]["seed"], 123)
+        self.assertEqual(fusion["recovery"]["max_tokens"], 768)
         self.assertFalse(fusion["verifier"]["enabled"])
         self.assertFalse(fusion["reconciliation"]["enabled"])
 
@@ -513,7 +520,9 @@ class CustomHybridApiTests(unittest.TestCase):
             recovery_max_proposals=40,
             recovery_min_confidence=0.9,
         )
-        self.assertEqual(recovery["fusion"]["mode"], "bbox_vlm_recovery")
+        # The old recovery value remains accepted as a compatibility alias, but
+        # it resolves to the single OCR -> repair -> VLM pipeline.
+        self.assertEqual(recovery["fusion"]["mode"], "bbox_vlm")
         self.assertTrue(recovery["fusion"]["recovery"]["enabled"])
         self.assertEqual(
             recovery["fusion"]["recovery"]["max_tables_per_document"],
@@ -594,7 +603,7 @@ class CustomHybridApiTests(unittest.TestCase):
         self.assertEqual(args.cost_profile, "balanced")
         self.assertEqual(args.extraction_mode, "bbox_vlm")
 
-        recovery_args = build_parser().parse_args(
+        bbox_args = build_parser().parse_args(
             [
                 "--url",
                 "http://127.0.0.1:6108",
@@ -603,16 +612,16 @@ class CustomHybridApiTests(unittest.TestCase):
                 "--output",
                 "result.zip",
                 "--extraction-mode",
-                "bbox_vlm_recovery",
+                "bbox_vlm",
                 "--recovery-max-tables",
                 "4",
                 "--recovery-min-confidence",
                 "0.9",
             ]
         )
-        self.assertEqual(recovery_args.extraction_mode, "bbox_vlm_recovery")
-        self.assertEqual(recovery_args.recovery_max_tables, 4)
-        self.assertEqual(recovery_args.recovery_min_confidence, 0.9)
+        self.assertEqual(bbox_args.extraction_mode, "bbox_vlm")
+        self.assertEqual(bbox_args.recovery_max_tables, 4)
+        self.assertEqual(bbox_args.recovery_min_confidence, 0.9)
 
 
 if __name__ == "__main__":

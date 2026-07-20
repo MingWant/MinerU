@@ -45,7 +45,7 @@ class CustomHybridUiTests(unittest.TestCase):
                 self.assertIn(b'name="cost_profile"', body)
                 self.assertIn(b"balanced", body)
                 self.assertIn(b'name="extraction_mode"', body)
-                self.assertIn(b"bbox_vlm_recovery", body)
+                self.assertIn(b"bbox_vlm", body)
                 self.assertIn(b'name="recovery_max_tables"', body)
                 self.assertIn(b"4", body)
                 self.assertIn(b'name="recovery_min_confidence"', body)
@@ -151,8 +151,8 @@ class CustomHybridUiTests(unittest.TestCase):
             self.assertIn("Convert Again", page.text)
             self.assertIn('id="costProfileInput"', page.text)
             self.assertIn('id="extractionModeInput"', page.text)
-            self.assertIn("OCR BBox + VLM", page.text)
-            self.assertIn("OCR BBox + VLM Recovery", page.text)
+            self.assertIn("OCR + BBox Repair + VLM", page.text)
+            self.assertNotIn("bbox_vlm_recovery", page.text)
             self.assertIn('id="effortInput"', page.text)
             self.assertIn('id="temperatureInput"', page.text)
             self.assertIn('id="seedInput"', page.text)
@@ -165,7 +165,7 @@ class CustomHybridUiTests(unittest.TestCase):
                 files={"files": ("invoice.pdf", b"pdf")},
                 data={
                     "cost_profile": "balanced",
-                    "extraction_mode": "bbox_vlm_recovery",
+                    "extraction_mode": "bbox_vlm",
                     "effort": "medium",
                     "temperature": "0.25",
                     "seed": "123",

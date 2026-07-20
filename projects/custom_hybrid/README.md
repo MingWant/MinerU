@@ -110,13 +110,13 @@ default `fusion.mode=hybrid_fusion` runs two independent parses:
 - `output/fusion_summary.json`: per-document status and replacement counts.
 
 The alternative `fusion.mode=bbox_vlm` is a Pipeline-owned geometry path. It
-runs only `output/ocr`, skips the full-page Hybrid parse, sends the Pipeline
-Table content bboxes (the cyan boxes) as local crops to the constrained Vision
+runs only `output/ocr`, checks and repairs the OCR content bboxes first, then
+sends the complete repaired bbox set as local crops to the constrained Vision
 recognizer, and writes selected text into `output/fused`. The OCR text is retained
 when the VLM response is missing, malformed, unsafe, or fails a structured-value
-guard. The mode bypasses the ordinary fusion/recovery stages after recognition,
-so it cannot add, move, or resize blocks, Cells, content boxes, or Table grid
-coordinates.
+guard. Repair is part of this same OCR post-processing pipeline: Table/Cell
+geometry and the Table grid remain immutable while missing or incomplete content
+boxes are added or adjusted before recognition.
 
 Each fused parse directory also contains `<document>_fusion.json`, which records
 the bbox, candidates, confidence, similarity, and decision for every conflict.
@@ -163,21 +163,16 @@ Important coverage controls are `recover_missing_ocr_blocks`,
 
 ### Experimental bbox-conditioned VLM recognition
 
-Set `fusion.mode=bbox_vlm` to use bbox-conditioned recognition as the complete
-extraction mode. In this mode the recognizer is forced on, ordinary page-text
-recognition is forced off, Table content-box recognition is forced on, and valid
-VLM text is primary while guarded OCR remains the fallback. Keep
-`fusion.mode=hybrid_fusion` for the existing dual-parse workflow and its
-conservative optional recognizer behavior.
-
-Set `fusion.mode=bbox_vlm_recovery` for the opt-in high-quality geometry recovery
-path. It keeps the same Pipeline-only baseline and local transcription behavior,
-but first inspects Table Cells for visible ink that is missing from, or extends
-beyond, existing content boxes. Blank Cells do not trigger a model request.
-Suspicious Tables are rendered once with gray Cell borders, cyan existing content
-boxes, and red suspicious Cells. A constrained Vision reviewer may return only
-`add` or `adjust` proposals for known Cell/box IDs using rough normalized Table
-coordinates.
+Set `fusion.mode=bbox_vlm` to use the complete ordered bbox pipeline. The
+recognizer is forced on, ordinary page-text recognition is forced off, and Table
+content-box recognition is forced on. Immediately after OCR, the workflow
+inspects Table Cells for visible ink that is missing from, or extends beyond,
+existing content boxes. Blank Cells do not trigger a model request. Suspicious
+Tables are rendered once with gray Cell borders, cyan existing content boxes,
+and red suspicious Cells. A constrained Vision reviewer may return only `add` or
+`adjust` proposals for known Cell/box IDs using rough normalized Table
+coordinates. Repaired boxes are then included in the same recognition request;
+there is no separate recovery extraction mode.
 
 Reviewer coordinates never become final geometry directly. The workflow clips
 them to the immutable Cell boundary, refines them against dark document pixels,
@@ -261,10 +256,10 @@ per-pixel Python loops. Reports and the English UI expose analyzed/skipped Cell
 counts, pixel-analysis time, cache hits/misses, request-budget skips, and native
 network requests.
 
-In `bbox_vlm_recovery` mode, Recovery reuses the recognizer's rendered-page
-cache by default (`share_recognizer_page_cache=true`). Recovery still performs
-its own Cell-local ink analysis and never changes Table/Cell geometry, but it no
-longer renders the same PDF page a second time before native transcription.
+In `bbox_vlm` mode, the bbox repair stage reuses the recognizer's rendered-page
+cache by default (`share_recognizer_page_cache=true`). It performs its own
+Cell-local ink analysis and never changes Table/Cell geometry, but it no longer
+renders the same PDF page a second time before native transcription.
 
 `table_orphan_recovery_enabled=true` also scans only the part of each Table that
 is outside the union of all OCR Cell bboxes. After removing long Table rules and
@@ -524,10 +519,10 @@ profile, which forces `effort=medium`, caps output at 2048 tokens, disables form
 and image analysis, and prevents verifier/recognizer/reconciliation requests. It
 does not disable Table extraction, Pipeline OCR, deterministic fusion, or cyan
 content bboxes. Submit `extraction_mode=bbox_vlm` after either cost profile to
-enable the Pipeline BBox + local VLM path; this task override re-enables only the
-required Table recognizer and disables the unrelated verifier/reconciliation
-requests. Submit `extraction_mode=bbox_vlm_recovery` to add the selective
-geometry-review and pixel-refinement pass before transcription. In BBox VLM
+enable the Pipeline OCR -> bbox repair -> local VLM path; this task override
+enables both the required Table recognizer and the selective geometry-review /
+pixel-refinement pass, while disabling unrelated verifier/reconciliation
+requests. In BBox VLM
 mode with a general structured VLM, `balanced` sends target and row crops while
 keeping whole-Table images off; `quality` also enables the whole-Table context
 image. MinerU-native recognition always sends one target crop only. Both
@@ -567,7 +562,7 @@ curl -X POST \
   -H "Authorization: Bearer $CUSTOM_HYBRID_API_KEY" \
   -F "files=@invoice.pdf" \
   -F "cost_profile=balanced" \
-  -F "extraction_mode=bbox_vlm_recovery" \
+  -F "extraction_mode=bbox_vlm" \
   -F "recovery_max_tables=3" \
   -F "recovery_max_proposals=30" \
   -F "recovery_min_confidence=0.85" \
@@ -590,7 +585,7 @@ python projects/custom_hybrid/api_client.py \
   --input ~/Documents/invoice.pdf \
   --output ~/Documents/invoice-fused.zip \
   --cost-profile balanced \
-  --extraction-mode bbox_vlm_recovery \
+  --extraction-mode bbox_vlm \
   --recovery-max-tables 3 \
   --recovery-max-proposals 30 \
   --recovery-min-confidence 0.85

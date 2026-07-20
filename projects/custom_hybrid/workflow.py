@@ -35,6 +35,7 @@ from projects.custom_hybrid.fusion import (
     FusionSettings,
     OpenAIVisionVerifier,
     fuse_middle_json,
+    normalize_fusion_mode,
     recover_table_cell_geometry,
 )
 from projects.custom_hybrid.form_detection import (
@@ -212,12 +213,14 @@ def _validate_proxy_config(vllm_config: Mapping[str, Any]) -> None:
 def _validate_fusion_config(fusion_config: Any) -> None:
     if not isinstance(fusion_config, dict):
         raise WorkflowConfigError("fusion must be a JSON object")
-    mode = fusion_config.get("mode", "hybrid_fusion")
-    if mode not in {"hybrid_fusion", "bbox_vlm", "bbox_vlm_recovery"}:
+    normalized_mode = normalize_fusion_mode(
+        fusion_config.get("mode", "hybrid_fusion")
+    )
+    if normalized_mode not in {"hybrid_fusion", "bbox_vlm"}:
         raise WorkflowConfigError(
-            "fusion.mode must be hybrid_fusion, bbox_vlm, or bbox_vlm_recovery"
+            "fusion.mode must be hybrid_fusion or bbox_vlm"
         )
-    if mode in {"bbox_vlm", "bbox_vlm_recovery"} and not fusion_config.get("enabled", False):
+    if normalized_mode == "bbox_vlm" and not fusion_config.get("enabled", False):
         raise WorkflowConfigError(
             "fusion.enabled must be true for BBox VLM extraction modes"
         )
@@ -1933,19 +1936,21 @@ def fuse_output_trees(
 def run_extract(config: Mapping[str, Any], input_path: str | Path, output_path: str | Path) -> int:
     fusion_config = config.get("fusion", {})
     fusion_enabled = bool(fusion_config.get("enabled", False))
-    fusion_mode = str(fusion_config.get("mode", "hybrid_fusion"))
+    fusion_mode = normalize_fusion_mode(
+        fusion_config.get("mode", "hybrid_fusion")
+    )
     output_root = Path(output_path).expanduser().resolve()
     if fusion_enabled:
         child_names = (
             ("ocr", "fused")
-            if fusion_mode in {"bbox_vlm", "bbox_vlm_recovery"}
+            if fusion_mode == "bbox_vlm"
             else ("hybrid", "ocr", "fused")
         )
         for child_name in child_names:
             _require_empty_output(output_root / child_name, child_name.capitalize())
     server, thread, proxy_url = _start_parameter_proxy(config)
     try:
-        if fusion_enabled and fusion_mode in {"bbox_vlm", "bbox_vlm_recovery"}:
+        if fusion_enabled and fusion_mode == "bbox_vlm":
             ocr_output = output_root / "ocr"
             fused_output = output_root / "fused"
             _run_mineru_command(build_pipeline_command(config, input_path, ocr_output))
@@ -2767,6 +2772,11 @@ def run_doctor(config: Mapping[str, Any]) -> dict[str, Any]:
         upstream_status["error"] = type(exc).__name__
 
     fusion_config = config.get("fusion", {})
+    fusion_mode = normalize_fusion_mode(
+        fusion_config.get("mode", "hybrid_fusion")
+        if isinstance(fusion_config, Mapping)
+        else "hybrid_fusion"
+    )
     recognizer_config = (
         fusion_config.get("recognizer", {})
         if isinstance(fusion_config, Mapping)
@@ -2783,7 +2793,7 @@ def run_doctor(config: Mapping[str, Any]) -> dict[str, Any]:
             recognizer_config.get("enabled", False)
             or (
                 isinstance(fusion_config, Mapping)
-                and fusion_config.get("mode") in {"bbox_vlm", "bbox_vlm_recovery"}
+                and fusion_mode == "bbox_vlm"
             )
         )
     )
@@ -2952,7 +2962,7 @@ def run_doctor(config: Mapping[str, Any]) -> dict[str, Any]:
             recovery_config.get("enabled", False)
             or (
                 isinstance(fusion_config, Mapping)
-                and fusion_config.get("mode") == "bbox_vlm_recovery"
+                and fusion_mode == "bbox_vlm"
             )
         )
     )

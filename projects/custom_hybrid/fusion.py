@@ -35,7 +35,8 @@ from projects.custom_hybrid.table_fusion import (
 
 
 TEXT_SPAN_TYPES = {"text", "hyperlink"}
-FUSION_MODES = {"hybrid_fusion", "bbox_vlm", "bbox_vlm_recovery"}
+FUSION_MODES = {"hybrid_fusion", "bbox_vlm"}
+LEGACY_FUSION_MODE_ALIASES = {"bbox_vlm_recovery": "bbox_vlm"}
 RECOGNITION_SELECTION_POLICIES = {"conservative", "vlm_primary"}
 TEXT_BLOCK_TYPES = {
     "text",
@@ -57,6 +58,11 @@ TEXT_BLOCK_TYPES = {
     "page_footnote",
     "aside_text",
 }
+
+
+def normalize_fusion_mode(value: Any) -> str:
+    mode = str(value)
+    return LEGACY_FUSION_MODE_ALIASES.get(mode, mode)
 
 
 @dataclass
@@ -141,7 +147,7 @@ class FusionSettings:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "FusionSettings":
-        mode = str(value.get("mode", cls.mode))
+        mode = normalize_fusion_mode(value.get("mode", cls.mode))
         if mode not in FUSION_MODES:
             raise ValueError(
                 f"fusion.mode must be one of {', '.join(sorted(FUSION_MODES))}"
@@ -158,7 +164,7 @@ class FusionSettings:
         selection_policy = str(
             recognizer.get("selection_policy", "conservative")
         )
-        if mode in {"bbox_vlm", "bbox_vlm_recovery"}:
+        if mode == "bbox_vlm":
             selection_policy = "vlm_primary"
         if selection_policy not in RECOGNITION_SELECTION_POLICIES:
             raise ValueError(
@@ -256,17 +262,17 @@ class FusionSettings:
                 reconciliation.get("max_candidates_per_page", 120)
             ),
             bbox_recognition_enabled=(
-                mode in {"bbox_vlm", "bbox_vlm_recovery"}
+                mode == "bbox_vlm"
                 or bool(recognizer.get("enabled", False))
             ),
             bbox_recognition_normal_ocr_enabled=bool(
                 False
-                if mode in {"bbox_vlm", "bbox_vlm_recovery"}
+                if mode == "bbox_vlm"
                 else recognizer.get("normal_ocr_enabled", True)
             ),
             bbox_recognition_table_ocr_enabled=bool(
                 True
-                if mode in {"bbox_vlm", "bbox_vlm_recovery"}
+                if mode == "bbox_vlm"
                 else recognizer.get("table_ocr_enabled", True)
             ),
             bbox_recognition_prefer_vlm_for_unscored=bool(
@@ -313,7 +319,7 @@ class FusionSettings:
                 recognizer.get("recovered_empty_min_confidence", 0.9)
             ),
             bbox_recovery_enabled=(
-                mode == "bbox_vlm_recovery"
+                mode == "bbox_vlm"
                 or bool(recovery.get("enabled", False))
             ),
             bbox_recovery_min_confidence=float(
@@ -3553,10 +3559,9 @@ def fuse_middle_json(
             recognition_table_structure_unchanged &= (
                 recognition_invariant_before[1] == recognition_invariant_after[1]
             )
-        if settings.mode in {"bbox_vlm", "bbox_vlm_recovery"}:
-            # This mode deliberately bypasses the normal Hybrid/OCR fusion stages.
-            # The recognized Pipeline page already contains the selected text while
-            # retaining every Pipeline-owned bbox and Table grid coordinate.
+        if settings.mode == "bbox_vlm":
+            # BBox VLM is one ordered Pipeline: OCR geometry, bbox repair, then
+            # recognition. The resulting page retains Pipeline-owned Table grids.
             hybrid_pages[page_index] = copy.deepcopy(ocr_page)
             continue
         apply_structured_fallbacks(

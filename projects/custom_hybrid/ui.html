@@ -324,8 +324,7 @@
               <label for="extractionModeInput">Extraction Mode</label>
               <select id="extractionModeInput">
                 <option value="hybrid_fusion" selected>Hybrid Fusion</option>
-                <option value="bbox_vlm">OCR BBox + VLM</option>
-                <option value="bbox_vlm_recovery">OCR BBox + VLM Recovery</option>
+                <option value="bbox_vlm">OCR + BBox Repair + VLM</option>
               </select>
             </div>
             <div class="field field-wide">
@@ -630,7 +629,7 @@
   }
 
   function syncRecoveryControls() {
-    const enabled = extractionModeInput.value === 'bbox_vlm_recovery';
+    const enabled = extractionModeInput.value === 'bbox_vlm';
     recoverySettings.classList.toggle('disabled', !enabled);
     recoveryInputs.forEach(input => { input.disabled = taskBusy || !enabled; });
   }
@@ -960,10 +959,8 @@
       setStage('queue', ['prepare', 'service', 'upload']);
     } else if (status.status === 'processing') {
       message.textContent = extractionModeInput.value === 'bbox_vlm'
-        ? 'Running Pipeline OCR, local Table BBox recognition, and safe text fusion.'
-        : extractionModeInput.value === 'bbox_vlm_recovery'
-          ? 'Reviewing suspicious Table geometry, recovering content boxes, and transcribing local crops.'
-          : 'Running Hybrid extraction, Pipeline OCR, and fusion.';
+        ? 'Running Pipeline OCR, repairing missing content boxes, then transcribing the repaired crops.'
+        : 'Running Hybrid extraction, Pipeline OCR, and fusion.';
       setStage('parse', ['prepare', 'service', 'upload', 'queue']);
     } else if (status.status === 'completed') {
       message.textContent = 'Conversion completed. You can convert the same files again.';
@@ -1158,9 +1155,9 @@
       seed: seedInput.value,
       max_tokens: maxTokensInput.value,
       repetition_penalty: repetitionPenaltyInput.value,
-      recovery_max_tables: extractionModeInput.value === 'bbox_vlm_recovery' ? recoveryMaxTablesInput.value : '',
-      recovery_max_proposals: extractionModeInput.value === 'bbox_vlm_recovery' ? recoveryMaxProposalsInput.value : '',
-      recovery_min_confidence: extractionModeInput.value === 'bbox_vlm_recovery' ? recoveryMinConfidenceInput.value : '',
+      recovery_max_tables: extractionModeInput.value === 'bbox_vlm' ? recoveryMaxTablesInput.value : '',
+      recovery_max_proposals: extractionModeInput.value === 'bbox_vlm' ? recoveryMaxProposalsInput.value : '',
+      recovery_min_confidence: extractionModeInput.value === 'bbox_vlm' ? recoveryMinConfidenceInput.value : '',
     };
     Object.entries(taskParameters).forEach(([name, value]) => {
       if (value !== '') form.append(name, value);
