@@ -15,7 +15,7 @@ from projects.custom_hybrid.ui import create_ui_app
 
 
 class CustomHybridUiTests(unittest.TestCase):
-    def test_ui_proxies_auth_upload_status_report_and_download(self):
+    def test_ui_proxies_unauthenticated_upload_status_report_and_download(self):
         seen = []
         archive_buffer = BytesIO()
         with zipfile.ZipFile(archive_buffer, "w") as archive:
@@ -24,7 +24,7 @@ class CustomHybridUiTests(unittest.TestCase):
         async def handler(request: httpx.Request) -> httpx.Response:
             body = await request.aread()
             seen.append((request, body))
-            self.assertEqual(request.headers.get("authorization"), "Bearer secret")
+            self.assertIsNone(request.headers.get("authorization"))
             self.assertEqual(request.url.params.get("token"), "jupyter")
             path = request.url.path
             if path == "/health":

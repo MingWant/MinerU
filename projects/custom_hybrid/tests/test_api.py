@@ -87,7 +87,7 @@ class CustomHybridApiTests(unittest.TestCase):
         )
         return 0
 
-    def test_authenticated_async_task_returns_fused_zip_and_report(self):
+    def test_unauthenticated_async_task_returns_fused_zip_and_report(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             app = create_app(
@@ -96,31 +96,24 @@ class CustomHybridApiTests(unittest.TestCase):
                 api_key="secret",
                 runner=self._successful_runner,
             )
-            headers = {"Authorization": "Bearer secret"}
             with TestClient(app) as client:
-                self.assertEqual(client.get("/health").status_code, 200)
-                self.assertEqual(
-                    client.post(
-                        "/tasks",
-                        files={"files": ("invoice.pdf", b"pdf")},
-                    ).status_code,
-                    401,
-                )
+                health = client.get("/health")
+                self.assertEqual(health.status_code, 200)
+                self.assertFalse(health.json()["authentication_required"])
                 response = client.post(
                     "/tasks",
                     files={"files": ("invoice.pdf", b"pdf")},
-                    headers=headers,
                 )
                 self.assertEqual(response.status_code, 202)
                 task_id = response.json()["task_id"]
                 for _attempt in range(100):
-                    status = client.get(f"/tasks/{task_id}", headers=headers).json()
+                    status = client.get(f"/tasks/{task_id}").json()
                     if status["status"] in {"completed", "failed"}:
                         break
                     time.sleep(0.01)
 
                 self.assertEqual(status["status"], "completed")
-                result = client.get(f"/tasks/{task_id}/result", headers=headers)
+                result = client.get(f"/tasks/{task_id}/result")
                 self.assertEqual(result.status_code, 200)
                 archive_path = root / "result.zip"
                 archive_path.write_bytes(result.content)
@@ -134,22 +127,20 @@ class CustomHybridApiTests(unittest.TestCase):
                     self.assertEqual(task_parameters["cost_profile"], "balanced")
                     self.assertEqual(task_parameters["extraction_mode"], "hybrid_fusion")
                     self.assertEqual(task_parameters["mineru"]["effort"], "medium")
-                report = client.get(f"/tasks/{task_id}/report", headers=headers)
+                report = client.get(f"/tasks/{task_id}/report")
                 self.assertEqual(report.json()["documents"], ["invoice.pdf"])
-                preview = client.get(f"/tasks/{task_id}/preview", headers=headers)
+                preview = client.get(f"/tasks/{task_id}/preview")
                 self.assertEqual(preview.status_code, 200)
                 self.assertEqual(preview.content, b"bbox-pdf")
                 self.assertEqual(preview.headers["content-type"], "application/pdf")
                 form_cells = client.get(
                     f"/tasks/{task_id}/preview",
                     params={"kind": "form_cells"},
-                    headers=headers,
                 )
                 self.assertEqual(form_cells.status_code, 200)
                 self.assertEqual(form_cells.content, b"form-cell-pdf")
                 markdown = client.get(
                     f"/tasks/{task_id}/markdown",
-                    headers=headers,
                 )
                 self.assertEqual(markdown.status_code, 200)
                 self.assertEqual(markdown.json()["selected"], "document/document.md")
@@ -161,7 +152,6 @@ class CustomHybridApiTests(unittest.TestCase):
                         "document": "document/document.md",
                         "path": "images/page.png",
                     },
-                    headers=headers,
                 )
                 self.assertEqual(asset.status_code, 200)
                 self.assertEqual(asset.content, b"image-data")
@@ -171,10 +161,9 @@ class CustomHybridApiTests(unittest.TestCase):
                         "document": "document/document.md",
                         "path": "../../task_parameters.json",
                     },
-                    headers=headers,
                 )
                 self.assertEqual(traversal.status_code, 404)
-                deleted = client.delete(f"/tasks/{task_id}", headers=headers)
+                deleted = client.delete(f"/tasks/{task_id}")
                 self.assertEqual(deleted.json(), {"task_id": task_id, "deleted": True})
 
     def test_synchronous_parse_returns_zip_and_rejects_unsupported_input(self):

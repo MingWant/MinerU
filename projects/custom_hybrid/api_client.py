@@ -53,10 +53,12 @@ def parse_remote(
     recovery_min_confidence: float | None = None,
     timeout_seconds: float = 3600,
 ) -> Path:
+    # ``api_key`` remains in the callable surface for compatibility. The
+    # trusted-LAN Custom Hybrid API no longer uses bearer authentication.
+    _ = api_key
     inputs = collect_inputs(input_path)
     destination = Path(output_path).expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     task_parameters = {
         name: value
         for name, value in {
@@ -86,7 +88,6 @@ def parse_remote(
                 base_url.rstrip("/") + "/file_parse",
                 files=files,
                 data=task_parameters or None,
-                headers=headers,
                 params={"token": jupyter_token} if jupyter_token else None,
             ) as response:
                 if response.is_error:
@@ -105,7 +106,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--url", required=True, help="Custom Hybrid API base URL")
     parser.add_argument("--input", required=True, help="PDF/image file or directory")
     parser.add_argument("--output", required=True, help="Destination ZIP path")
-    parser.add_argument("--api-key-env", default="CUSTOM_HYBRID_API_KEY")
+    parser.add_argument(
+        "--api-key-env",
+        default="CUSTOM_HYBRID_API_KEY",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--jupyter-token-env", default="JUPYTER_TOKEN")
     parser.add_argument("--cost-profile", choices=("balanced", "quality"))
     parser.add_argument(
@@ -121,7 +126,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    api_key = os.getenv(args.api_key_env) if args.api_key_env else None
     jupyter_token = (
         os.getenv(args.jupyter_token_env) if args.jupyter_token_env else None
     )
@@ -129,7 +133,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.url,
         args.input,
         args.output,
-        api_key=api_key,
         jupyter_token=jupyter_token,
         cost_profile=args.cost_profile,
         extraction_mode=args.extraction_mode,

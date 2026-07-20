@@ -27,12 +27,11 @@ def create_ui_app(
     timeout_seconds: float = 3600,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> FastAPI:
+    # Retained for compatibility with existing launch scripts. The trusted-LAN
+    # Custom Hybrid API no longer accepts or requires a bearer token.
+    _ = remote_api_key
     remote_base = remote_url.rstrip("/")
-    headers = (
-        {"Authorization": f"Bearer {remote_api_key}"}
-        if remote_api_key
-        else {}
-    )
+    headers: dict[str, str] = {}
     params = {"token": jupyter_token} if jupyter_token else None
     app = FastAPI(title="Custom Hybrid MinerU Local UI", docs_url=None, redoc_url=None)
 
@@ -274,23 +273,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7860)
-    parser.add_argument("--remote-api-key-env", default="CUSTOM_HYBRID_API_KEY")
+    parser.add_argument(
+        "--remote-api-key-env",
+        default="CUSTOM_HYBRID_API_KEY",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--jupyter-token-env", default="JUPYTER_TOKEN")
     parser.add_argument("--timeout-seconds", type=float, default=3600)
-    parser.add_argument("--allow-public-bind", action="store_true")
+    parser.add_argument(
+        "--allow-public-bind",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.host in {"0.0.0.0", "::"} and not args.allow_public_bind:
-        raise SystemExit(
-            "The UI contains access to your private API. Pass --allow-public-bind "
-            "explicitly before exposing it beyond localhost."
-        )
     app = create_ui_app(
         args.remote_url,
-        remote_api_key=os.getenv(args.remote_api_key_env),
         jupyter_token=os.getenv(args.jupyter_token_env),
         timeout_seconds=args.timeout_seconds,
     )

@@ -5,9 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
-import hmac
 import json
-import os
 import shutil
 import sys
 import threading
@@ -21,11 +19,9 @@ from typing import Any, Callable, Mapping, Sequence
 
 import uvicorn
 from fastapi import (
-    Depends,
     FastAPI,
     File,
     Form,
-    Header,
     HTTPException,
     Request,
     UploadFile,
@@ -708,6 +704,10 @@ def create_app(
     max_upload_mb: int = 200,
     runner: Runner = run_extract,
 ) -> FastAPI:
+    # ``api_key`` is retained only so older launchers can call this function.
+    # The Custom Hybrid HTTP service is intentionally unauthenticated on its
+    # trusted local/LAN deployment; upstream vLLM authentication is separate.
+    _ = api_key
     resolved_config = Path(config_path).expanduser().resolve()
     load_config(resolved_config)
     manager = CustomHybridTaskManager(
@@ -728,18 +728,6 @@ def create_app(
     )
     app.state.task_manager = manager
     max_upload_bytes = max_upload_mb * 1024 * 1024
-
-    def authorize(authorization: str | None = Header(default=None)) -> None:
-        if api_key is None:
-            return
-        prefix = "Bearer "
-        supplied = (
-            authorization[len(prefix) :]
-            if authorization and authorization.startswith(prefix)
-            else ""
-        )
-        if not hmac.compare_digest(supplied, api_key):
-            raise HTTPException(status_code=401, detail="Invalid or missing bearer token")
 
     def require_task(task_id: str) -> TaskRecord:
         record = manager.get(task_id)
@@ -778,12 +766,12 @@ def create_app(
             "status": "ok",
             "service": "custom-hybrid-mineru",
             "upstream_url": config["vllm"]["upstream_url"],
-            "authentication_required": api_key is not None,
+            "authentication_required": False,
             "max_upload_mb": max_upload_mb,
             "task_parameter_defaults": _task_parameter_defaults(config),
         }
 
-    @app.post("/tasks", status_code=202, dependencies=[Depends(authorize)])
+    @app.post("/tasks", status_code=202)
     async def submit_task(
         request: Request,
         files: list[UploadFile] = File(...),
@@ -819,14 +807,13 @@ def create_app(
         record = await create_uploaded_task(files, parameters)
         return _task_payload(record, request)
 
-    @app.get("/tasks/{task_id}", name="get_task", dependencies=[Depends(authorize)])
+    @app.get("/tasks/{task_id}", name="get_task")
     async def get_task(task_id: str, request: Request) -> dict[str, Any]:
         return _task_payload(require_task(task_id), request)
 
     @app.get(
         "/tasks/{task_id}/result",
         name="get_task_result",
-        dependencies=[Depends(authorize)],
     )
     async def get_task_result(task_id: str):
         record = require_completed_task(task_id)
@@ -839,7 +826,6 @@ def create_app(
     @app.get(
         "/tasks/{task_id}/preview",
         name="get_task_preview",
-        dependencies=[Depends(authorize)],
     )
     async def get_task_preview(task_id: str, kind: str = "span"):
         record = require_completed_task(task_id)
@@ -882,7 +868,6 @@ def create_app(
 
     @app.get(
         "/tasks/{task_id}/markdown",
-        dependencies=[Depends(authorize)],
     )
     async def get_task_markdown(task_id: str, document: str | None = None):
         record = require_completed_task(task_id)
@@ -903,7 +888,6 @@ def create_app(
 
     @app.get(
         "/tasks/{task_id}/asset",
-        dependencies=[Depends(authorize)],
     )
     async def get_task_markdown_asset(
         task_id: str,
@@ -932,7 +916,6 @@ def create_app(
     @app.get(
         "/tasks/{task_id}/report",
         name="get_task_report",
-        dependencies=[Depends(authorize)],
     )
     async def get_task_report(task_id: str):
         record = require_task(task_id)
@@ -945,7 +928,7 @@ def create_app(
             content=json.loads(report_path.read_text(encoding="utf-8"))
         )
 
-    @app.post("/file_parse", dependencies=[Depends(authorize)])
+    @app.post("/file_parse")
     async def file_parse(
         files: list[UploadFile] = File(...),
         cost_profile: str = Form(default=DEFAULT_COST_PROFILE),
@@ -987,7 +970,7 @@ def create_app(
             filename=f"{completed.task_id}-fused.zip",
         )
 
-    @app.delete("/tasks/{task_id}", dependencies=[Depends(authorize)])
+    @app.delete("/tasks/{task_id}")
     async def delete_task(task_id: str):
         require_task(task_id)
         try:
@@ -1005,24 +988,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8010)
     parser.add_argument("--output-root", default="./output/custom_hybrid_api")
-    parser.add_argument("--api-key-env", default="CUSTOM_HYBRID_API_KEY")
+    parser.add_argument(
+        "--api-key-env",
+        default="CUSTOM_HYBRID_API_KEY",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--max-upload-mb", type=int, default=200)
-    parser.add_argument("--allow-unauthenticated-public", action="store_true")
+    parser.add_argument(
+        "--allow-unauthenticated-public",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    api_key = os.getenv(args.api_key_env) if args.api_key_env else None
-    public_host = args.host in {"0.0.0.0", "::"}
-    if public_host and not api_key and not args.allow_unauthenticated_public:
-        raise SystemExit(
-            f"Set {args.api_key_env} or pass --allow-unauthenticated-public explicitly"
-        )
     app = create_app(
         args.config,
         args.output_root,
-        api_key=api_key,
         max_upload_mb=args.max_upload_mb,
     )
     uvicorn.run(app, host=args.host, port=args.port)

@@ -499,11 +499,10 @@ The standard `mineru-api` does not run the dual Hybrid + Pipeline OCR fusion
 workflow. Use the dedicated service to upload documents and download a ZIP whose
 root contains `fused/`, `fusion_summary.json`, and the per-task vLLM audit log.
 
-Set a bearer token before binding the service to a public/container interface:
+The Custom Hybrid task API is intentionally unauthenticated for trusted local and
+LAN deployments. It can bind directly to a container or LAN interface:
 
 ```bash
-export CUSTOM_HYBRID_API_KEY='replace-with-a-long-random-token'
-
 python projects/custom_hybrid/api.py \
   --config workflow.local.json \
   --host 0.0.0.0 \
@@ -511,9 +510,9 @@ python projects/custom_hybrid/api.py \
   --output-root /work/mineru-output/custom-hybrid-api
 ```
 
-Public binding without a token is rejected unless
-`--allow-unauthenticated-public` is explicitly supplied. Keep the service behind
-a private network, VPN, or authenticated reverse proxy. The server uses
+There is no Custom Hybrid bearer-token header. Do not expose this service to the
+public internet; use a trusted LAN, VPN, firewall, or authenticated reverse proxy
+if the network itself is not trusted. The server uses
 `workflow.local.json` as its baseline. API tasks default to the `balanced` cost
 profile, which forces `effort=medium`, caps output at 2048 tokens, disables formula
 and image analysis, and prevents verifier/recognizer/reconciliation requests. It
@@ -559,7 +558,6 @@ Example task-level parameter override:
 
 ```bash
 curl -X POST \
-  -H "Authorization: Bearer $CUSTOM_HYBRID_API_KEY" \
   -F "files=@invoice.pdf" \
   -F "cost_profile=balanced" \
   -F "extraction_mode=bbox_vlm" \
@@ -578,7 +576,6 @@ From a Mac, only Python and `httpx` are required. Run the client from this repo:
 
 ```bash
 python -m pip install httpx
-export CUSTOM_HYBRID_API_KEY='replace-with-a-long-random-token'
 
 python projects/custom_hybrid/api_client.py \
   --url http://10.100.0.30:8010 \
@@ -599,19 +596,17 @@ task files remain under `--output-root` until deleted.
 If `jupyter-server-proxy` is installed and direct port publishing is unavailable,
 use `http://<jupyter-host>:<jupyter-port>/proxy/8010` as `--url` and export the
 Jupyter access token through `JUPYTER_TOKEN`. The client sends that token as a
-query parameter while retaining the Custom Hybrid bearer token in the
-`Authorization` header.
+query parameter for the Jupyter proxy; the Custom Hybrid API itself remains
+unauthenticated.
 
 ## 5. Run the lightweight local UI
 
-The local UI is a small FastAPI/HTML application. It runs on the Mac, keeps API
-credentials out of browser JavaScript, and proxies uploads, task polling, reports,
-and ZIP downloads to the remote Custom Hybrid service. It does not install or run
-MinerU models locally.
+The local UI is a small FastAPI/HTML application. It runs on the Mac and proxies
+uploads, task polling, reports, and ZIP downloads to the remote Custom Hybrid
+service. It does not install or run MinerU models locally.
 
 ```bash
 python -m pip install fastapi uvicorn httpx python-multipart
-export CUSTOM_HYBRID_API_KEY='the-same-token-used-by-the-server'
 
 python projects/custom_hybrid/ui.py \
   --remote-url http://10.100.0.30:6108 \
@@ -627,8 +622,8 @@ through a task-scoped, image-only endpoint with path traversal protection.
 
 Extraction and vLLM Generation controls are task-scoped; the Fusion Report tab
 includes the accepted task parameter snapshot. The English `Extraction Mode`
-selector offers `Hybrid Fusion`, `OCR BBox + VLM`, and
-`OCR BBox + VLM Recovery`. After a task completes, the same
+selector offers `Hybrid Fusion` and `OCR + BBox Repair + VLM`. After a task
+completes, the same
 selected files and parameters remain available and Convert changes to Convert
 Again, so rerunning does not require Clear. For PDF inputs, the fused workflow
 generates `*_layout.pdf`, `*_span.pdf`, `*_forms.pdf`, and
@@ -647,7 +642,7 @@ gaps. Parent bands are stored in `form_rows`, leaf recognition targets in
 `form_cells`, and neither stage rewrites layout blocks, Table HTML, or source OCR
 spans. Existing Table Cell geometry remains in middle JSON and is intentionally
 not drawn in `*_span.pdf`. Use Original / Bounding Boxes to switch views. The UI
-refuses public binding unless `--allow-public-bind` is supplied explicitly.
+can bind directly to a trusted LAN interface without an additional flag.
 
 `span.pdf` generation resolves the source PDF from the uploaded task input first
 and then falls back to the fused `*_origin.pdf` artifact. The preview endpoint
