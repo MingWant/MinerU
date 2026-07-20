@@ -178,10 +178,13 @@ there is no separate recovery extraction mode.
 Reviewer coordinates never become final geometry directly. The workflow clips
 them to the immutable Cell boundary, refines them against dark document pixels,
 then applies confidence, area-ratio, IoU deduplication, adjustment-overlap,
-per-Table, and per-document gates. Table bounds, Cell bounds, row/column indices,
-and HTML grid signatures are snapshotted; any invariant failure rolls back every
-accepted proposal on that page. Accepted empty recovered boxes can enter local
-VLM transcription only when their geometry confidence passes
+per-Table, and per-document gates. Two deterministic local cases may instead be
+clipped to the immutable Table boundary: one content line detected across
+overlapping adjacent Cells, and signature/date ink extending below a truncated
+terminal-row Cell. Table bounds, Cell bounds, row/column indices, and HTML grid
+signatures are snapshotted; any invariant failure rolls back every accepted
+proposal on that page. Accepted empty recovered boxes can enter local VLM
+transcription only when their geometry confidence passes
 `recognizer.recovered_empty_min_confidence`.
 
 Recovery cost is bounded by `recovery.max_tables_per_document`,
@@ -262,6 +265,23 @@ Table rules are removed before the content-tight bbox is calculated. Highly
 overlapping proposals owned by different Cells in the same Table are rejected
 as duplicates; this protects against malformed OCR grids that map the same
 printed row into several Cells.
+When adjacent Cells detect vertically overlapping fragments of the same ink
+line, `merge_split_content_boxes_enabled=true` combines them before fusion if
+horizontal coverage, vertical overlap, and union-height guards pass. The merged
+bbox is sent to vLLM once and is auditable through its source Cell IDs. The
+guards are controlled by `split_content_min_horizontal_overlap`,
+`split_content_min_vertical_overlap`, and
+`split_content_max_union_height_ratio`.
+
+For the final Table row only, labels such as signature, ID/passport number, and
+date enable a bounded scan down to the existing Table bottom. This recovers
+handwriting that lies below a truncated Cell without modifying the Cell or Table
+grid. `terminal_field_min_bottom_extension` and
+`terminal_field_max_bottom_extension` constrain the allowed geometry gap; the
+extension is never enabled from a remote reviewer response. A locally recovered
+date crop may contain a small printed-label fragment; when it contains exactly
+one valid numeric date, that date is extracted before the normal empty-OCR
+capacity and safety guards are applied.
 Reports and the English UI expose analyzed/skipped Cell counts, pixel-analysis
 time, cache hits/misses, request-budget skips, and native network requests.
 
@@ -276,7 +296,9 @@ borders, content-like line bands are inserted as `add_orphan` content boxes and
 sent through the same native transcription path. This covers truncated grids
 where visible text remains inside the Table but below or beside every detected
 Cell. Orphan boxes may be attached to the nearest Cell for text/HTML ownership,
-but the original Table and Cell bboxes remain immutable.
+but the original Table and Cell bboxes remain immutable. If the per-Table orphan
+budget is full, more substantial text-line candidates are preferred over thin
+ink fragments; `table_orphan_preferred_line_height` controls that ranking bias.
 
 `table_fringe_recovery_enabled=true` extends that masked scan a bounded distance
 below a detected Table. It recovers labels and dates that visually belong to the
@@ -306,6 +328,13 @@ bbox remains in middle JSON for audit but is hidden from visualization and
 recognition; the combined bbox and fallback text (for example,
 `1. ContentABCDEFG`) are sent to vLLM. Amount-only, code-like, distant, and
 vertically misaligned neighbors are not merged.
+
+`ink_marker_merge_enabled=true` covers the corresponding case where a
+handwritten circled/list marker has no OCR span at all. For visually tall text
+boxes, a bounded masked scan looks immediately to the left for a compact,
+same-line ink prefix. A guarded match expands the existing content bbox over the
+marker and sends the combined crop to vLLM once. Printed labels, thin strokes,
+distant ink, and markers already covered by another bbox remain excluded.
 
 `structured_output_mode=json_schema` is the default example and sends a dynamic
 strict schema whose ID enum and item count match the current batch. vLLM-native

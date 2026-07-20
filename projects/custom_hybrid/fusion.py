@@ -1086,6 +1086,7 @@ def apply_bbox_recovery_proposals(
         "checkbox_added": 0,
         "checkbox_merged": 0,
         "list_marker_merged": 0,
+        "ink_marker_merged": 0,
         "rejected": 0,
         "errors": 0,
     }
@@ -1118,6 +1119,7 @@ def apply_bbox_recovery_proposals(
         marker_id = item.get("marker_id")
         confidence = item.get("confidence")
         bbox = _valid_bbox(item.get("bbox"))
+        ink_marker_bbox = _valid_bbox(item.get("ink_marker_bbox"))
         decision = {
             "kind": "bbox_recovery",
             "page": page_index,
@@ -1135,11 +1137,45 @@ def apply_bbox_recovery_proposals(
         table_key = cell_id.rsplit("-c", 1)[0] if isinstance(cell_id, str) else ""
         expected_table_id = table_key.replace("-t", "-table-")
         detached_actions = {"add_orphan", "add_fringe", "add_checkbox"}
-        table_scoped_actions = detached_actions | {"merge_list_marker"}
+        table_scoped_actions = detached_actions | {
+            "merge_list_marker",
+            "merge_ink_marker",
+        }
         if action not in detached_actions:
             table_id = expected_table_id
         table = tables.get(table_id) if isinstance(table_id, str) else None
         table_bbox = table[1] if table is not None else None
+        spanning_requested = bool(item.get("spanning_cells"))
+        terminal_field_requested = bool(item.get("terminal_field_extension"))
+        merged_cell_ids = item.get("merged_cell_ids", [])
+        spanning_cells = bool(
+            spanning_requested
+            and action == "add"
+            and item.get("recovery_source") == "local_split_pixel_ink_merge"
+            and isinstance(merged_cell_ids, list)
+            and len(merged_cell_ids) >= 2
+            and isinstance(cell_id, str)
+            and cell_id in merged_cell_ids
+            and all(
+                isinstance(merged_id, str)
+                and merged_id.startswith(table_key + "-c")
+                for merged_id in merged_cell_ids
+            )
+        )
+        terminal_field_extension = bool(
+            terminal_field_requested
+            and action == "add"
+            and item.get("recovery_source") == "local_terminal_field_ink"
+            and isinstance(cell_id, str)
+            and table_bbox is not None
+        )
+        terminal_field_kind = (
+            str(item.get("terminal_field_kind"))
+            if terminal_field_extension
+            and item.get("terminal_field_kind")
+            in {"date", "identifier", "signature"}
+            else None
+        )
         decision["table_id"] = table_id
         if action not in {
             "add",
@@ -1149,6 +1185,7 @@ def apply_bbox_recovery_proposals(
             "add_checkbox",
             "merge_checkbox",
             "merge_list_marker",
+            "merge_ink_marker",
         }:
             reason = "unsupported_action"
         elif cell is None or cell_bbox is None:
@@ -1157,6 +1194,10 @@ def apply_bbox_recovery_proposals(
             table is None or table_id != expected_table_id
         ):
             reason = "unknown_table"
+        elif spanning_requested and (not spanning_cells or table_bbox is None):
+            reason = "spanning_cells_guard"
+        elif terminal_field_requested and not terminal_field_extension:
+            reason = "terminal_field_extension_guard"
         elif not isinstance(confidence, (int, float)) or float(confidence) < settings.bbox_recovery_min_confidence:
             reason = "low_confidence"
         elif bbox is None:
@@ -1172,6 +1213,8 @@ def apply_bbox_recovery_proposals(
                     table_bbox,
                     settings.bbox_recovery_fringe_bottom_extension,
                 )
+            elif spanning_cells or terminal_field_extension:
+                outer_bbox = table_bbox
             else:
                 outer_bbox = (
                     table_bbox if action in table_scoped_actions else cell_bbox
@@ -1193,6 +1236,8 @@ def apply_bbox_recovery_proposals(
                     table_bbox,
                     settings.bbox_recovery_fringe_bottom_extension,
                 )
+            elif spanning_cells or terminal_field_extension:
+                outer_bbox = table_bbox
             else:
                 outer_bbox = (
                     table_bbox if action in table_scoped_actions else cell_bbox
@@ -1226,6 +1271,8 @@ def apply_bbox_recovery_proposals(
                         "add_fringe",
                         "merge_list_marker",
                     }
+                    or spanning_cells
+                    or terminal_field_extension
                     else settings.bbox_recovery_min_area_ratio
                 )
                 if not minimum_area_ratio <= area_ratio <= settings.bbox_recovery_max_area_ratio:
@@ -1311,6 +1358,7 @@ def apply_bbox_recovery_proposals(
             "adjust",
             "merge_checkbox",
             "merge_list_marker",
+            "merge_ink_marker",
         }:
             if (
                 target is None
@@ -1362,6 +1410,49 @@ def apply_bbox_recovery_proposals(
                     or _bbox_coverage(original_bbox, bbox) < 0.95
                 ):
                     reason = "list_marker_union_guard"
+        if reason is None and action == "merge_ink_marker":
+            marker_width = (
+                ink_marker_bbox[2] - ink_marker_bbox[0]
+                if ink_marker_bbox is not None
+                else 0.0
+            )
+            marker_height = (
+                ink_marker_bbox[3] - ink_marker_bbox[1]
+                if ink_marker_bbox is not None
+                else 0.0
+            )
+            target_height = original_bbox[3] - original_bbox[1]
+            gap = (
+                original_bbox[0] - ink_marker_bbox[2]
+                if ink_marker_bbox is not None
+                else float("inf")
+            )
+            vertical_overlap = (
+                max(
+                    0.0,
+                    min(ink_marker_bbox[3], original_bbox[3])
+                    - max(ink_marker_bbox[1], original_bbox[1]),
+                )
+                if ink_marker_bbox is not None
+                else 0.0
+            )
+            overlap_ratio = (
+                vertical_overlap / min(marker_height, target_height)
+                if min(marker_height, target_height) > 0
+                else 0.0
+            )
+            if (
+                item.get("recovery_source") != "local_ink_marker_merge"
+                or target_source != "content_span"
+                or ink_marker_bbox is None
+                or not 5.0 <= marker_width <= 40.0
+                or not 5.0 <= marker_height <= 40.0
+                or not 0.0 <= gap <= 24.0
+                or overlap_ratio < 0.35
+                or _bbox_coverage(ink_marker_bbox, bbox) < 0.95
+                or _bbox_coverage(original_bbox, bbox) < 0.95
+            ):
+                reason = "ink_marker_union_guard"
         if reason is not None:
             stats["rejected"] += 1
             decision.update(result="rejected", reason=reason)
@@ -1379,7 +1470,24 @@ def apply_bbox_recovery_proposals(
             "fusion_recovery_checkbox": action == "add_checkbox",
             "fusion_checkbox_grouped": action == "merge_checkbox",
             "fusion_list_marker_grouped": action == "merge_list_marker",
+            "fusion_ink_marker_grouped": action == "merge_ink_marker",
+            "fusion_recovery_spanning_cells": spanning_cells,
+            "fusion_recovery_terminal_field_extension": (
+                terminal_field_extension
+            ),
         }
+        if spanning_cells:
+            recovery_metadata["fusion_recovery_merged_cell_ids"] = list(
+                merged_cell_ids
+            )
+        if terminal_field_kind is not None:
+            recovery_metadata[
+                "fusion_recovery_terminal_field_kind"
+            ] = terminal_field_kind
+        if action == "merge_ink_marker" and ink_marker_bbox is not None:
+            recovery_metadata["fusion_ink_marker_bbox"] = list(
+                ink_marker_bbox
+            )
         if action in {"add_checkbox", "merge_checkbox"}:
             recovery_metadata.update(
                 {
@@ -1446,11 +1554,15 @@ def apply_bbox_recovery_proposals(
                 raw_marker[
                     "fusion_visualization_hidden_reason"
                 ] = "merged_list_marker"
+            elif action == "merge_ink_marker":
+                raw_target["fusion_force_recognition"] = True
             stats["adjusted"] += 1
             if action == "merge_checkbox":
                 stats["checkbox_merged"] += 1
             elif action == "merge_list_marker":
                 stats["list_marker_merged"] += 1
+            elif action == "merge_ink_marker":
+                stats["ink_marker_merged"] += 1
         accepted_count += 1
         table_counts[table_key] += 1
         stats["accepted"] += 1
@@ -1469,6 +1581,7 @@ def apply_bbox_recovery_proposals(
         stats["checkbox_added"] = 0
         stats["checkbox_merged"] = 0
         stats["list_marker_merged"] = 0
+        stats["ink_marker_merged"] = 0
         stats["rejected"] += rolled_back
         stats["errors"] += 1
         for decision in decisions:
@@ -1645,6 +1758,9 @@ _AMOUNT_RE = re.compile(
 _RECOVERED_GROUPED_AMOUNT_RE = re.compile(
     r"^\s*(\d{1,3})([.,])(\d{3})\2(\d{2})\s*$"
 )
+_RECOVERED_TERMINAL_DATE_RE = re.compile(
+    r"(?<!\d)(\d{1,4})\s*[/|.\-]\s*(\d{1,2})\s*[/|.\-]\s*(\d{1,4})(?!\d)"
+)
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9./_-]{2,63}$")
 _DATE_LIKE_RE = re.compile(
     r"(?:\d{1,4}\s*[-/]\s*[A-Za-z0-9]{1,2}\s*[-/]\s*\d{1,4}|"
@@ -1687,6 +1803,25 @@ def _normalize_recovered_amount_candidate(text: str) -> str:
     if match is None:
         return text.strip()
     return f"{match.group(1)},{match.group(3)}.{match.group(4)}"
+
+
+def _normalize_recovered_terminal_date_candidate(
+    text: str,
+    metadata: Mapping[str, Any],
+) -> str:
+    """Extract one valid date from a trusted terminal-date recovery crop."""
+    stripped = text.strip()
+    if (
+        metadata.get("fusion_recovery_source") != "local_terminal_field_ink"
+        or metadata.get("fusion_recovery_terminal_field_kind") != "date"
+    ):
+        return stripped
+    matches = {
+        "/".join(match.groups())
+        for match in _RECOVERED_TERMINAL_DATE_RE.finditer(stripped)
+        if _valid_date_candidate("/".join(match.groups()))
+    }
+    return next(iter(matches)) if len(matches) == 1 else stripped
 
 
 def _valid_identifier_candidate(text: str) -> bool:
@@ -2239,9 +2374,17 @@ def apply_bbox_recognition(
         recovery_requires_recognition = bool(candidate.get("recovered"))
         raw_vlm_text = returned.get(candidate_id, "")
         vlm_text = raw_vlm_text
+        normalized_recovered_amount = False
+        normalized_terminal_date = False
         if recovery_requires_recognition and not line.text.strip():
             vlm_text = _normalize_recovered_amount_candidate(vlm_text)
-        normalized_recovered_amount = vlm_text != raw_vlm_text
+            normalized_recovered_amount = vlm_text != raw_vlm_text
+            amount_normalized_text = vlm_text
+            vlm_text = _normalize_recovered_terminal_date_candidate(
+                vlm_text,
+                line.spans[0] if line.spans else {},
+            )
+            normalized_terminal_date = vlm_text != amount_normalized_text
         source, reason, field_type, similarity, length_ratio = (
             select_bbox_recognition_candidate(line, vlm_text, settings)
             if candidate_id in returned
@@ -2315,7 +2458,10 @@ def apply_bbox_recognition(
             "similarity": round(similarity, 6),
             "length_ratio": round(length_ratio, 6),
         }
-        if normalized_recovered_amount:
+        if normalized_terminal_date:
+            decision["normalized_vlm_text"] = vlm_text
+            decision["vlm_text_normalization"] = "terminal_date_extraction"
+        elif normalized_recovered_amount:
             decision["normalized_vlm_text"] = vlm_text
             decision["vlm_text_normalization"] = "grouped_amount_separators"
         if candidate_reason != reason:
@@ -3616,6 +3762,7 @@ def fuse_middle_json(
         "bbox_recovery_checkbox_proposals": 0,
         "bbox_recovery_checkbox_merge_proposals": 0,
         "bbox_recovery_list_marker_merge_proposals": 0,
+        "bbox_recovery_ink_marker_merge_proposals": 0,
         "bbox_recovery_checkbox_checked": 0,
         "bbox_recovery_checkbox_unchecked": 0,
         "bbox_recovery_checkbox_ambiguous": 0,
@@ -3633,6 +3780,7 @@ def fuse_middle_json(
         "bbox_recovery_checkbox_added": 0,
         "bbox_recovery_checkbox_merged": 0,
         "bbox_recovery_list_marker_merged": 0,
+        "bbox_recovery_ink_marker_merged": 0,
         "bbox_recovery_rejected": 0,
         "bbox_recovery_errors": 0,
         "table_targets": 0,
@@ -3769,6 +3917,10 @@ def fuse_middle_json(
                             "list_marker_merged",
                             "bbox_recovery_list_marker_merge_proposals",
                         ),
+                        (
+                            "ink_marker_merged",
+                            "bbox_recovery_ink_marker_merge_proposals",
+                        ),
                         ("checkbox_checked", "bbox_recovery_checkbox_checked"),
                         ("checkbox_unchecked", "bbox_recovery_checkbox_unchecked"),
                         ("checkbox_ambiguous", "bbox_recovery_checkbox_ambiguous"),
@@ -3814,6 +3966,7 @@ def fuse_middle_json(
                         "checkbox_added",
                         "checkbox_merged",
                         "list_marker_merged",
+                        "ink_marker_merged",
                         "rejected",
                         "errors",
                     ):

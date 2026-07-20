@@ -297,6 +297,145 @@ class BBoxRecoveryReviewerTests(unittest.TestCase):
         self.assertGreater(uncovered[0]["bbox"][1], 45)
         self.assertIn("uncovered_ink", uncovered[0]["recovery_reasons"])
 
+    def test_local_pixel_recovery_merges_same_line_split_across_adjacent_cells(self):
+        from PIL import Image, ImageDraw
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            image = Image.new("RGB", (160, 110), "white")
+            ImageDraw.Draw(image).rectangle([20, 55, 125, 80], fill="black")
+            image.save(image_path)
+            image.close()
+            reviewer = OpenAIBBoxRecoveryReviewer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "mineru-claim-forms",
+                    "render_scale": 1.0,
+                    "checkbox_recovery_enabled": False,
+                    "table_orphan_recovery_enabled": False,
+                },
+            )
+            try:
+                result = reviewer(
+                    0,
+                    [160, 110],
+                    [
+                        {
+                            "id": "p0-table-0",
+                            "bbox": [0, 0, 160, 105],
+                            "cells": [
+                                {
+                                    "id": "p0-t0-c0",
+                                    "bbox": [0, 0, 150, 65],
+                                    "row_end": 0,
+                                    "text": "",
+                                    "existing": [],
+                                    "reasons": ["missing_content_bbox"],
+                                },
+                                {
+                                    "id": "p0-t0-c1",
+                                    "bbox": [0, 50, 150, 100],
+                                    "row_end": 1,
+                                    "text": "",
+                                    "existing": [],
+                                    "reasons": ["missing_content_bbox"],
+                                },
+                            ],
+                        }
+                    ],
+                )
+            finally:
+                reviewer.close()
+
+        self.assertEqual(len(result["items"]), 1)
+        merged = result["items"][0]
+        self.assertTrue(merged["spanning_cells"])
+        self.assertEqual(merged["merged_cell_ids"], ["p0-t0-c0", "p0-t0-c1"])
+        self.assertEqual(merged["recovery_source"], "local_split_pixel_ink_merge")
+        self.assertLess(merged["bbox"][1], 57)
+        self.assertGreater(merged["bbox"][3], 78)
+
+    def test_terminal_signature_row_analysis_extends_to_table_bottom(self):
+        from PIL import Image, ImageDraw
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            image = Image.new("RGB", (200, 120), "white")
+            draw = ImageDraw.Draw(image)
+            draw.rectangle([8, 64, 45, 70], fill="black")
+            draw.rectangle([108, 64, 145, 70], fill="black")
+            draw.rectangle([20, 92, 75, 102], fill="black")
+            draw.rectangle([125, 92, 180, 102], fill="black")
+            image.save(image_path)
+            image.close()
+            reviewer = OpenAIBBoxRecoveryReviewer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "mineru-claim-forms",
+                    "render_scale": 1.0,
+                    "checkbox_recovery_enabled": False,
+                    "table_orphan_recovery_enabled": False,
+                },
+            )
+            try:
+                result = reviewer(
+                    0,
+                    [200, 120],
+                    [
+                        {
+                            "id": "p0-table-0",
+                            "bbox": [0, 0, 200, 115],
+                            "cells": [
+                                {
+                                    "id": "p0-t0-c0",
+                                    "bbox": [0, 0, 200, 60],
+                                    "row_end": 0,
+                                    "text": "Header",
+                                    "existing": [],
+                                    "reasons": [],
+                                },
+                                {
+                                    "id": "p0-t0-c1",
+                                    "bbox": [0, 60, 100, 82],
+                                    "row_end": 1,
+                                    "text": "Signature of Insured 受保人簽署",
+                                    "existing": [
+                                        {"id": "p0-t0-c1-b0", "bbox": [6, 62, 48, 72]}
+                                    ],
+                                    "reasons": [],
+                                },
+                                {
+                                    "id": "p0-t0-c2",
+                                    "bbox": [100, 60, 195, 82],
+                                    "row_end": 1,
+                                    "text": "Date (DD/MM/YY) 日期",
+                                    "existing": [
+                                        {"id": "p0-t0-c2-b0", "bbox": [106, 62, 148, 72]}
+                                    ],
+                                    "reasons": [],
+                                },
+                            ],
+                        }
+                    ],
+                )
+            finally:
+                reviewer.close()
+
+        recovered = [
+            item
+            for item in result["items"]
+            if item.get("recovery_source") == "local_terminal_field_ink"
+        ]
+        self.assertEqual(len(recovered), 2)
+        self.assertTrue(all(item["bbox"][1] > 85 for item in recovered))
+        self.assertTrue(all(item["terminal_field_extension"] for item in recovered))
+        self.assertEqual(
+            {item["terminal_field_kind"] for item in recovered},
+            {"date", "signature"},
+        )
+
     def test_table_orphan_recovery_accepts_short_amount(self):
         from PIL import Image, ImageDraw
 
@@ -344,6 +483,58 @@ class BBoxRecoveryReviewerTests(unittest.TestCase):
         ]
         self.assertEqual(len(orphan), 1)
         self.assertLess(orphan[0]["bbox"][2] - orphan[0]["bbox"][0], 40)
+
+    def test_table_orphan_budget_prefers_substantial_line_over_thin_fragment(self):
+        from PIL import Image, ImageDraw
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            image = Image.new("RGB", (200, 110), "white")
+            draw = ImageDraw.Draw(image)
+            for column in range(20, 81, 2):
+                draw.line([column, 30, column, 33], fill="black")
+            for column in range(20, 106, 2):
+                draw.line([column, 80, column, 89], fill="black")
+            image.save(image_path)
+            image.close()
+            reviewer = OpenAIBBoxRecoveryReviewer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "mineru-claim-forms",
+                    "render_scale": 1.0,
+                    "checkbox_recovery_enabled": False,
+                    "table_fringe_recovery_enabled": False,
+                    "table_orphan_max_boxes_per_table": 1,
+                },
+            )
+            try:
+                result = reviewer(
+                    0,
+                    [200, 110],
+                    [
+                        {
+                            "id": "p0-table-0",
+                            "bbox": [0, 0, 200, 100],
+                            "cells": [
+                                {
+                                    "id": "p0-t0-c0",
+                                    "bbox": [0, 0, 190, 20],
+                                    "row_end": 0,
+                                    "text": "Header",
+                                    "existing": [],
+                                    "reasons": [],
+                                }
+                            ],
+                        }
+                    ],
+                )
+            finally:
+                reviewer.close()
+
+        self.assertEqual(len(result["items"]), 1)
+        self.assertEqual(result["items"][0]["action"], "add_orphan")
+        self.assertGreater(result["items"][0]["bbox"][1], 70)
 
     def test_table_fringe_recovery_masks_existing_page_text(self):
         from PIL import Image, ImageDraw
@@ -605,6 +796,59 @@ class BBoxRecoveryReviewerTests(unittest.TestCase):
         proposals = reviewer._table_list_marker_proposals(table, 10)
 
         self.assertEqual(proposals, [])
+
+    def test_ink_marker_recovery_extends_handwriting_bbox_over_circled_prefix(self):
+        from PIL import Image, ImageDraw
+
+        image = Image.new("RGB", (200, 100), "white")
+        draw = ImageDraw.Draw(image)
+        draw.ellipse([30, 34, 52, 58], outline="black", width=2)
+        draw.line([41, 39, 41, 53], fill="black", width=2)
+        draw.rectangle([68, 34, 165, 58], fill="black")
+        reviewer = OpenAIBBoxRecoveryReviewer(
+            "http://vision.test",
+            "unused.pdf",
+            {
+                "render_scale": 1.0,
+                "ink_marker_merge_enabled": True,
+            },
+            page_provider=mock.Mock(),
+        )
+        try:
+            proposals = reviewer._table_ink_marker_proposals(
+                image,
+                [200, 100],
+                {
+                    "id": "p0-table-0",
+                    "bbox": [0, 0, 200, 100],
+                    "cells": [
+                        {
+                            "id": "p0-t0-c0",
+                            "bbox": [0, 0, 200, 100],
+                            "existing": [
+                                {
+                                    "id": "p0-t0-c0-b0",
+                                    "bbox": [68, 34, 165, 58],
+                                    "text": "Abdominal pain",
+                                    "source": "content_span",
+                                }
+                            ],
+                        }
+                    ],
+                },
+                10,
+            )
+        finally:
+            reviewer.close()
+            image.close()
+
+        self.assertEqual(len(proposals), 1)
+        self.assertEqual(proposals[0]["action"], "merge_ink_marker")
+        self.assertEqual(proposals[0]["target_id"], "p0-t0-c0-b0")
+        self.assertLess(proposals[0]["bbox"][0], 35)
+        self.assertEqual(proposals[0]["bbox"][2], 165.0)
+        self.assertGreaterEqual(proposals[0]["bbox"][3], 58.0)
+        self.assertEqual(reviewer.ink_marker_labels_merged, 1)
 
     def test_local_pixel_recovery_removes_long_table_rules_from_content_bbox(self):
         from PIL import Image, ImageDraw

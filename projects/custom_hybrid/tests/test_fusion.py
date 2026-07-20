@@ -256,6 +256,168 @@ class FusionTests(unittest.TestCase):
         self.assertEqual(stats["accepted"], 1)
         self.assertEqual(stats["rejected"], 1)
         self.assertEqual(decisions[1]["reason"], "cross_cell_duplicate_bbox")
+
+    def test_bbox_recovery_accepts_locally_merged_spanning_content_box(self):
+        cells = [
+            {
+                "bbox": [10, 10, 190, 50],
+                "text": "",
+                "row_start": 0,
+                "row_end": 0,
+                "col_start": 0,
+                "col_end": 0,
+            },
+            {
+                "bbox": [10, 45, 190, 90],
+                "text": "",
+                "row_start": 1,
+                "row_end": 1,
+                "col_start": 0,
+                "col_end": 0,
+            },
+        ]
+        page = structured_middle(
+            "table",
+            html="<table><tr><td></td></tr><tr><td></td></tr></table>",
+            table_cells=cells,
+        )["pdf_info"][0]
+
+        stats, decisions, _batches, unchanged = apply_bbox_recovery_proposals(
+            page,
+            0,
+            {
+                "items": [
+                    {
+                        "action": "add",
+                        "cell_id": "p0-t0-c0",
+                        "target_id": "",
+                        "bbox": [20, 25, 180, 75],
+                        "confidence": 0.95,
+                        "spanning_cells": True,
+                        "merged_cell_ids": ["p0-t0-c0", "p0-t0-c1"],
+                        "recovery_source": "local_split_pixel_ink_merge",
+                    }
+                ]
+            },
+            FusionSettings.from_mapping({"mode": "bbox_vlm"}),
+            remaining_document_budget=10,
+        )
+
+        self.assertTrue(unchanged)
+        self.assertEqual(stats["added"], 1)
+        self.assertEqual(decisions[0]["result"], "accepted")
+        recovered = page["preproc_blocks"][0]["lines"][0]["spans"][0][
+            "table_cells"
+        ][0]["content_spans"][0]
+        self.assertEqual(recovered["bbox"], [20.0, 25.0, 180.0, 75.0])
+        self.assertTrue(recovered["fusion_recovery_spanning_cells"])
+        self.assertEqual(
+            recovered["fusion_recovery_merged_cell_ids"],
+            ["p0-t0-c0", "p0-t0-c1"],
+        )
+
+    def test_bbox_recovery_accepts_terminal_field_ink_below_cell_boundary(self):
+        cells = [
+            {
+                "bbox": [10, 10, 190, 55],
+                "text": "Signature of Insured",
+                "row_start": 0,
+                "row_end": 0,
+                "col_start": 0,
+                "col_end": 0,
+            }
+        ]
+        page = structured_middle(
+            "table",
+            html="<table><tr><td>Signature of Insured</td></tr></table>",
+            table_cells=cells,
+        )["pdf_info"][0]
+
+        stats, decisions, _batches, unchanged = apply_bbox_recovery_proposals(
+            page,
+            0,
+            {
+                "items": [
+                    {
+                        "action": "add",
+                        "cell_id": "p0-t0-c0",
+                        "target_id": "",
+                        "bbox": [25, 45, 175, 75],
+                        "confidence": 0.95,
+                        "terminal_field_extension": True,
+                        "terminal_field_kind": "date",
+                        "recovery_source": "local_terminal_field_ink",
+                    }
+                ]
+            },
+            FusionSettings.from_mapping({"mode": "bbox_vlm"}),
+            remaining_document_budget=10,
+        )
+
+        self.assertTrue(unchanged)
+        self.assertEqual(stats["added"], 1)
+        self.assertEqual(decisions[0]["result"], "accepted")
+        recovered = page["preproc_blocks"][0]["lines"][0]["spans"][0][
+            "table_cells"
+        ][0]["content_spans"][0]
+        self.assertEqual(recovered["bbox"], [25.0, 45.0, 175.0, 75.0])
+        self.assertTrue(recovered["fusion_recovery_terminal_field_extension"])
+        self.assertEqual(recovered["fusion_recovery_terminal_field_kind"], "date")
+
+    def test_bbox_recovery_merges_local_ink_marker_into_handwriting_bbox(self):
+        cells = [
+            {
+                "bbox": [10, 10, 190, 90],
+                "text": "Abdominal pain",
+                "content_spans": [
+                    {
+                        "bbox": [70, 30, 170, 55],
+                        "text": "Abdominal pain",
+                    }
+                ],
+                "row_start": 0,
+                "row_end": 0,
+                "col_start": 0,
+                "col_end": 0,
+            }
+        ]
+        page = structured_middle(
+            "table",
+            html="<table><tr><td>Abdominal pain</td></tr></table>",
+            table_cells=cells,
+        )["pdf_info"][0]
+
+        stats, decisions, _batches, unchanged = apply_bbox_recovery_proposals(
+            page,
+            0,
+            {
+                "items": [
+                    {
+                        "action": "merge_ink_marker",
+                        "table_id": "p0-table-0",
+                        "cell_id": "p0-t0-c0",
+                        "target_id": "p0-t0-c0-b0",
+                        "bbox": [40, 30, 170, 56],
+                        "ink_marker_bbox": [40, 32, 60, 56],
+                        "confidence": 0.97,
+                        "recovery_source": "local_ink_marker_merge",
+                    }
+                ]
+            },
+            FusionSettings.from_mapping({"mode": "bbox_vlm"}),
+            remaining_document_budget=10,
+        )
+
+        self.assertTrue(unchanged)
+        self.assertEqual(stats["ink_marker_merged"], 1)
+        self.assertEqual(decisions[0]["result"], "accepted")
+        target = page["preproc_blocks"][0]["lines"][0]["spans"][0][
+            "table_cells"
+        ][0]["content_spans"][0]
+        self.assertEqual(target["bbox"], [40.0, 30.0, 170.0, 56.0])
+        self.assertTrue(target["fusion_ink_marker_grouped"])
+        self.assertTrue(target["fusion_force_recognition"])
+        self.assertEqual(target["fusion_ink_marker_bbox"], [40.0, 32.0, 60.0, 56.0])
         self.assertTrue(unchanged)
 
     def test_bbox_vlm_repairs_box_then_transcribes_isolated_empty_crop(self):
@@ -2133,6 +2295,66 @@ class FusionTests(unittest.TestCase):
         self.assertEqual(recovered["reason"], "empty_ocr_vlm_recovery")
         self.assertTrue(batches[0]["quality_guard_evaluated"])
         self.assertNotIn("quality_guard_triggered", batches[0])
+
+    def test_terminal_date_recovery_extracts_date_from_native_crop_context(self):
+        page = structured_middle(
+            "table",
+            html="<table><tr><td></td></tr></table>",
+            table_cells=[
+                {
+                    "bbox": [10, 10, 190, 80],
+                    "content_spans": [
+                        {
+                            "bbox": [120, 35, 180, 62],
+                            "text": "",
+                            "fusion_recovery_source": "local_terminal_field_ink",
+                            "fusion_recovery_confidence": 0.95,
+                            "fusion_recovery_action": "add",
+                            "fusion_recovery_terminal_field_extension": True,
+                            "fusion_recovery_terminal_field_kind": "date",
+                        }
+                    ],
+                    "text": "",
+                    "row_start": 0,
+                    "row_end": 0,
+                    "col_start": 0,
+                    "col_end": 0,
+                }
+            ],
+        )["pdf_info"][0]
+        lines = collect_table_ocr_lines(page, 0)
+
+        def recognize(_page, _size, candidates):
+            return {
+                "items": [
+                    {"id": candidates[0]["id"], "text": "年) 21|11|25"}
+                ],
+                "batches": [
+                    {"status": "ok", "ids": [candidates[0]["id"]]}
+                ],
+            }
+
+        stats, decisions, _batches = apply_bbox_recognition(
+            0,
+            [200, 300],
+            lines,
+            FusionSettings(
+                bbox_recognition_enabled=True,
+                bbox_recognition_batch_guard_enabled=False,
+            ),
+            recognize,
+        )
+
+        self.assertEqual(stats["recovered_vlm_selected"], 1)
+        self.assertEqual(decisions[0]["selected_text"], "21/11/25")
+        self.assertEqual(decisions[0]["reason"], "empty_ocr_vlm_recovery")
+        self.assertEqual(
+            decisions[0]["vlm_text_normalization"],
+            "terminal_date_extraction",
+        )
+        self.assertFalse(
+            lines[0].source_span.get("fusion_visualization_hidden", False)
+        )
 
     def test_empty_ocr_candidate_rejects_rules_formula_echo_and_overflow(self):
         settings = FusionSettings(bbox_recognition_enabled=True)
