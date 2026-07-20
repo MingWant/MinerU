@@ -130,13 +130,16 @@ class FusionSettings:
     bbox_recognition_selection_policy: str = "conservative"
     bbox_recognition_vlm_primary_min_quality: float = 0.5
     bbox_recognition_recovered_empty_min_confidence: float = 0.9
+    bbox_recognition_empty_max_chars_per_em: float = 4.0
     bbox_recovery_enabled: bool = False
     bbox_recovery_min_confidence: float = 0.85
     bbox_recovery_min_area_ratio: float = 0.001
     bbox_recovery_max_area_ratio: float = 0.95
     bbox_recovery_duplicate_iou: float = 0.6
+    bbox_recovery_cross_cell_duplicate_overlap: float = 0.72
     bbox_recovery_adjust_min_iou: float = 0.05
     bbox_recovery_orphan_max_cell_overlap: float = 0.25
+    bbox_recovery_fringe_bottom_extension: float = 72.0
     bbox_recovery_checkbox_min_size: float = 4.0
     bbox_recovery_checkbox_max_size: float = 20.0
     bbox_recovery_checkbox_min_aspect: float = 0.65
@@ -318,6 +321,9 @@ class FusionSettings:
             bbox_recognition_recovered_empty_min_confidence=float(
                 recognizer.get("recovered_empty_min_confidence", 0.9)
             ),
+            bbox_recognition_empty_max_chars_per_em=float(
+                recognizer.get("empty_max_chars_per_em", 4.0)
+            ),
             bbox_recovery_enabled=(
                 mode == "bbox_vlm"
                 or bool(recovery.get("enabled", False))
@@ -334,11 +340,17 @@ class FusionSettings:
             bbox_recovery_duplicate_iou=float(
                 recovery.get("duplicate_iou", 0.6)
             ),
+            bbox_recovery_cross_cell_duplicate_overlap=float(
+                recovery.get("cross_cell_duplicate_overlap", 0.72)
+            ),
             bbox_recovery_adjust_min_iou=float(
                 recovery.get("adjust_min_iou", 0.05)
             ),
             bbox_recovery_orphan_max_cell_overlap=float(
                 recovery.get("table_orphan_max_cell_overlap", 0.25)
+            ),
+            bbox_recovery_fringe_bottom_extension=float(
+                recovery.get("table_fringe_bottom_extension", 72.0)
             ),
             bbox_recovery_checkbox_min_size=float(
                 recovery.get("checkbox_apply_min_size", 4.0)
@@ -739,7 +751,14 @@ def collect_table_ocr_lines(
                 )
             for content_span, text, raw_bbox, source_span in candidates:
                 bbox = _valid_bbox(raw_bbox)
-                if bbox is None or not _center_inside(bbox, assessment.bbox):
+                fringe_recovery = bool(
+                    source_span is not None
+                    and source_span.get("fusion_recovery_action") == "add_fringe"
+                )
+                if bbox is None or (
+                    not _center_inside(bbox, assessment.bbox)
+                    and not fringe_recovery
+                ):
                     continue
                 key = (normalize_for_comparison(text), bbox)
                 if key in seen:
@@ -758,6 +777,10 @@ def collect_table_ocr_lines(
                         "fusion_table_bbox": list(assessment.bbox),
                         "fusion_cell_bbox": list(_valid_bbox(cell.get("bbox")) or bbox),
                         "fusion_table_geometry_reliable": assessment.quality.reliable,
+                        "fusion_recovered_bbox": bool(
+                            source_span is not None
+                            and source_span.get("fusion_recovery_action")
+                        ),
                     }
                 )
                 for field in ("row_start", "row_end", "col_start", "col_end"):
@@ -806,6 +829,12 @@ def _bbox_iou(left: Sequence[float], right: Sequence[float]) -> float:
     return intersection / union if union > 0 else 0.0
 
 
+def _bbox_coverage(bbox: Sequence[float], existing: Sequence[float]) -> float:
+    """Return how much of bbox is already covered by existing geometry."""
+    area = max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
+    return _intersection_area(bbox, existing) / area if area > 0 else 0.0
+
+
 def _clip_bbox_to_outer(
     bbox: Sequence[float],
     outer: Sequence[float],
@@ -820,15 +849,48 @@ def _clip_bbox_to_outer(
     )
 
 
+def _table_fringe_outer_bbox(
+    page: Mapping[str, Any],
+    table_bbox: Sequence[float],
+    extension: float,
+) -> tuple[float, float, float, float]:
+    page_size = page.get("page_size", [])
+    page_height = (
+        float(page_size[1])
+        if isinstance(page_size, (list, tuple))
+        and len(page_size) >= 2
+        and isinstance(page_size[1], (int, float))
+        and math.isfinite(float(page_size[1]))
+        and float(page_size[1]) > 0
+        else float(table_bbox[3]) + max(float(extension), 0.0)
+    )
+    return (
+        float(table_bbox[0]),
+        float(table_bbox[1]),
+        float(table_bbox[2]),
+        min(
+            page_height,
+            float(table_bbox[3]) + max(float(extension), 0.0),
+        ),
+    )
+
+
 def build_bbox_recovery_manifest(
     page: Mapping[str, Any],
     page_index: int,
 ) -> list[dict[str, Any]]:
     """Describe Pipeline Table/Cell geometry without granting mutation authority."""
     manifest: list[dict[str, Any]] = []
-    for table_index, table in enumerate(
-        collect_structured_spans(page, page_index, {"table"})
-    ):
+    structured_tables = collect_structured_spans(page, page_index, {"table"})
+    page_existing = [
+        {
+            "bbox": list(line.bbox),
+            "text": line.text,
+            "source": line.block_type,
+        }
+        for line in collect_text_lines(page, page_index)
+    ]
+    for table_index, table in enumerate(structured_tables):
         raw_cells = table.span.get("table_cells", [])
         if not isinstance(raw_cells, list):
             continue
@@ -900,6 +962,12 @@ def build_bbox_recovery_manifest(
                     "id": f"p{page_index}-table-{table_index}",
                     "bbox": list(table.bbox),
                     "cells": cells,
+                    "page_existing": page_existing,
+                    "page_exclusions": [
+                        list(other.bbox)
+                        for other_index, other in enumerate(structured_tables)
+                        if other_index != table_index
+                    ],
                 }
             )
     return manifest
@@ -1000,7 +1068,9 @@ def apply_bbox_recovery_proposals(
         "added": 0,
         "adjusted": 0,
         "orphan_added": 0,
+        "fringe_added": 0,
         "checkbox_added": 0,
+        "checkbox_merged": 0,
         "rejected": 0,
         "errors": 0,
     }
@@ -1047,13 +1117,20 @@ def apply_bbox_recovery_proposals(
         cell_bbox = _valid_bbox(cell.get("bbox")) if cell is not None else None
         table_key = cell_id.rsplit("-c", 1)[0] if isinstance(cell_id, str) else ""
         expected_table_id = table_key.replace("-t", "-table-")
-        detached_actions = {"add_orphan", "add_checkbox"}
+        detached_actions = {"add_orphan", "add_fringe", "add_checkbox"}
         if action not in detached_actions:
             table_id = expected_table_id
         table = tables.get(table_id) if isinstance(table_id, str) else None
         table_bbox = table[1] if table is not None else None
         decision["table_id"] = table_id
-        if action not in {"add", "adjust", "add_orphan", "add_checkbox"}:
+        if action not in {
+            "add",
+            "adjust",
+            "add_orphan",
+            "add_fringe",
+            "add_checkbox",
+            "merge_checkbox",
+        }:
             reason = "unsupported_action"
         elif cell is None or cell_bbox is None:
             reason = "unknown_cell"
@@ -1070,9 +1147,19 @@ def apply_bbox_recovery_proposals(
         elif table_counts[table_key] >= settings.bbox_recovery_max_proposals_per_table:
             reason = "table_budget"
         if reason is None:
+            if action == "add_fringe" and table_bbox is not None:
+                outer_bbox = _table_fringe_outer_bbox(
+                    page,
+                    table_bbox,
+                    settings.bbox_recovery_fringe_bottom_extension,
+                )
+            else:
+                outer_bbox = (
+                    table_bbox if action in detached_actions else cell_bbox
+                )
             bbox = _clip_bbox_to_outer(
                 bbox,
-                table_bbox if action in detached_actions else cell_bbox,
+                outer_bbox,
             )
             if bbox is None:
                 reason = (
@@ -1081,7 +1168,16 @@ def apply_bbox_recovery_proposals(
                     else "bbox_outside_cell"
                 )
         if reason is None:
-            outer_bbox = table_bbox if action in detached_actions else cell_bbox
+            if action == "add_fringe":
+                outer_bbox = _table_fringe_outer_bbox(
+                    page,
+                    table_bbox,
+                    settings.bbox_recovery_fringe_bottom_extension,
+                )
+            else:
+                outer_bbox = (
+                    table_bbox if action in detached_actions else cell_bbox
+                )
             cell_area = (outer_bbox[2] - outer_bbox[0]) * (
                 outer_bbox[3] - outer_bbox[1]
             )
@@ -1104,9 +1200,14 @@ def apply_bbox_recovery_proposals(
                     reason = "checkbox_geometry_guard"
             else:
                 area_ratio = bbox_area / cell_area if cell_area > 0 else 0.0
-                if not settings.bbox_recovery_min_area_ratio <= area_ratio <= settings.bbox_recovery_max_area_ratio:
+                minimum_area_ratio = (
+                    0.0
+                    if action in {"add_orphan", "add_fringe"}
+                    else settings.bbox_recovery_min_area_ratio
+                )
+                if not minimum_area_ratio <= area_ratio <= settings.bbox_recovery_max_area_ratio:
                     reason = "area_ratio_guard"
-        if reason is None and action == "add_orphan":
+        if reason is None and action in {"add_orphan", "add_fringe"}:
             bbox_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
             related_cell_bboxes = [
                 valid
@@ -1124,15 +1225,17 @@ def apply_bbox_recovery_proposals(
             )
             if maximum_overlap > settings.bbox_recovery_orphan_max_cell_overlap:
                 reason = "orphan_cell_overlap_guard"
-        existing_bboxes = []
-        if action in detached_actions:
+        existing_records: list[
+            tuple[tuple[float, float, float, float], str]
+        ] = []
+        if action in detached_actions or action == "add":
             for related_id, related_cell in cells.items():
                 if not related_id.startswith(table_key + "-c"):
                     continue
                 raw_spans = related_cell.get("content_spans", [])
                 if isinstance(raw_spans, list):
-                    existing_bboxes.extend(
-                        valid
+                    existing_records.extend(
+                        (valid, related_id)
                         for span in raw_spans
                         if isinstance(span, Mapping)
                         for valid in [_valid_bbox(span.get("bbox"))]
@@ -1140,12 +1243,12 @@ def apply_bbox_recovery_proposals(
                     )
                 content_bbox = _valid_bbox(related_cell.get("content_bbox"))
                 if content_bbox is not None:
-                    existing_bboxes.append(content_bbox)
+                    existing_records.append((content_bbox, related_id))
         elif cell is not None:
             raw_spans = cell.get("content_spans", [])
             if isinstance(raw_spans, list):
-                existing_bboxes.extend(
-                    valid
+                existing_records.extend(
+                    (valid, str(cell_id or ""))
                     for span in raw_spans
                     if isinstance(span, Mapping)
                     for valid in [_valid_bbox(span.get("bbox"))]
@@ -1153,16 +1256,34 @@ def apply_bbox_recovery_proposals(
                 )
             content_bbox = _valid_bbox(cell.get("content_bbox"))
             if content_bbox is not None:
-                existing_bboxes.append(content_bbox)
+                existing_records.append((content_bbox, str(cell_id or "")))
+        existing_bboxes = [record[0] for record in existing_records]
         target = boxes.get(target_id) if isinstance(target_id, str) else None
-        if reason is None and action in {"add", "add_orphan", "add_checkbox"} and any(
+        if reason is None and action == "add" and any(
+            owner_id != cell_id
+            and _bbox_coverage(bbox, existing)
+            >= settings.bbox_recovery_cross_cell_duplicate_overlap
+            for existing, owner_id in existing_records
+        ):
+            reason = "cross_cell_duplicate_bbox"
+        if reason is None and action in {
+            "add",
+            "add_orphan",
+            "add_fringe",
+            "add_checkbox",
+        } and any(
             _bbox_iou(bbox, existing) >= settings.bbox_recovery_duplicate_iou
             for existing in existing_bboxes
         ):
             reason = "duplicate_bbox"
-        if reason is None and action in {"add", "add_orphan", "add_checkbox"} and target_id not in {"", None}:
+        if reason is None and action in {
+            "add",
+            "add_orphan",
+            "add_fringe",
+            "add_checkbox",
+        } and target_id not in {"", None}:
             reason = "unexpected_add_target"
-        if reason is None and action == "adjust":
+        if reason is None and action in {"adjust", "merge_checkbox"}:
             if (
                 target is None
                 or not isinstance(target_id, str)
@@ -1194,9 +1315,11 @@ def apply_bbox_recovery_proposals(
             "fusion_recovery_action": action,
             "fusion_recovery_table_id": table_id,
             "fusion_recovery_orphan": action == "add_orphan",
+            "fusion_recovery_fringe": action == "add_fringe",
             "fusion_recovery_checkbox": action == "add_checkbox",
+            "fusion_checkbox_grouped": action == "merge_checkbox",
         }
-        if action == "add_checkbox":
+        if action in {"add_checkbox", "merge_checkbox"}:
             recovery_metadata.update(
                 {
                     "fusion_checkbox_state": str(
@@ -1207,7 +1330,7 @@ def apply_bbox_recovery_proposals(
                     ),
                 }
             )
-        if action in {"add", "add_orphan", "add_checkbox"}:
+        if action in {"add", "add_orphan", "add_fringe", "add_checkbox"}:
             raw_spans = cell.setdefault("content_spans", [])
             if not isinstance(raw_spans, list):
                 raw_spans = []
@@ -1224,6 +1347,8 @@ def apply_bbox_recovery_proposals(
             stats["added"] += 1
             if action == "add_orphan":
                 stats["orphan_added"] += 1
+            elif action == "add_fringe":
+                stats["fringe_added"] += 1
             elif action == "add_checkbox":
                 stats["checkbox_added"] += 1
         else:
@@ -1241,6 +1366,8 @@ def apply_bbox_recovery_proposals(
                 raw_target["content_bbox"] = list(bbox)
                 raw_target.update(recovery_metadata)
             stats["adjusted"] += 1
+            if action == "merge_checkbox":
+                stats["checkbox_merged"] += 1
         accepted_count += 1
         table_counts[table_key] += 1
         stats["accepted"] += 1
@@ -1255,7 +1382,9 @@ def apply_bbox_recovery_proposals(
         stats["added"] = 0
         stats["adjusted"] = 0
         stats["orphan_added"] = 0
+        stats["fringe_added"] = 0
         stats["checkbox_added"] = 0
+        stats["checkbox_merged"] = 0
         stats["rejected"] += rolled_back
         stats["errors"] += 1
         for decision in decisions:
@@ -1326,6 +1455,7 @@ def build_bbox_recognition_manifest(
         seen.add(key)
         candidate_id = f"p{page_index}-bbox-{len(manifest)}"
         metadata = line.spans[0]
+        recovered_bbox = bool(metadata.get("fusion_recovered_bbox"))
         candidate = {
             "id": candidate_id,
             "bbox": [round(value, 3) for value in line.bbox],
@@ -1334,6 +1464,8 @@ def build_bbox_recognition_manifest(
             if line.confidence is not None
             else None,
             "type": line.block_type,
+            "recovered_bbox": recovered_bbox,
+            "recovered": recovered_bbox and not line.text.strip(),
             "contexts": {
                 "target": [round(value, 3) for value in line.bbox],
             },
@@ -1423,6 +1555,9 @@ _WORD_DATE_RE = re.compile(
 _AMOUNT_RE = re.compile(
     r"^\s*[($€£¥]?\s*-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?\s*\)?\s*$"
 )
+_RECOVERED_GROUPED_AMOUNT_RE = re.compile(
+    r"^\s*(\d{1,3})([.,])(\d{3})\2(\d{2})\s*$"
+)
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9./_-]{2,63}$")
 _DATE_LIKE_RE = re.compile(
     r"(?:\d{1,4}\s*[-/]\s*[A-Za-z0-9]{1,2}\s*[-/]\s*\d{1,4}|"
@@ -1431,6 +1566,11 @@ _DATE_LIKE_RE = re.compile(
 )
 _BBOX_PROTOCOL_ID_RE = re.compile(
     r"^(?:p\d+(?:-bbox)?-\d+|(?:slot|image)[-_]?\d+)\W*$",
+    flags=re.IGNORECASE,
+)
+_BBOX_EMPTY_PLACEHOLDER_RE = re.compile(
+    r"[\[\(<{]?\s*(?:illegible|unreadable|non[\s_-]*text|no[\s_-]*text|"
+    r"blank|empty|none|n/?a|unknown)\s*[\]\)>}]?",
     flags=re.IGNORECASE,
 )
 
@@ -1452,6 +1592,14 @@ def _valid_date_candidate(text: str) -> bool:
 
 def _valid_amount_candidate(text: str) -> bool:
     return bool(_AMOUNT_RE.fullmatch(text))
+
+
+def _normalize_recovered_amount_candidate(text: str) -> str:
+    """Repair an unambiguous repeated separator in a newly recovered amount."""
+    match = _RECOVERED_GROUPED_AMOUNT_RE.fullmatch(text)
+    if match is None:
+        return text.strip()
+    return f"{match.group(1)},{match.group(3)}.{match.group(4)}"
 
 
 def _valid_identifier_candidate(text: str) -> bool:
@@ -1527,6 +1675,66 @@ def select_bbox_recognition_candidate(
         return "ocr", "vlm_candidate_too_long", field_type, similarity, length_ratio
     if not normalized_ocr:
         if settings.bbox_recognition_empty_ocr_enabled:
+            metadata = line.spans[0] if line.spans else {}
+            checkbox = bool(metadata.get("fusion_recovery_checkbox"))
+            if not checkbox and _BBOX_EMPTY_PLACEHOLDER_RE.fullmatch(vlm_text):
+                return (
+                    "ocr",
+                    "empty_ocr_placeholder_guard",
+                    "general",
+                    similarity,
+                    length_ratio,
+                )
+            has_text_character = any(
+                unicodedata.category(character).startswith(("L", "N"))
+                for character in vlm_text
+            )
+            if not checkbox and not has_text_character:
+                return (
+                    "ocr",
+                    "empty_ocr_non_text_candidate",
+                    "general",
+                    similarity,
+                    length_ratio,
+                )
+            if (
+                line.block_type == "table_ocr"
+                and not checkbox
+                and re.search(
+                    r"\\(?:begin|because|end|frac|overline|sqrt|sum|therefore)",
+                    vlm_text,
+                    flags=re.IGNORECASE,
+                )
+            ):
+                return (
+                    "ocr",
+                    "empty_ocr_formula_guard",
+                    "general",
+                    similarity,
+                    length_ratio,
+                )
+            width = max(line.bbox[2] - line.bbox[0], 1.0)
+            height = max(line.bbox[3] - line.bbox[1], 1.0)
+            line_count = max(vlm_text.count("\n") + 1, 1)
+            em_height = max(height / line_count, 1.0)
+            maximum_characters = max(
+                8,
+                int(
+                    width
+                    / em_height
+                    * line_count
+                    * settings.bbox_recognition_empty_max_chars_per_em
+                ),
+            )
+            visible_characters = len(re.sub(r"\s+", "", vlm_text))
+            if not checkbox and visible_characters > maximum_characters:
+                return (
+                    "ocr",
+                    "empty_ocr_geometry_capacity_guard",
+                    "general",
+                    similarity,
+                    length_ratio,
+                )
             return (
                 "vlm",
                 "empty_ocr_vlm_recovery",
@@ -1825,6 +2033,13 @@ def apply_bbox_recognition(
     manifest, by_id = build_bbox_recognition_manifest(page_index, lines)
     stats = {
         "candidates": len(manifest),
+        "recovered_candidates": sum(
+            1 for candidate in manifest if candidate.get("recovered")
+        ),
+        "recovered_responses": 0,
+        "recovered_vlm_selected": 0,
+        "recovered_no_response": 0,
+        "recovered_hidden": 0,
         "requests": 0,
         "responses": 0,
         "vlm_selected": 0,
@@ -1839,6 +2054,8 @@ def apply_bbox_recognition(
         "native_cache_misses": 0,
         "native_cache_writes": 0,
         "native_deduplicated_candidates": 0,
+        "native_recovered_limit_bypasses": 0,
+        "native_recovered_unsent": 0,
         "circuit_breaker_trips": 0,
         "high_risk_fallbacks": 0,
         "protocol_echoes": 0,
@@ -1870,6 +2087,8 @@ def apply_bbox_recognition(
         "native_cache_misses",
         "native_cache_writes",
         "native_deduplicated_candidates",
+        "native_recovered_limit_bypasses",
+        "native_recovered_unsent",
         "circuit_breaker_trips",
     ):
         value = response.get(key)
@@ -1897,6 +2116,11 @@ def apply_bbox_recognition(
                 continue
             returned[candidate_id] = text.strip()
     stats["responses"] = len(returned)
+    stats["recovered_responses"] = sum(
+        1
+        for candidate in manifest
+        if candidate.get("recovered") and candidate["id"] in returned
+    )
     batch_guarded_ids = apply_recognition_batch_quality_guard(
         batches,
         returned,
@@ -1907,7 +2131,13 @@ def apply_bbox_recognition(
     for candidate in manifest:
         candidate_id = candidate["id"]
         line = by_id[candidate_id]
-        vlm_text = returned.get(candidate_id, "")
+        recovered_bbox = bool(candidate.get("recovered_bbox"))
+        recovery_requires_recognition = bool(candidate.get("recovered"))
+        raw_vlm_text = returned.get(candidate_id, "")
+        vlm_text = raw_vlm_text
+        if recovery_requires_recognition and not line.text.strip():
+            vlm_text = _normalize_recovered_amount_candidate(vlm_text)
+        normalized_recovered_amount = vlm_text != raw_vlm_text
         source, reason, field_type, similarity, length_ratio = (
             select_bbox_recognition_candidate(line, vlm_text, settings)
             if candidate_id in returned
@@ -1942,10 +2172,23 @@ def apply_bbox_recognition(
                 settings,
             )
             stats["vlm_selected"] += 1
+            if recovery_requires_recognition:
+                stats["recovered_vlm_selected"] += 1
             if candidate_reason == "empty_ocr_vlm_recovery":
                 stats["empty_ocr_recoveries"] += 1
         else:
             stats["ocr_kept"] += 1
+            if recovery_requires_recognition and candidate_id not in returned:
+                stats["recovered_no_response"] += 1
+            if (
+                recovery_requires_recognition
+                and not line.text.strip()
+                and line.source_span is not None
+                and not line.source_span.get("fusion_recovery_checkbox")
+            ):
+                line.source_span["fusion_visualization_hidden"] = True
+                line.source_span["fusion_visualization_hidden_reason"] = reason
+                stats["recovered_hidden"] += 1
             if candidate_reason.startswith("high_risk_"):
                 stats["high_risk_fallbacks"] += 1
             if candidate_reason == "bbox_protocol_id_echo":
@@ -1956,9 +2199,11 @@ def apply_bbox_recognition(
             "id": candidate_id,
             "bbox": candidate["bbox"],
             "block_type": line.block_type,
+            "recovered_bbox": recovered_bbox,
+            "recovery_requires_recognition": recovery_requires_recognition,
             "ocr_text": candidate["ocr_text"],
             "ocr_confidence": candidate["ocr_confidence"],
-            "vlm_text": vlm_text if candidate_id in returned else None,
+            "vlm_text": raw_vlm_text if candidate_id in returned else None,
             "selected_source": source,
             "selected_text": line.text,
             "reason": reason,
@@ -1966,6 +2211,9 @@ def apply_bbox_recognition(
             "similarity": round(similarity, 6),
             "length_ratio": round(length_ratio, 6),
         }
+        if normalized_recovered_amount:
+            decision["normalized_vlm_text"] = vlm_text
+            decision["vlm_text_normalization"] = "grouped_amount_separators"
         if candidate_reason != reason:
             decision["candidate_reason"] = candidate_reason
         decisions.append(decision)
@@ -3218,6 +3466,11 @@ def fuse_middle_json(
         "page_reconciliation_insertions": 0,
         "page_reconciliation_errors": 0,
         "bbox_recognition_candidates": 0,
+        "bbox_recognition_recovered_candidates": 0,
+        "bbox_recognition_recovered_responses": 0,
+        "bbox_recognition_recovered_vlm_selected": 0,
+        "bbox_recognition_recovered_no_response": 0,
+        "bbox_recognition_recovered_hidden": 0,
         "bbox_recognition_requests": 0,
         "bbox_recognition_responses": 0,
         "bbox_recognition_vlm_selected": 0,
@@ -3232,6 +3485,8 @@ def fuse_middle_json(
         "bbox_recognition_native_cache_misses": 0,
         "bbox_recognition_native_cache_writes": 0,
         "bbox_recognition_native_deduplicated_candidates": 0,
+        "bbox_recognition_native_recovered_limit_bypasses": 0,
+        "bbox_recognition_native_recovered_unsent": 0,
         "bbox_recognition_circuit_breaker_trips": 0,
         "bbox_recognition_high_risk_fallbacks": 0,
         "bbox_recognition_protocol_echoes": 0,
@@ -3251,14 +3506,17 @@ def fuse_middle_json(
         "bbox_recovery_local_only_tables": 0,
         "bbox_recovery_orphan_tables_analyzed": 0,
         "bbox_recovery_orphan_proposals": 0,
+        "bbox_recovery_fringe_proposals": 0,
         "bbox_recovery_checkbox_tables_analyzed": 0,
         "bbox_recovery_checkbox_candidates": 0,
         "bbox_recovery_checkbox_proposals": 0,
+        "bbox_recovery_checkbox_merge_proposals": 0,
         "bbox_recovery_checkbox_checked": 0,
         "bbox_recovery_checkbox_unchecked": 0,
         "bbox_recovery_checkbox_ambiguous": 0,
         "bbox_recovery_pixel_cells_analyzed": 0,
         "bbox_recovery_pixel_cells_skipped": 0,
+        "bbox_recovery_diagonal_rules_removed": 0,
         "bbox_recovery_pixel_analysis_ms": 0.0,
         "bbox_recovery_requests": 0,
         "bbox_recovery_proposals": 0,
@@ -3266,7 +3524,9 @@ def fuse_middle_json(
         "bbox_recovery_added": 0,
         "bbox_recovery_adjusted": 0,
         "bbox_recovery_orphan_added": 0,
+        "bbox_recovery_fringe_added": 0,
         "bbox_recovery_checkbox_added": 0,
+        "bbox_recovery_checkbox_merged": 0,
         "bbox_recovery_rejected": 0,
         "bbox_recovery_errors": 0,
         "table_targets": 0,
@@ -3388,17 +3648,26 @@ def fuse_middle_json(
                             "bbox_recovery_orphan_tables_analyzed",
                         ),
                         ("orphan_proposals", "bbox_recovery_orphan_proposals"),
+                        ("fringe_proposals", "bbox_recovery_fringe_proposals"),
                         (
                             "checkbox_tables_analyzed",
                             "bbox_recovery_checkbox_tables_analyzed",
                         ),
                         ("checkbox_candidates", "bbox_recovery_checkbox_candidates"),
                         ("checkbox_proposals", "bbox_recovery_checkbox_proposals"),
+                        (
+                            "checkbox_merged",
+                            "bbox_recovery_checkbox_merge_proposals",
+                        ),
                         ("checkbox_checked", "bbox_recovery_checkbox_checked"),
                         ("checkbox_unchecked", "bbox_recovery_checkbox_unchecked"),
                         ("checkbox_ambiguous", "bbox_recovery_checkbox_ambiguous"),
                         ("pixel_cells_analyzed", "bbox_recovery_pixel_cells_analyzed"),
                         ("pixel_cells_skipped", "bbox_recovery_pixel_cells_skipped"),
+                        (
+                            "diagonal_rules_removed",
+                            "bbox_recovery_diagonal_rules_removed",
+                        ),
                     ):
                         value = recovery_response.get(response_key)
                         if isinstance(value, int) and value > 0:
@@ -3431,7 +3700,9 @@ def fuse_middle_json(
                         "added",
                         "adjusted",
                         "orphan_added",
+                        "fringe_added",
                         "checkbox_added",
+                        "checkbox_merged",
                         "rejected",
                         "errors",
                     ):
@@ -3463,19 +3734,73 @@ def fuse_middle_json(
                 0,
             )
             if len(recognition_lines) > remaining_recognition_budget:
-                counts["bbox_recognition_candidate_limit"] += (
-                    len(recognition_lines) - remaining_recognition_budget
+                if settings.mode == "bbox_vlm":
+                    recovered_lines = [
+                        line
+                        for line in recognition_lines
+                        if line.spans[0].get("fusion_recovered_bbox")
+                        and not line.text.strip()
+                    ]
+                    ordinary_lines = [
+                        line
+                        for line in recognition_lines
+                        if line not in recovered_lines
+                    ]
+                    ordinary_budget = max(
+                        remaining_recognition_budget - len(recovered_lines),
+                        0,
+                    )
+                    recognition_lines = (
+                        recovered_lines + ordinary_lines[:ordinary_budget]
+                    )
+                else:
+                    recognition_lines = recognition_lines[
+                        :remaining_recognition_budget
+                    ]
+                counts["bbox_recognition_candidate_limit"] += max(
+                    len(normal_recognition_lines)
+                    + len(table_recognition_lines)
+                    - len(recognition_lines),
+                    0,
                 )
-                recognition_lines = recognition_lines[:remaining_recognition_budget]
             if bbox_recognizer is None:
                 if recognition_lines:
-                    unavailable_manifest, _unavailable_by_id = (
+                    unavailable_manifest, unavailable_by_id = (
                         build_bbox_recognition_manifest(page_index, recognition_lines)
                     )
                     recognition_candidate_count += len(unavailable_manifest)
                     counts["bbox_recognition_candidates"] += len(
                         unavailable_manifest
                     )
+                    unavailable_recovered = sum(
+                        1
+                        for candidate in unavailable_manifest
+                        if candidate.get("recovered")
+                    )
+                    counts[
+                        "bbox_recognition_recovered_candidates"
+                    ] += unavailable_recovered
+                    counts[
+                        "bbox_recognition_recovered_no_response"
+                    ] += unavailable_recovered
+                    hidden_recovered = 0
+                    for candidate in unavailable_manifest:
+                        if not candidate.get("recovered"):
+                            continue
+                        line = unavailable_by_id[candidate["id"]]
+                        if (
+                            line.source_span is None
+                            or line.source_span.get("fusion_recovery_checkbox")
+                        ):
+                            continue
+                        line.source_span["fusion_visualization_hidden"] = True
+                        line.source_span[
+                            "fusion_visualization_hidden_reason"
+                        ] = "recognizer_unavailable"
+                        hidden_recovered += 1
+                    counts[
+                        "bbox_recognition_recovered_hidden"
+                    ] += hidden_recovered
                     counts["bbox_recognition_ocr_kept"] += len(
                         unavailable_manifest
                     )
@@ -3494,6 +3819,10 @@ def fuse_middle_json(
                             "id": candidate["id"],
                             "bbox": candidate["bbox"],
                             "block_type": candidate["type"],
+                            "recovered_bbox": bool(candidate.get("recovered_bbox")),
+                            "recovery_requires_recognition": bool(
+                                candidate.get("recovered")
+                            ),
                             "ocr_text": candidate["ocr_text"],
                             "ocr_confidence": candidate["ocr_confidence"],
                             "vlm_text": None,
@@ -3519,6 +3848,11 @@ def fuse_middle_json(
                 recognition_candidate_count += recognition_stats["candidates"]
                 for key in (
                     "candidates",
+                    "recovered_candidates",
+                    "recovered_responses",
+                    "recovered_vlm_selected",
+                    "recovered_no_response",
+                    "recovered_hidden",
                     "requests",
                     "responses",
                     "vlm_selected",
@@ -3533,6 +3867,8 @@ def fuse_middle_json(
                     "native_cache_misses",
                     "native_cache_writes",
                     "native_deduplicated_candidates",
+                    "native_recovered_limit_bypasses",
+                    "native_recovered_unsent",
                     "circuit_breaker_trips",
                     "high_risk_fallbacks",
                     "protocol_echoes",
@@ -4054,8 +4390,12 @@ class OpenAIVisionVerifier:
         self.config = config
         self.timeout = float(config.get("timeout_seconds", 120))
         self.headers = {"Content-Type": "application/json"}
-        api_key_env = str(config.get("api_key_env", "VLLM_API_KEY"))
-        api_key = os.getenv(api_key_env)
+        api_key_env = config.get("api_key_env")
+        api_key = (
+            os.getenv(api_key_env.strip())
+            if isinstance(api_key_env, str) and api_key_env.strip()
+            else None
+        )
         if api_key:
             self.headers["Authorization"] = f"Bearer {api_key}"
         self.model = config.get("model")

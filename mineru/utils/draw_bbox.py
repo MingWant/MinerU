@@ -35,7 +35,7 @@ DIRECT_LAYOUT_BBOX_BLOCK_TYPES = TEXT_LIKE_BLOCK_TYPES_FOR_BBOX | {
 
 # span.pdf 从这些结构性 block 中收集内部 span bbox。
 SPAN_SOURCE_BLOCK_TYPES = DIRECT_LAYOUT_BBOX_BLOCK_TYPES
-BBOX_RENDERER_VERSION = 6
+BBOX_RENDERER_VERSION = 8
 
 
 def _get_layout_source_blocks(page):
@@ -114,10 +114,19 @@ def _table_cell_render_bboxes(span):
         for cell in span.get("table_cells", [])
         if isinstance(cell, dict)
     ]
+    def visible_content_bboxes(cell):
+        raw_spans = cell.get("content_spans", [])
+        if isinstance(raw_spans, list) and raw_spans:
+            return _deduplicate_bboxes(
+                item.get("bbox")
+                for item in raw_spans
+                if isinstance(item, dict)
+                and not item.get("fusion_visualization_hidden")
+            )
+        return cell_content_bboxes(cell)
+
     content_bboxes = _deduplicate_bboxes(
-        bbox
-        for cell in cells
-        for bbox in cell_content_bboxes(cell)
+        bbox for cell in cells for bbox in visible_content_bboxes(cell)
     )
     # Cell geometry remains in middle JSON, but only content-tight OCR boxes are
     # useful in visual review. Returning no Cell boxes keeps both PDF renderers
@@ -141,8 +150,6 @@ def draw_bbox_without_number(i, bbox_list, page, c, rgb_config, fill_config):
 
 def draw_bbox_with_number(i, bbox_list, page, c, rgb_config, fill_config, draw_bbox=True):
     new_rgb = [float(color) / 255 for color in rgb_config]
-    # 强制转换为 float
-    page_width, page_height = float(page.cropbox[2]), float(page.cropbox[3])
 
     for j, bbox in enumerate(_page_bboxes(bbox_list, i)):
         # 确保bbox的每个元素都是float
@@ -548,8 +555,15 @@ def draw_span_bbox(pdf_info, pdf_bytes, out_path, filename):
                 continue
             page_form_key_list.append(field.get("key_bbox"))
             page_form_value_list.append(field.get("value_bbox"))
-        # staged middle JSON以preproc_blocks为准；finalized JSON也兼容para_blocks。
-        for block_key in ('preproc_blocks', 'para_blocks'):
+        # staged/fused JSON 以 preproc_blocks 为页内原始来源；同时扫描
+        # para_blocks 会把跨页段落合并产生的子项画到错误页面。只有没有
+        # preproc_blocks 的 finalized JSON 才回退到 para_blocks。
+        block_keys = (
+            ('preproc_blocks',)
+            if page.get('preproc_blocks')
+            else ('para_blocks',)
+        )
+        for block_key in block_keys:
             for block in page.get(block_key, []):
                 if block.get('type') in SPAN_SOURCE_BLOCK_TYPES:
                     for line in block.get('lines', []):

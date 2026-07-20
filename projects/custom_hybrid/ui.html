@@ -483,15 +483,26 @@
           <div class="coverage-metric"><strong id="nativeCacheHitsValue">-</strong><span>Native Cache Hits</span></div>
           <div class="coverage-metric"><strong id="nativeCacheMissesValue">-</strong><span>Native Cache Misses</span></div>
           <div class="coverage-metric"><strong id="nativeBudgetSkippedValue">-</strong><span>Native Budget Skips</span></div>
+          <div class="coverage-metric"><strong id="recoveredBboxCandidatesValue">-</strong><span>Recovered BBox Candidates</span></div>
+          <div class="coverage-metric"><strong id="recoveredBboxResponsesValue">-</strong><span>Recovered BBox Responses</span></div>
+          <div class="coverage-metric"><strong id="recoveredBboxNoResponseValue">-</strong><span>Recovered BBox No-Response</span></div>
+          <div class="coverage-metric"><strong id="recoveredBboxHiddenValue">-</strong><span>Unconfirmed BBoxes Hidden</span></div>
+          <div class="coverage-metric"><strong id="recoveredBboxUnsentValue">-</strong><span>Recovered BBox Unsent</span></div>
+          <div class="coverage-metric"><strong id="recoveredBboxBypassesValue">-</strong><span>Recovery Limit Bypasses</span></div>
           <div class="coverage-metric"><strong id="recognitionCircuitBreakersValue">-</strong><span>Protocol Circuit Breakers</span></div>
           <div class="coverage-metric"><strong id="recoveryTablesValue">-</strong><span>Recovery Tables Reviewed</span></div>
           <div class="coverage-metric"><strong id="localRecoveryValue">-</strong><span>Local Pixel Proposals</span></div>
           <div class="coverage-metric"><strong id="recoveryCellsAnalyzedValue">-</strong><span>Recovery Cells Analyzed</span></div>
           <div class="coverage-metric"><strong id="recoveryCellsSkippedValue">-</strong><span>Recovery Cells Skipped</span></div>
+          <div class="coverage-metric"><strong id="recoveryDiagonalRulesValue">-</strong><span>Diagonal Rules Removed</span></div>
           <div class="coverage-metric"><strong id="recoveryPixelMsValue">-</strong><span>Recovery Pixel Time</span></div>
           <div class="coverage-metric"><strong id="orphanTablesValue">-</strong><span>Orphan Tables Scanned</span></div>
           <div class="coverage-metric"><strong id="orphanBoxesValue">-</strong><span>Orphan Boxes Added</span></div>
+          <div class="coverage-metric"><strong id="fringeProposalsValue">-</strong><span>Fringe BBox Proposals</span></div>
+          <div class="coverage-metric"><strong id="fringeBoxesValue">-</strong><span>Fringe BBoxes Added</span></div>
           <div class="coverage-metric"><strong id="checkboxBoxesValue">-</strong><span>Checkbox Boxes Added</span></div>
+          <div class="coverage-metric"><strong id="checkboxMergeProposalsValue">-</strong><span>Checkbox Merge Proposals</span></div>
+          <div class="coverage-metric"><strong id="checkboxMergedValue">-</strong><span>Checkbox Labels Merged</span></div>
           <div class="coverage-metric"><strong id="checkboxCheckedValue">-</strong><span>Checked Controls</span></div>
           <div class="coverage-metric"><strong id="checkboxUncheckedValue">-</strong><span>Unchecked Controls</span></div>
           <div class="coverage-metric"><strong id="checkboxAmbiguousValue">-</strong><span>Ambiguous Controls</span></div>
@@ -971,7 +982,7 @@
   }
 
   function renderCoverageSummary(report) {
-    const totals = {total: 0, matched: 0, recovered: 0, uncovered: 0, unreliableTables: 0, keyValuePairs: 0, vlmRecognized: 0, ocrRetained: 0, protocolEchoes: 0, invalidRecognition: 0, recognitionErrors: 0, recognitionRebatches: 0, nativeRecognitionRequests: 0, nativeRecognitionSkipped: 0, nativeCacheHits: 0, nativeCacheMisses: 0, nativeBudgetSkipped: 0, recognitionCircuitBreakers: 0, recoveryTables: 0, localRecovery: 0, recoveryCellsAnalyzed: 0, recoveryCellsSkipped: 0, recoveryPixelMs: 0, orphanTables: 0, orphanBoxes: 0, checkboxBoxes: 0, checkboxChecked: 0, checkboxUnchecked: 0, checkboxAmbiguous: 0, recoveryAdded: 0, recoveryAdjusted: 0, recoveryRejected: 0};
+    const totals = {total: 0, matched: 0, recovered: 0, uncovered: 0, unreliableTables: 0, keyValuePairs: 0, vlmRecognized: 0, ocrRetained: 0, protocolEchoes: 0, invalidRecognition: 0, recognitionErrors: 0, recognitionRebatches: 0, nativeRecognitionRequests: 0, nativeRecognitionSkipped: 0, nativeCacheHits: 0, nativeCacheMisses: 0, nativeBudgetSkipped: 0, recoveredBboxCandidates: 0, recoveredBboxResponses: 0, recoveredBboxNoResponse: 0, recoveredBboxHidden: 0, recoveredBboxUnsent: 0, recoveredBboxBypasses: 0, recognitionCircuitBreakers: 0, recoveryTables: 0, localRecovery: 0, recoveryCellsAnalyzed: 0, recoveryCellsSkipped: 0, recoveryDiagonalRules: 0, recoveryPixelMs: 0, orphanTables: 0, orphanBoxes: 0, fringeProposals: 0, fringeBoxes: 0, checkboxBoxes: 0, checkboxMergeProposals: 0, checkboxMerged: 0, checkboxChecked: 0, checkboxUnchecked: 0, checkboxAmbiguous: 0, recoveryAdded: 0, recoveryAdjusted: 0, recoveryRejected: 0};
     const documents = report && report.documents ? Object.values(report.documents) : [];
     documents.forEach(documentResult => {
       const counts = documentResult && documentResult.counts ? documentResult.counts : {};
@@ -992,15 +1003,26 @@
       totals.nativeCacheHits += Number(counts.bbox_recognition_native_cache_hits || 0);
       totals.nativeCacheMisses += Number(counts.bbox_recognition_native_cache_misses || 0);
       totals.nativeBudgetSkipped += Number(counts.bbox_recognition_native_budget_skipped || 0);
+      totals.recoveredBboxCandidates += Number(counts.bbox_recognition_recovered_candidates || 0);
+      totals.recoveredBboxResponses += Number(counts.bbox_recognition_recovered_responses || 0);
+      totals.recoveredBboxNoResponse += Number(counts.bbox_recognition_recovered_no_response || 0);
+      totals.recoveredBboxHidden += Number(counts.bbox_recognition_recovered_hidden || 0);
+      totals.recoveredBboxUnsent += Number(counts.bbox_recognition_native_recovered_unsent || 0);
+      totals.recoveredBboxBypasses += Number(counts.bbox_recognition_native_recovered_limit_bypasses || 0);
       totals.recognitionCircuitBreakers += Number(counts.bbox_recognition_circuit_breaker_trips || 0);
       totals.recoveryTables += Number(counts.bbox_recovery_tables_reviewed || 0);
       totals.localRecovery += Number(counts.bbox_recovery_local_proposals || 0);
       totals.recoveryCellsAnalyzed += Number(counts.bbox_recovery_pixel_cells_analyzed || 0);
       totals.recoveryCellsSkipped += Number(counts.bbox_recovery_pixel_cells_skipped || 0);
+      totals.recoveryDiagonalRules += Number(counts.bbox_recovery_diagonal_rules_removed || 0);
       totals.recoveryPixelMs += Number(counts.bbox_recovery_pixel_analysis_ms || 0);
       totals.orphanTables += Number(counts.bbox_recovery_orphan_tables_analyzed || 0);
       totals.orphanBoxes += Number(counts.bbox_recovery_orphan_added || 0);
+      totals.fringeProposals += Number(counts.bbox_recovery_fringe_proposals || 0);
+      totals.fringeBoxes += Number(counts.bbox_recovery_fringe_added || 0);
       totals.checkboxBoxes += Number(counts.bbox_recovery_checkbox_added || 0);
+      totals.checkboxMergeProposals += Number(counts.bbox_recovery_checkbox_merge_proposals || 0);
+      totals.checkboxMerged += Number(counts.bbox_recovery_checkbox_merged || 0);
       totals.checkboxChecked += Number(counts.bbox_recovery_checkbox_checked || 0);
       totals.checkboxUnchecked += Number(counts.bbox_recovery_checkbox_unchecked || 0);
       totals.checkboxAmbiguous += Number(counts.bbox_recovery_checkbox_ambiguous || 0);
@@ -1025,15 +1047,26 @@
     document.querySelector('#nativeCacheHitsValue').textContent = String(totals.nativeCacheHits);
     document.querySelector('#nativeCacheMissesValue').textContent = String(totals.nativeCacheMisses);
     document.querySelector('#nativeBudgetSkippedValue').textContent = String(totals.nativeBudgetSkipped);
+    document.querySelector('#recoveredBboxCandidatesValue').textContent = String(totals.recoveredBboxCandidates);
+    document.querySelector('#recoveredBboxResponsesValue').textContent = String(totals.recoveredBboxResponses);
+    document.querySelector('#recoveredBboxNoResponseValue').textContent = String(totals.recoveredBboxNoResponse);
+    document.querySelector('#recoveredBboxHiddenValue').textContent = String(totals.recoveredBboxHidden);
+    document.querySelector('#recoveredBboxUnsentValue').textContent = String(totals.recoveredBboxUnsent);
+    document.querySelector('#recoveredBboxBypassesValue').textContent = String(totals.recoveredBboxBypasses);
     document.querySelector('#recognitionCircuitBreakersValue').textContent = String(totals.recognitionCircuitBreakers);
     document.querySelector('#recoveryTablesValue').textContent = String(totals.recoveryTables);
     document.querySelector('#localRecoveryValue').textContent = String(totals.localRecovery);
     document.querySelector('#recoveryCellsAnalyzedValue').textContent = String(totals.recoveryCellsAnalyzed);
     document.querySelector('#recoveryCellsSkippedValue').textContent = String(totals.recoveryCellsSkipped);
+    document.querySelector('#recoveryDiagonalRulesValue').textContent = String(totals.recoveryDiagonalRules);
     document.querySelector('#recoveryPixelMsValue').textContent = `${totals.recoveryPixelMs.toFixed(1)} ms`;
     document.querySelector('#orphanTablesValue').textContent = String(totals.orphanTables);
     document.querySelector('#orphanBoxesValue').textContent = String(totals.orphanBoxes);
+    document.querySelector('#fringeProposalsValue').textContent = String(totals.fringeProposals);
+    document.querySelector('#fringeBoxesValue').textContent = String(totals.fringeBoxes);
     document.querySelector('#checkboxBoxesValue').textContent = String(totals.checkboxBoxes);
+    document.querySelector('#checkboxMergeProposalsValue').textContent = String(totals.checkboxMergeProposals);
+    document.querySelector('#checkboxMergedValue').textContent = String(totals.checkboxMerged);
     document.querySelector('#checkboxCheckedValue').textContent = String(totals.checkboxChecked);
     document.querySelector('#checkboxUncheckedValue').textContent = String(totals.checkboxUnchecked);
     document.querySelector('#checkboxAmbiguousValue').textContent = String(totals.checkboxAmbiguous);

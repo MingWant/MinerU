@@ -109,8 +109,8 @@ BBOX_VLM_FUSION_OVERRIDES = {
     "recovery": {
         "enabled": True,
         "max_tables_per_document": 3,
-        "max_proposals_per_document": 100,
-        "max_proposals_per_table": 30,
+        "max_proposals_per_document": 200,
+        "max_proposals_per_table": 50,
         "max_requests_per_document": 3,
     },
     "reconciliation": {"enabled": False},
@@ -385,8 +385,12 @@ def _normalize_task_parameters(
                     "max_tables_per_document": 10
                     if cost_profile == "quality"
                     else 3,
-                    "max_proposals_per_document": 100,
-                    "max_proposals_per_table": 30,
+                    "max_proposals_per_document": 500
+                    if cost_profile == "quality"
+                    else 200,
+                    "max_proposals_per_table": 100
+                    if cost_profile == "quality"
+                    else 50,
                     "max_requests_per_document": 10
                     if cost_profile == "quality"
                     else 3,

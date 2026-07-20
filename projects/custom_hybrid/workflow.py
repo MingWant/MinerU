@@ -282,12 +282,17 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         raise WorkflowConfigError("fusion.recovery.enabled must be a boolean")
     for key in (
         "local_missing_enabled",
+        "local_uncovered_enabled",
         "review_after_local_recovery",
         "skip_vlm_for_mineru_models",
         "disable_after_invalid_schema",
         "share_recognizer_page_cache",
         "table_orphan_recovery_enabled",
+        "table_fringe_recovery_enabled",
         "checkbox_recovery_enabled",
+        "checkbox_accept_existing_label_bbox",
+        "checkbox_merge_label_enabled",
+        "table_diagonal_rule_enabled",
     ):
         field = recovery.get(key)
         if field is not None and not isinstance(field, bool):
@@ -311,9 +316,13 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         "min_area_ratio",
         "max_area_ratio",
         "duplicate_iou",
+        "cross_cell_duplicate_overlap",
         "adjust_min_iou",
         "min_ink_ratio",
+        "max_cell_ink_ratio",
         "min_uncovered_ink_ratio",
+        "cell_horizontal_rule_ratio",
+        "cell_vertical_rule_ratio",
         "local_pixel_confidence",
         "table_orphan_confidence",
         "table_orphan_max_cell_overlap",
@@ -330,6 +339,7 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         "checkbox_right_column_ink_ratio",
         "checkbox_unchecked_interior_ratio",
         "checkbox_checked_interior_ratio",
+        "checkbox_label_min_vertical_overlap",
     ):
         field = recovery.get(key)
         if field is not None and (
@@ -338,6 +348,25 @@ def _validate_fusion_config(fusion_config: Any) -> None:
             or not 0 <= float(field) <= 1
         ):
             raise WorkflowConfigError(f"fusion.recovery.{key} must be between 0 and 1")
+    for key in (
+        "table_diagonal_rule_min_angle",
+        "table_diagonal_rule_max_angle",
+    ):
+        field = recovery.get(key)
+        if field is not None and (
+            isinstance(field, bool)
+            or not isinstance(field, (int, float))
+            or not 0 <= float(field) <= 90
+        ):
+            raise WorkflowConfigError(
+                f"fusion.recovery.{key} must be between 0 and 90"
+            )
+    if float(recovery.get("table_diagonal_rule_max_angle", 88.0)) < float(
+        recovery.get("table_diagonal_rule_min_angle", 12.0)
+    ):
+        raise WorkflowConfigError(
+            "fusion.recovery diagonal rule angles must be ordered"
+        )
     for key, default in (
         ("table_orphan_horizontal_line_ratio", 0.5),
         ("table_orphan_vertical_line_ratio", 0.5),
@@ -352,6 +381,12 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         recovery.get("min_area_ratio", 0.001)
     ):
         raise WorkflowConfigError("fusion.recovery area ratios must be ordered")
+    if float(recovery.get("max_cell_ink_ratio", 0.65)) < float(
+        recovery.get("min_ink_ratio", 0.002)
+    ):
+        raise WorkflowConfigError(
+            "fusion.recovery Cell ink-ratio limits must be ordered"
+        )
     if float(recovery.get("table_orphan_max_ink_density", 0.7)) < float(
         recovery.get("table_orphan_min_ink_density", 0.01)
     ):
@@ -399,12 +434,46 @@ def _validate_fusion_config(fusion_config: Any) -> None:
             "fusion.recovery.table_orphan_min_row_ink_pixels must be a "
             "positive integer"
         )
+    cell_min_row_ink = recovery.get("cell_line_min_row_ink_pixels", 2)
+    if (
+        isinstance(cell_min_row_ink, bool)
+        or not isinstance(cell_min_row_ink, int)
+        or cell_min_row_ink < 1
+    ):
+        raise WorkflowConfigError(
+            "fusion.recovery.cell_line_min_row_ink_pixels must be a positive "
+            "integer"
+        )
+    minimum_uncovered_ink = recovery.get("min_uncovered_ink_pixels", 12)
+    if (
+        isinstance(minimum_uncovered_ink, bool)
+        or not isinstance(minimum_uncovered_ink, int)
+        or minimum_uncovered_ink < 1
+    ):
+        raise WorkflowConfigError(
+            "fusion.recovery.min_uncovered_ink_pixels must be a positive integer"
+        )
     for key, default, allow_zero in (
+        ("cell_rule_min_length", 18.0, False),
+        ("cell_rule_padding", 1.0, True),
+        ("cell_rule_max_thickness", 2.5, False),
+        ("cell_line_gap", 1.5, True),
+        ("cell_line_min_height", 2.0, False),
+        ("cell_line_min_dark_height", 3.0, False),
+        ("cell_line_min_width", 3.0, False),
+        ("existing_bbox_padding", 1.0, True),
+        ("table_diagonal_rule_min_length", 80.0, False),
+        ("table_diagonal_rule_max_gap", 8.0, True),
+        ("table_diagonal_rule_padding", 1.5, True),
+        ("table_diagonal_rule_extension", 20.0, True),
         ("table_orphan_cell_padding", 1.5, True),
         ("table_orphan_line_gap", 0.75, True),
-        ("table_orphan_min_line_height", 4.0, False),
+        ("table_orphan_min_line_height", 3.0, False),
         ("table_orphan_min_dark_height", 2.0, False),
-        ("table_orphan_min_line_width", 20.0, False),
+        ("table_orphan_min_line_width", 8.0, False),
+        ("table_orphan_horizontal_gap", 12.0, False),
+        ("table_fringe_bottom_extension", 72.0, True),
+        ("checkbox_label_max_gap", 24.0, True),
     ):
         field = recovery.get(key, default)
         if (
@@ -440,7 +509,7 @@ def _validate_fusion_config(fusion_config: Any) -> None:
             "integer between 4 and checkbox_max_vertices"
         )
     for key, default in (
-        ("checkbox_min_size", 5.0),
+        ("checkbox_min_size", 5.5),
         ("checkbox_max_size", 16.0),
         ("checkbox_min_aspect", 0.75),
         ("checkbox_max_aspect", 1.25),
@@ -463,7 +532,7 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         ):
             raise WorkflowConfigError(f"fusion.recovery.{key} must be positive")
     for lower, upper, defaults in (
-        ("checkbox_min_size", "checkbox_max_size", (5.0, 16.0)),
+        ("checkbox_min_size", "checkbox_max_size", (5.5, 16.0)),
         ("checkbox_min_aspect", "checkbox_max_aspect", (0.75, 1.25)),
         ("checkbox_apply_min_size", "checkbox_apply_max_size", (4.0, 20.0)),
         ("checkbox_apply_min_aspect", "checkbox_apply_max_aspect", (0.65, 1.4)),
@@ -606,6 +675,7 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         "timeout_seconds",
         "target_render_scale",
         "context_render_scale",
+        "empty_max_chars_per_em",
     ):
         value = recognizer.get(key)
         if value is not None and (
@@ -1005,6 +1075,20 @@ class JsonlAuditLogger:
             stream.write(line + "\n")
 
 
+def _optional_bearer_headers(
+    *configs: Mapping[str, Any],
+) -> dict[str, str]:
+    """Use Bearer auth only when an environment variable is explicitly named."""
+    for config in configs:
+        api_key_env = config.get("api_key_env")
+        if not isinstance(api_key_env, str) or not api_key_env.strip():
+            continue
+        api_key = os.getenv(api_key_env.strip())
+        if api_key:
+            return {"authorization": f"Bearer {api_key}"}
+    return {}
+
+
 class ParameterProxyASGI:
     """Small ASGI reverse proxy that rewrites OpenAI generation requests."""
 
@@ -1020,11 +1104,7 @@ class ParameterProxyASGI:
         self.generation = vllm_config["generation"]
         self.prompt_preview_chars = int(vllm_config.get("audit_prompt_preview_chars", 0))
         self.audit = JsonlAuditLogger(vllm_config.get("audit_log"))
-        self.upstream_headers = {}
-        api_key_env = str(vllm_config.get("api_key_env", "VLLM_API_KEY"))
-        api_key = os.getenv(api_key_env)
-        if api_key:
-            self.upstream_headers["authorization"] = f"Bearer {api_key}"
+        self.upstream_headers = _optional_bearer_headers(vllm_config)
         self.client = None
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
@@ -1249,11 +1329,7 @@ def resolve_upstream_max_model_len(config: Mapping[str, Any]) -> int | None:
         import httpx
 
         vllm_config = config["vllm"]
-        headers = {}
-        api_key_env = str(vllm_config.get("api_key_env", "VLLM_API_KEY"))
-        api_key = os.getenv(api_key_env)
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
+        headers = _optional_bearer_headers(vllm_config)
         response = httpx.get(
             str(vllm_config["upstream_url"]).rstrip("/") + "/v1/models",
             headers=headers,
@@ -1567,10 +1643,9 @@ def _resolve_visualization_pdf(
     document_stem: str,
     source_document: Path | None,
 ) -> Path | None:
-    candidates = []
+    candidates = [parse_dir / f"{document_stem}_origin.pdf"]
     if source_document is not None and source_document.suffix.lower() == ".pdf":
         candidates.append(source_document)
-    candidates.append(parse_dir / f"{document_stem}_origin.pdf")
     return next((path for path in candidates if path.is_file()), None)
 
 
@@ -1806,27 +1881,41 @@ def fuse_output_trees(
         if ocr_path is None or fused_path is None:
             summary["failed"][stem] = "missing matching OCR or fused middle JSON"
             continue
+        vision_document_path = (
+            _resolve_visualization_pdf(
+                fused_path.parent,
+                stem,
+                document_path,
+            )
+            or document_path
+        )
         verifier = None
         recognizer = None
         recovery_reviewer = None
         try:
-            if verifier_config.get("enabled", False) and document_path is not None:
+            if (
+                verifier_config.get("enabled", False)
+                and vision_document_path is not None
+            ):
                 verifier_base_url = str(verifier_config.get("base_url") or proxy_url)
                 verifier = OpenAIVisionVerifier(
                     verifier_base_url,
-                    document_path,
+                    vision_document_path,
                     verifier_config,
                 )
-            if settings.bbox_recognition_enabled and document_path is not None:
+            if (
+                settings.bbox_recognition_enabled
+                and vision_document_path is not None
+            ):
                 recognizer_base_url = str(
                     recognizer_config.get("base_url") or proxy_url
                 )
                 recognizer = OpenAIBBoxRecognizer(
                     recognizer_base_url,
-                    document_path,
+                    vision_document_path,
                     recognizer_config,
                 )
-            if settings.bbox_recovery_enabled and document_path is not None:
+            if settings.bbox_recovery_enabled and vision_document_path is not None:
                 effective_recovery_config = dict(recognizer_config)
                 effective_recovery_config.update(recovery_config)
                 recovery_base_url = str(
@@ -1848,7 +1937,7 @@ def fuse_output_trees(
                         recovery_kwargs["page_provider"] = shared_provider
                 recovery_reviewer = OpenAIBBoxRecoveryReviewer(
                     recovery_base_url,
-                    document_path,
+                    vision_document_path,
                     effective_recovery_config,
                     **recovery_kwargs,
                 )
@@ -1870,7 +1959,7 @@ def fuse_output_trees(
                 ),
             )
             if form_detection_enabled:
-                if document_path is None:
+                if vision_document_path is None:
                     report["form_detection"] = {
                         "status": "skipped",
                         "reason": "source_document_unavailable",
@@ -1883,7 +1972,7 @@ def fuse_output_trees(
                     try:
                         structure_report = annotate_form_structure(
                             fused_middle,
-                            document_path,
+                            vision_document_path,
                             form_detection_settings,
                         )
                         report["form_detection"] = structure_report[
@@ -1911,7 +2000,7 @@ def fuse_output_trees(
             generated_files = _regenerate_fused_outputs(
                 fused_path.parent,
                 stem,
-                document_path,
+                vision_document_path,
             )
             summary["documents"][stem] = {
                 "middle_json": str(fused_path),
@@ -2745,11 +2834,7 @@ def run_doctor(config: Mapping[str, Any]) -> dict[str, Any]:
     try:
         import httpx
 
-        headers = {}
-        api_key_env = str(config["vllm"].get("api_key_env", "VLLM_API_KEY"))
-        api_key = os.getenv(api_key_env)
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
+        headers = _optional_bearer_headers(config["vllm"])
         response = httpx.get(
             upstream_url + "/v1/models", headers=headers, timeout=3.0
         )
@@ -2822,15 +2907,10 @@ def run_doctor(config: Mapping[str, Any]) -> dict[str, Any]:
         try:
             import httpx
 
-            recognizer_headers = {}
-            recognizer_api_key_env = str(
-                recognizer_config.get("api_key_env", "VLLM_API_KEY")
+            recognizer_headers = _optional_bearer_headers(
+                recognizer_config,
+                config["vllm"],
             )
-            recognizer_api_key = os.getenv(recognizer_api_key_env)
-            if recognizer_api_key:
-                recognizer_headers["Authorization"] = (
-                    f"Bearer {recognizer_api_key}"
-                )
             models_response = httpx.get(
                 recognizer_url + "/v1/models",
                 headers=recognizer_headers,
@@ -3002,15 +3082,11 @@ def run_doctor(config: Mapping[str, Any]) -> dict[str, Any]:
         try:
             import httpx
 
-            recovery_headers = {}
-            recovery_api_key_env = str(
-                recovery_config.get("api_key_env")
-                or recognizer_config.get("api_key_env")
-                or config["vllm"].get("api_key_env", "VLLM_API_KEY")
+            recovery_headers = _optional_bearer_headers(
+                recovery_config,
+                recognizer_config,
+                config["vllm"],
             )
-            recovery_api_key = os.getenv(recovery_api_key_env)
-            if recovery_api_key:
-                recovery_headers["Authorization"] = f"Bearer {recovery_api_key}"
             models_response = httpx.get(
                 recovery_url + "/v1/models",
                 headers=recovery_headers,

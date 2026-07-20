@@ -64,7 +64,12 @@ class OpenAIBBoxRecognizer:
         self.config = config
         self.timeout = float(config.get("timeout_seconds", 120))
         self.headers = {"Content-Type": "application/json"}
-        api_key = os.getenv(str(config.get("api_key_env", "VLLM_API_KEY")))
+        api_key_env = config.get("api_key_env")
+        api_key = (
+            os.getenv(api_key_env.strip())
+            if isinstance(api_key_env, str) and api_key_env.strip()
+            else None
+        )
         if api_key:
             self.headers["Authorization"] = f"Bearer {api_key}"
         self.model = config.get("model")
@@ -376,16 +381,21 @@ class OpenAIBBoxRecognizer:
         deduplicated_candidates = 0
         budget_skipped = 0
         circuit_breaker_trips = 0
+        recovered_limit_bypasses = 0
+        recovered_unsent_ids: set[str] = set()
 
-        def priority(item: tuple[int, Mapping[str, Any]]) -> tuple[int, float, int]:
+        def priority(
+            item: tuple[int, Mapping[str, Any]],
+        ) -> tuple[int, int, float, int]:
             index, candidate = item
             bbox = candidate.get("bbox")
             try:
                 height = float(bbox[3]) - float(bbox[1])
             except (TypeError, ValueError, IndexError):
                 height = 0.0
+            recovered = bool(candidate.get("recovered"))
             empty = not str(candidate.get("ocr_text", "")).strip()
-            return (0 if empty else 1, -height, index)
+            return (0 if recovered else 1, 0 if empty else 1, -height, index)
 
         selected = [
             item
@@ -399,8 +409,15 @@ class OpenAIBBoxRecognizer:
             0,
         )
         if page_candidate_limit and len(selected) > page_candidate_limit:
-            limited_out = selected[page_candidate_limit:]
-            selected = selected[:page_candidate_limit]
+            recovered_selected = [
+                item for item in selected if item[1].get("recovered")
+            ]
+            ordinary_selected = [
+                item for item in selected if not item[1].get("recovered")
+            ]
+            ordinary_limit = max(page_candidate_limit - len(recovered_selected), 0)
+            limited_out = ordinary_selected[ordinary_limit:]
+            selected = recovered_selected + ordinary_selected[:ordinary_limit]
             limited_ids = [
                 str(candidate.get("id", ""))
                 for _index, candidate in limited_out
@@ -424,6 +441,8 @@ class OpenAIBBoxRecognizer:
             )
             if not isinstance(target_bbox, list) or len(target_bbox) != 4:
                 invalid_outputs += 1
+                if candidate.get("recovered"):
+                    recovered_unsent_ids.add(candidate_id)
                 continue
             try:
                 image_url = self._crop_url(
@@ -460,12 +479,18 @@ class OpenAIBBoxRecognizer:
                         "key": cache_key,
                         "image_url": image_url,
                         "candidates": [(candidate_id, candidate)],
+                        "recovered": bool(candidate.get("recovered")),
                     }
                 else:
                     pending["candidates"].append((candidate_id, candidate))
+                    pending["recovered"] = bool(
+                        pending.get("recovered") or candidate.get("recovered")
+                    )
                     deduplicated_candidates += 1
             except Exception as exc:
                 errors += 1
+                if candidate.get("recovered"):
+                    recovered_unsent_ids.add(candidate_id)
                 batches.append(
                     {
                         "page": page_index,
@@ -477,16 +502,21 @@ class OpenAIBBoxRecognizer:
                 )
 
         pending = list(pending_by_key.values())
+        recovered_pending = [entry for entry in pending if entry.get("recovered")]
+        ordinary_pending = [entry for entry in pending if not entry.get("recovered")]
         page_request_limit = max(
             int(self.config.get("native_max_requests_per_page", 0)),
             0,
         )
         available_requests = max(max_requests - self.requests_made, 0)
-        request_slots = available_requests
+        standard_slots = available_requests
         if page_request_limit:
-            request_slots = min(request_slots, page_request_limit)
-        scheduled = pending[:request_slots]
-        unscheduled = pending[request_slots:]
+            standard_slots = min(standard_slots, page_request_limit)
+        recovered_within_limit = min(len(recovered_pending), standard_slots)
+        recovered_limit_bypasses = len(recovered_pending) - recovered_within_limit
+        ordinary_slots = max(standard_slots - recovered_within_limit, 0)
+        scheduled = recovered_pending + ordinary_pending[:ordinary_slots]
+        unscheduled = ordinary_pending[ordinary_slots:]
         for entry in unscheduled:
             ids = [candidate_id for candidate_id, _candidate in entry["candidates"]]
             budget_skipped += len(ids)
@@ -579,6 +609,34 @@ class OpenAIBBoxRecognizer:
                 )
             if consecutive_failures >= max_failures:
                 remaining = scheduled[wave_start + len(wave) :]
+                if not remaining:
+                    continue
+                recovered_remaining = [
+                    entry for entry in remaining if entry.get("recovered")
+                ]
+                if recovered_remaining:
+                    batches.append(
+                        {
+                            "page": page_index,
+                            "status": "native_circuit_breaker_recovery_bypass",
+                            "protocol": "mineru_native",
+                            "ids": [
+                                candidate_id
+                                for entry in recovered_remaining
+                                for candidate_id, _candidate in entry["candidates"]
+                            ],
+                            "recovered_candidates": sum(
+                                len(entry["candidates"])
+                                for entry in recovered_remaining
+                            ),
+                        }
+                    )
+                    continue
+                remaining_ids = [
+                    candidate_id
+                    for entry in remaining
+                    for candidate_id, _candidate in entry["candidates"]
+                ]
                 remaining_candidates = sum(
                     len(entry["candidates"]) for entry in remaining
                 )
@@ -589,6 +647,7 @@ class OpenAIBBoxRecognizer:
                         "page": page_index,
                         "status": "native_circuit_breaker",
                         "protocol": "mineru_native",
+                        "ids": remaining_ids,
                         "skipped_candidates": remaining_candidates,
                     }
                 )
@@ -616,6 +675,7 @@ class OpenAIBBoxRecognizer:
                 "max_concurrency": max_concurrency,
                 "page_request_limit": page_request_limit,
                 "page_candidate_limit": page_candidate_limit,
+                "recovered_limit_bypasses": recovered_limit_bypasses,
             }
         )
         return {
@@ -632,6 +692,8 @@ class OpenAIBBoxRecognizer:
             "native_cache_misses": cache_misses,
             "native_cache_writes": cache_writes,
             "native_deduplicated_candidates": deduplicated_candidates,
+            "native_recovered_limit_bypasses": recovered_limit_bypasses,
+            "native_recovered_unsent": len(recovered_unsent_ids),
             "native_max_concurrency": max_concurrency,
             "circuit_breaker_trips": circuit_breaker_trips,
         }

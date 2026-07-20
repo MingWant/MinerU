@@ -7,6 +7,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPOSITORY_ROOT = Path(__file__).parents[3]
 if str(REPOSITORY_ROOT) not in sys.path:
@@ -176,6 +177,22 @@ class NativeMinerUFakeHttpx:
         )
 
 
+class InvalidNativeMinerUFakeHttpx(NativeMinerUFakeHttpx):
+    def post(self, *_args, json=None, headers=None, **_kwargs):
+        self.requests.append({"json": json, "headers": headers})
+        return Response(
+            {
+                "choices": [
+                    {
+                        "message": {"content": "repeated output"},
+                        "finish_reason": "length",
+                    }
+                ],
+                "usage": {"prompt_tokens": 30, "completion_tokens": 512},
+            }
+        )
+
+
 class InvalidSchemaFakeHttpx(FakeHttpx):
     def post(self, *_args, json=None, **_kwargs):
         self.requests.append(json)
@@ -251,6 +268,32 @@ def middle(text):
 
 
 class BBoxRecognitionTests(unittest.TestCase):
+    def test_recognizer_bearer_header_is_opt_in(self):
+        with mock.patch.dict(
+            "os.environ",
+            {"VLLM_API_KEY": "local-secret"},
+            clear=False,
+        ):
+            unauthenticated = OpenAIBBoxRecognizer(
+                "http://vision.test",
+                "unused.pdf",
+                {},
+            )
+            authenticated = OpenAIBBoxRecognizer(
+                "http://vision.test",
+                "unused.pdf",
+                {"api_key_env": "VLLM_API_KEY"},
+            )
+            try:
+                self.assertNotIn("Authorization", unauthenticated.headers)
+                self.assertEqual(
+                    authenticated.headers["Authorization"],
+                    "Bearer local-secret",
+                )
+            finally:
+                unauthenticated.close()
+                authenticated.close()
+
     def test_compliant_endpoint_improves_cer_through_full_fusion_gate(self):
         from PIL import Image
 
@@ -644,6 +687,125 @@ class BBoxRecognitionTests(unittest.TestCase):
         self.assertEqual(result["native_budget_skipped"], 1)
         self.assertEqual(fake_httpx.max_active, 2)
         self.assertEqual(len(result["items"]), 3)
+
+    def test_native_recovered_bbox_bypasses_exhausted_request_limits(self):
+        from PIL import Image, ImageDraw
+
+        fake_httpx = NativeMinerUFakeHttpx()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            image = Image.new("RGB", (200, 100), "white")
+            ImageDraw.Draw(image).rectangle([20, 20, 100, 50], fill="black")
+            image.save(image_path)
+            image.close()
+            recognizer = OpenAIBBoxRecognizer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "mineru-claim-forms",
+                    "max_context_tokens": 8192,
+                    "native_min_bbox_height": 0,
+                    "native_max_candidates_per_page": 1,
+                    "native_max_requests_per_page": 1,
+                    "max_requests_per_document": 1,
+                    "target_render_scale": 1.0,
+                },
+            )
+            recognizer.httpx = fake_httpx
+            ordinary = {
+                "id": "p0-bbox-0",
+                "bbox": [10, 10, 110, 60],
+                "ocr_text": "Existing",
+                "recovered": False,
+                "type": "table_ocr",
+                "contexts": {"target": [10, 10, 110, 60]},
+            }
+            recovered = {
+                "id": "p0-bbox-1",
+                "bbox": [20, 20, 100, 50],
+                "ocr_text": "",
+                "recovered": True,
+                "type": "table_ocr",
+                "contexts": {"target": [20, 20, 100, 50]},
+            }
+            try:
+                first = recognizer(0, [200, 100], [ordinary])
+                second = recognizer(0, [200, 100], [recovered])
+                malformed = dict(recovered)
+                malformed["id"] = "p0-bbox-2"
+                malformed["contexts"] = {"target": [20, 20]}
+                third = recognizer(0, [200, 100], [malformed])
+            finally:
+                recognizer.close()
+
+        self.assertEqual(first["native_requests"], 1)
+        self.assertEqual(second["native_requests"], 1)
+        self.assertEqual(second["native_budget_skipped"], 0)
+        self.assertEqual(second["native_recovered_limit_bypasses"], 1)
+        self.assertEqual(second["native_recovered_unsent"], 0)
+        self.assertEqual(second["items"][0]["id"], "p0-bbox-1")
+        self.assertEqual(third["native_requests"], 0)
+        self.assertEqual(third["native_recovered_unsent"], 1)
+        self.assertEqual(len(fake_httpx.requests), 2)
+
+    def test_native_circuit_breaker_does_not_leave_recovered_bbox_unsent(self):
+        from PIL import Image, ImageDraw
+
+        fake_httpx = InvalidNativeMinerUFakeHttpx()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            image = Image.new("RGB", (240, 120), "white")
+            draw = ImageDraw.Draw(image)
+            for index, shade in enumerate((20, 70, 120, 170)):
+                draw.rectangle(
+                    [12 + index * 50, 12, 48 + index * 50, 48],
+                    fill=(shade, shade, shade),
+                )
+            image.save(image_path)
+            image.close()
+            recognizer = OpenAIBBoxRecognizer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "mineru-claim-forms",
+                    "max_context_tokens": 8192,
+                    "native_all_candidates": True,
+                    "native_min_bbox_height": 0,
+                    "native_max_consecutive_failures": 1,
+                    "native_max_concurrency": 1,
+                    "target_render_scale": 1.0,
+                },
+            )
+            recognizer.httpx = fake_httpx
+            candidates = [
+                {
+                    "id": f"p0-bbox-{index}",
+                    "bbox": [10 + index * 50, 10, 50 + index * 50, 50],
+                    "ocr_text": "" if index < 3 else "Existing",
+                    "recovered": index < 3,
+                    "type": "table_ocr",
+                    "contexts": {
+                        "target": [10 + index * 50, 10, 50 + index * 50, 50]
+                    },
+                }
+                for index in range(4)
+            ]
+            try:
+                result = recognizer(0, [240, 120], candidates)
+            finally:
+                recognizer.close()
+
+        self.assertEqual(result["native_requests"], 3)
+        self.assertEqual(result["native_recovered_unsent"], 0)
+        self.assertEqual(result["native_budget_skipped"], 1)
+        self.assertEqual(result["circuit_breaker_trips"], 1)
+        self.assertEqual(len(fake_httpx.requests), 3)
+        self.assertTrue(
+            any(
+                batch["status"] == "native_circuit_breaker_recovery_bypass"
+                for batch in result["batches"]
+            )
+        )
 
     def test_json_schema_mode_constrains_ids_and_item_count(self):
         from PIL import Image

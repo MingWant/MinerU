@@ -1,5 +1,4 @@
 import sys
-import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -204,6 +203,61 @@ class FusionTests(unittest.TestCase):
             [110, 18, 175, 32],
         )
 
+    def test_bbox_recovery_rejects_cross_cell_duplicate_content_boxes(self):
+        cells = [
+            {
+                "bbox": [10, 10, 110, 45],
+                "text": "First",
+                "row_start": 0,
+                "row_end": 0,
+                "col_start": 0,
+                "col_end": 0,
+            },
+            {
+                "bbox": [12, 12, 112, 47],
+                "text": "Duplicate",
+                "row_start": 1,
+                "row_end": 1,
+                "col_start": 0,
+                "col_end": 0,
+            },
+        ]
+        page = structured_middle(
+            "table",
+            html="<table><tr><td>First</td></tr><tr><td>Duplicate</td></tr></table>",
+            table_cells=cells,
+        )["pdf_info"][0]
+
+        stats, decisions, _batches, unchanged = apply_bbox_recovery_proposals(
+            page,
+            0,
+            {
+                "items": [
+                    {
+                        "action": "add",
+                        "cell_id": "p0-t0-c0",
+                        "target_id": "",
+                        "bbox": [20, 18, 90, 35],
+                        "confidence": 0.95,
+                    },
+                    {
+                        "action": "add",
+                        "cell_id": "p0-t0-c1",
+                        "target_id": "",
+                        "bbox": [21, 18, 91, 35],
+                        "confidence": 0.95,
+                    },
+                ]
+            },
+            FusionSettings.from_mapping({"mode": "bbox_vlm"}),
+            remaining_document_budget=10,
+        )
+
+        self.assertEqual(stats["accepted"], 1)
+        self.assertEqual(stats["rejected"], 1)
+        self.assertEqual(decisions[1]["reason"], "cross_cell_duplicate_bbox")
+        self.assertTrue(unchanged)
+
     def test_bbox_vlm_repairs_box_then_transcribes_isolated_empty_crop(self):
         pipeline = structured_middle(
             "table",
@@ -229,6 +283,7 @@ class FusionTests(unittest.TestCase):
                 "local_only_tables": 1,
                 "pixel_cells_analyzed": 1,
                 "pixel_cells_skipped": 4,
+                "diagonal_rules_removed": 2,
                 "pixel_analysis_ms": 2.5,
                 "items": [
                     {
@@ -245,6 +300,7 @@ class FusionTests(unittest.TestCase):
         def recognize(_page, _size, candidates):
             self.assertEqual(len(candidates), 1)
             self.assertEqual(candidates[0]["bbox"], [20.0, 18.0, 170.0, 32.0])
+            self.assertTrue(candidates[0]["recovered"])
             return {
                 "items": [{"id": candidates[0]["id"], "text": "Recovered Value"}],
                 "native_requests": 0,
@@ -268,11 +324,93 @@ class FusionTests(unittest.TestCase):
         self.assertEqual(report["counts"]["bbox_recovery_added"], 1)
         self.assertEqual(report["counts"]["bbox_recovery_local_proposals"], 1)
         self.assertEqual(report["counts"]["bbox_recovery_pixel_cells_skipped"], 4)
+        self.assertEqual(
+            report["counts"]["bbox_recovery_diagonal_rules_removed"],
+            2,
+        )
         self.assertEqual(report["counts"]["bbox_recovery_pixel_analysis_ms"], 2.5)
         self.assertEqual(report["counts"]["bbox_recognition_vlm_selected"], 1)
+        self.assertEqual(
+            report["counts"]["bbox_recognition_recovered_candidates"],
+            1,
+        )
+        self.assertEqual(
+            report["counts"]["bbox_recognition_recovered_responses"],
+            1,
+        )
         self.assertEqual(report["counts"]["bbox_recognition_native_cache_hits"], 1)
         self.assertTrue(
             report["recovery_invariants"]["table_and_cell_geometry_unchanged"]
+        )
+
+    def test_bbox_vlm_candidate_budget_preserves_recovered_crop(self):
+        pipeline = structured_middle(
+            "table",
+            html="<table><tr><td>Existing</td><td></td></tr></table>",
+            table_cells=[
+                {
+                    "bbox": [10, 10, 95, 40],
+                    "text": "Existing",
+                    "content_spans": [
+                        {"bbox": [20, 18, 80, 30], "text": "Existing"}
+                    ],
+                    "row_start": 0,
+                    "row_end": 0,
+                    "col_start": 0,
+                    "col_end": 0,
+                },
+                {
+                    "bbox": [95, 10, 190, 40],
+                    "text": "",
+                    "row_start": 0,
+                    "row_end": 0,
+                    "col_start": 1,
+                    "col_end": 1,
+                },
+            ],
+        )
+
+        def review(_page, _size, _manifest):
+            return {
+                "tables_reviewed": 1,
+                "local_proposals": 1,
+                "items": [
+                    {
+                        "action": "add",
+                        "cell_id": "p0-t0-c1",
+                        "target_id": "",
+                        "bbox": [105, 18, 175, 32],
+                        "confidence": 0.95,
+                    }
+                ],
+            }
+
+        def recognize(_page, _size, candidates):
+            self.assertEqual(len(candidates), 1)
+            self.assertTrue(candidates[0]["recovered"])
+            return {"items": [{"id": candidates[0]["id"], "text": "Filled"}]}
+
+        _fused, report = fuse_middle_json(
+            pipeline,
+            pipeline,
+            FusionSettings.from_mapping(
+                {
+                    "mode": "bbox_vlm",
+                    "recognizer": {"max_candidates_per_document": 1},
+                }
+            ),
+            bbox_recovery_reviewer=review,
+            bbox_recognizer=recognize,
+        )
+
+        self.assertEqual(report["counts"]["bbox_recognition_candidate_limit"], 1)
+        self.assertEqual(
+            report["counts"]["bbox_recognition_recovered_candidates"],
+            1,
+        )
+        self.assertEqual(
+            report["counts"]["bbox_recognition_recovered_responses"],
+            1,
         )
 
     def test_bbox_vlm_repairs_and_transcribes_table_orphan(self):
@@ -352,6 +490,186 @@ class FusionTests(unittest.TestCase):
         self.assertTrue(
             report["recovery_invariants"]["table_and_cell_geometry_unchanged"]
         )
+
+    def test_bbox_vlm_repairs_and_transcribes_table_bottom_fringe(self):
+        pipeline = structured_middle(
+            "table",
+            html="<table><tr><td>Header</td></tr></table>",
+            table_cells=[
+                {
+                    "bbox": [10, 10, 190, 40],
+                    "text": "Header",
+                    "content_spans": [
+                        {"bbox": [20, 18, 80, 30], "text": "Header"}
+                    ],
+                    "row_start": 0,
+                    "row_end": 0,
+                    "col_start": 0,
+                    "col_end": 0,
+                }
+            ],
+        )
+
+        def review(_page, _size, manifest):
+            self.assertIn("page_existing", manifest[0])
+            return {
+                "tables_reviewed": 1,
+                "local_proposals": 1,
+                "fringe_proposals": 1,
+                "items": [
+                    {
+                        "action": "add_fringe",
+                        "table_id": "p0-table-0",
+                        "cell_id": "p0-t0-c0",
+                        "target_id": "",
+                        "bbox": [155, 90, 178, 98],
+                        "confidence": 0.92,
+                        "recovery_source": "local_table_fringe_ink",
+                    }
+                ],
+            }
+
+        def recognize(_page, _size, candidates):
+            fringe = next(item for item in candidates if not item["ocr_text"])
+            self.assertGreater(fringe["bbox"][1], 80)
+            return {"items": [{"id": fringe["id"], "text": "50.00"}]}
+
+        fused, report = fuse_middle_json(
+            pipeline,
+            pipeline,
+            FusionSettings.from_mapping({"mode": "bbox_vlm"}),
+            bbox_recovery_reviewer=review,
+            bbox_recognizer=recognize,
+        )
+
+        table_span = fused["pdf_info"][0]["preproc_blocks"][0]["lines"][0][
+            "spans"
+        ][0]
+        cell = table_span["table_cells"][0]
+        fringe = next(
+            item
+            for item in cell["content_spans"]
+            if item.get("fusion_recovery_fringe")
+        )
+        self.assertEqual(fringe["bbox"], [155.0, 90.0, 178.0, 98.0])
+        self.assertEqual(fringe["text"], "50.00")
+        self.assertEqual(report["counts"]["bbox_recovery_fringe_added"], 1)
+        self.assertEqual(report["counts"]["bbox_recovery_fringe_proposals"], 1)
+
+    def test_rejected_empty_recovery_bbox_is_hidden_from_span_renderer(self):
+        from mineru.utils.draw_bbox import _table_cell_render_bboxes
+
+        pipeline = structured_middle(
+            "table",
+            html="<table><tr><td>Header</td></tr></table>",
+            table_cells=[
+                {
+                    "bbox": [10, 10, 190, 80],
+                    "text": "Header",
+                    "content_spans": [
+                        {"bbox": [20, 18, 80, 30], "text": "Header"}
+                    ],
+                    "row_start": 0,
+                    "row_end": 0,
+                    "col_start": 0,
+                    "col_end": 0,
+                }
+            ],
+        )
+
+        def review(_page, _size, _manifest):
+            return {
+                "tables_reviewed": 1,
+                "local_proposals": 1,
+                "items": [
+                    {
+                        "action": "add",
+                        "cell_id": "p0-t0-c0",
+                        "target_id": "",
+                        "bbox": [20, 50, 80, 62],
+                        "confidence": 0.95,
+                        "recovery_source": "local_uncovered_pixel_ink",
+                    }
+                ],
+            }
+
+        def recognize(_page, _size, candidates):
+            recovered = next(item for item in candidates if not item["ocr_text"])
+            return {
+                "items": [
+                    {"id": recovered["id"], "text": "[Non-Text]"}
+                ]
+            }
+
+        fused, report = fuse_middle_json(
+            pipeline,
+            pipeline,
+            FusionSettings.from_mapping({"mode": "bbox_vlm"}),
+            bbox_recovery_reviewer=review,
+            bbox_recognizer=recognize,
+        )
+
+        table_span = fused["pdf_info"][0]["preproc_blocks"][0]["lines"][0][
+            "spans"
+        ][0]
+        recovered = next(
+            item
+            for item in table_span["table_cells"][0]["content_spans"]
+            if item.get("fusion_recovery_source")
+        )
+        self.assertTrue(recovered["fusion_visualization_hidden"])
+        _cells, visible = _table_cell_render_bboxes(table_span)
+        self.assertNotIn([20.0, 50.0, 80.0, 62.0], visible)
+        self.assertEqual(
+            report["counts"]["bbox_recognition_recovered_hidden"],
+            1,
+        )
+
+    def test_recovered_amount_with_repeated_separator_is_normalized(self):
+        page = structured_middle(
+            "table",
+            html="<table><tr><td></td></tr></table>",
+            table_cells=[
+                {
+                    "bbox": [10, 10, 190, 80],
+                    "text": "",
+                    "content_spans": [
+                        {
+                            "bbox": [120, 50, 180, 62],
+                            "text": "",
+                            "fusion_recovery_action": "add_orphan",
+                            "fusion_recovery_confidence": 0.95,
+                        }
+                    ],
+                    "row_start": 0,
+                    "row_end": 0,
+                    "col_start": 0,
+                    "col_end": 0,
+                }
+            ],
+        )["pdf_info"][0]
+        lines = collect_table_ocr_lines(page, 0)
+
+        def recognize(_page, _size, candidates):
+            return {
+                "items": [
+                    {"id": candidates[0]["id"], "text": "74.791.00"}
+                ]
+            }
+
+        stats, decisions, _batches = apply_bbox_recognition(
+            0,
+            [200, 300],
+            lines,
+            FusionSettings.from_mapping({"mode": "bbox_vlm"}),
+            recognize,
+        )
+
+        self.assertEqual(stats["recovered_vlm_selected"], 1)
+        self.assertEqual(decisions[0]["vlm_text"], "74.791.00")
+        self.assertEqual(decisions[0]["normalized_vlm_text"], "74,791.00")
+        self.assertEqual(decisions[0]["selected_text"], "74,791.00")
+        self.assertEqual(lines[0].text, "74,791.00")
 
     def test_bbox_recovery_rejects_orphan_inside_existing_cell(self):
         page = structured_middle(
@@ -463,6 +781,57 @@ class FusionTests(unittest.TestCase):
         self.assertTrue(
             report["recovery_invariants"]["table_and_cell_geometry_unchanged"]
         )
+
+    def test_bbox_recovery_merges_checkbox_with_right_label_bbox(self):
+        page = structured_middle(
+            "table",
+            html="<table><tr><td>Option</td></tr></table>",
+            table_cells=[
+                {
+                    "bbox": [10, 10, 190, 80],
+                    "text": "Option",
+                    "content_spans": [
+                        {"bbox": [40, 20, 100, 32], "text": "Option"}
+                    ],
+                    "row_start": 0,
+                    "row_end": 0,
+                    "col_start": 0,
+                    "col_end": 0,
+                }
+            ],
+        )["pdf_info"][0]
+
+        stats, decisions, _batches, unchanged = apply_bbox_recovery_proposals(
+            page,
+            0,
+            {
+                "items": [
+                    {
+                        "action": "merge_checkbox",
+                        "table_id": "p0-table-0",
+                        "cell_id": "p0-t0-c0",
+                        "target_id": "p0-t0-c0-b0",
+                        "bbox": [20, 20, 100, 32],
+                        "confidence": 0.95,
+                        "checkbox_state": "checked",
+                        "checkbox_interior_density": 0.2,
+                        "recovery_source": "local_checkbox_detector",
+                    }
+                ]
+            },
+            FusionSettings.from_mapping({"mode": "bbox_vlm"}),
+            remaining_document_budget=10,
+        )
+
+        span = page["preproc_blocks"][0]["lines"][0]["spans"][0][
+            "table_cells"
+        ][0]["content_spans"][0]
+        self.assertEqual(stats["checkbox_merged"], 1)
+        self.assertEqual(span["bbox"], [20.0, 20.0, 100.0, 32.0])
+        self.assertTrue(span["fusion_checkbox_grouped"])
+        self.assertEqual(span["fusion_checkbox_state"], "checked")
+        self.assertEqual(decisions[0]["result"], "accepted")
+        self.assertTrue(unchanged)
 
     def test_bbox_recovery_enforces_confidence_area_and_document_budgets(self):
         page = structured_middle(
@@ -1692,6 +2061,46 @@ class FusionTests(unittest.TestCase):
         self.assertEqual(recovered["reason"], "empty_ocr_vlm_recovery")
         self.assertTrue(batches[0]["quality_guard_evaluated"])
         self.assertNotIn("quality_guard_triggered", batches[0])
+
+    def test_empty_ocr_candidate_rejects_rules_formula_echo_and_overflow(self):
+        settings = FusionSettings(bbox_recognition_enabled=True)
+        line = collect_text_lines(
+            middle("", bbox=(10, 10, 110, 20))["pdf_info"][0],
+            0,
+        )[0]
+        line.block_type = "table_ocr"
+
+        separator = select_bbox_recognition_candidate(
+            line,
+            "---=---=---",
+            settings,
+        )
+        formula = select_bbox_recognition_candidate(
+            line,
+            r"(1) \because {AD} = \frac{1}{2}{AB}",
+            settings,
+        )
+        overflow = select_bbox_recognition_candidate(
+            line,
+            "A" * 100,
+            settings,
+        )
+        valid = select_bbox_recognition_candidate(
+            line,
+            "Missing Value",
+            settings,
+        )
+        placeholder = select_bbox_recognition_candidate(
+            line,
+            "[Non-Text]",
+            settings,
+        )
+
+        self.assertEqual(separator[1], "empty_ocr_non_text_candidate")
+        self.assertEqual(formula[1], "empty_ocr_formula_guard")
+        self.assertEqual(overflow[1], "empty_ocr_geometry_capacity_guard")
+        self.assertEqual(valid[:2], ("vlm", "empty_ocr_vlm_recovery"))
+        self.assertEqual(placeholder[1], "empty_ocr_placeholder_guard")
 
     def test_table_collector_keeps_empty_content_bbox_for_recognition(self):
         page = structured_middle(

@@ -25,9 +25,10 @@ MinerU server) and set `vllm.upstream_url` to its reachable base URL. To launch 
 from a Linux MinerU environment, configure `vllm.server_args` and run the
 `serve-vllm` command below. vLLM is not expected to run natively on Windows.
 
-For an authenticated server, set the environment variable named by
-`vllm.api_key_env`; the default is `VLLM_API_KEY`. Secrets are never written to
-the workflow JSON or audit log.
+No authorization header is sent by default. For an authenticated server, set
+`vllm.api_key_env` (or the corresponding recognizer/recovery/verifier setting)
+to the name of an environment variable containing the token. Secrets are never
+written to the workflow JSON or audit log.
 
 The visual conflict verifier can reuse the extraction endpoint or use a separate
 instruction-following vision endpoint through `fusion.verifier.base_url`. Build
@@ -185,8 +186,10 @@ VLM transcription only when their geometry confidence passes
 
 Recovery cost is bounded by `recovery.max_tables_per_document`,
 `max_requests_per_document`, `max_proposals_per_document`, and
-`max_proposals_per_table`. API `balanced` defaults to three reviewed Tables and
-thirty proposals; `quality` defaults to ten Tables and one hundred proposals.
+`max_proposals_per_table`. API `balanced` defaults to three reviewed Tables,
+two hundred document proposals, and fifty proposals per Table; `quality`
+defaults to ten Tables, five hundred document proposals, and one hundred per
+Table. One Cell may yield several content-tight line boxes.
 The English UI exposes optional overrides under **Advanced BBox Recovery
 Settings**. Fusion reports record reviewed Tables, requests, accepted/added/
 adjusted/rejected proposals, reviewer batches, decisions, and the Table/Cell
@@ -250,11 +253,17 @@ in the example). The default path is
 so deployments with stricter data-retention requirements should disable it or
 point it at an encrypted/ephemeral volume.
 
-For MinerU local-only Recovery, Cells that already have content boxes are not
-pixel-scanned. Remaining grayscale masks are evaluated with NumPy instead of
-per-pixel Python loops. Reports and the English UI expose analyzed/skipped Cell
-counts, pixel-analysis time, cache hits/misses, request-budget skips, and native
-network requests.
+For MinerU local-only Recovery, every eligible Cell is checked after Pipeline
+OCR, including Cells that already have some content boxes. Existing OCR boxes
+are padded and masked, then only meaningful uncovered ink is proposed as one or
+more content-tight line boxes. Grayscale masks are evaluated with NumPy instead
+of per-pixel Python loops. Long horizontal, vertical, and cross-Cell diagonal
+Table rules are removed before the content-tight bbox is calculated. Highly
+overlapping proposals owned by different Cells in the same Table are rejected
+as duplicates; this protects against malformed OCR grids that map the same
+printed row into several Cells.
+Reports and the English UI expose analyzed/skipped Cell counts, pixel-analysis
+time, cache hits/misses, request-budget skips, and native network requests.
 
 In `bbox_vlm` mode, the bbox repair stage reuses the recognizer's rendered-page
 cache by default (`share_recognizer_page_cache=true`). It performs its own
@@ -269,6 +278,11 @@ where visible text remains inside the Table but below or beside every detected
 Cell. Orphan boxes may be attached to the nearest Cell for text/HTML ownership,
 but the original Table and Cell bboxes remain immutable.
 
+`table_fringe_recovery_enabled=true` extends that masked scan a bounded distance
+below a detected Table. It recovers labels and dates that visually belong to the
+form but fell just outside the Pipeline Table boundary, without expanding or
+moving the Table/Cell geometry.
+
 `checkbox_recovery_enabled=true` runs a separate local contour detector for
 small square form controls. It accepts both empty and tick-connected outlines,
 requires four-sided border evidence, nearby label ink, and a short whitespace
@@ -279,7 +293,10 @@ handwritten box-like glyphs. The detector ignores tight OCR boxes that already
 cover the control and attaches a new content-tight cyan box to the containing/
 nearest Cell. Clear states are stored locally as checked or unchecked and do
 not require a model request; only ambiguous interiors retain empty OCR text and
-enter the normal bounded native-recognition queue.
+enter the normal bounded native-recognition queue. When the checkbox and its
+right-hand label were split only by OCR spacing, `checkbox_merge_label_enabled`
+updates the label content bbox to cover both; a checkbox already covered by a
+label bbox does not create a redundant square-only box.
 
 `structured_output_mode=json_schema` is the default example and sends a dynamic
 strict schema whose ID enum and item count match the current batch. vLLM-native
@@ -314,6 +331,19 @@ candidates when `empty_ocr_enabled=true`. An empty candidate can be filled only
 when a batch of at least `batch_guard_min_candidates` passes the configured
 quality ratio using non-empty OCR anchors. Isolated empty boxes and low-quality
 batches remain empty and are audited as `empty_ocr_context_guard`.
+Accepted recovery boxes are marked separately from ordinary OCR candidates and
+always enter MinerU-native recognition even after the ordinary page/document
+request limits are exhausted. The limits still cap non-recovery OCR review;
+crop/protocol failures continue to fail closed, while the circuit breaker skips
+only ordinary OCR candidates until every valid recovery crop has been sent.
+Reports expose recovered candidate, response, selection, no-response, unsent,
+and limit-bypass counts. `native_recovered_unsent` excludes crops that reached
+vLLM but produced an invalid or length-truncated response.
+Recovered boxes that receive no usable text are retained in middle JSON for
+audit, marked `fusion_visualization_hidden`, and omitted from `*_span.pdf` so an
+unconfirmed ink fragment is not presented as a meaningful OCR bbox. For a newly
+recovered amount only, a repeated thousands/decimal separator such as
+`74.791.00` is deterministically normalized to `74,791.00` after recognition.
 
 Every bbox receives a `bbox_recognition` audit decision with OCR/VLM candidates,
 unchanged bbox, field type, similarity, selected source, and reason. Batch audit
@@ -644,8 +674,10 @@ spans. Existing Table Cell geometry remains in middle JSON and is intentionally
 not drawn in `*_span.pdf`. Use Original / Bounding Boxes to switch views. The UI
 can bind directly to a trusted LAN interface without an additional flag.
 
-`span.pdf` generation resolves the source PDF from the uploaded task input first
-and then falls back to the fused `*_origin.pdf` artifact. The preview endpoint
+`span.pdf` generation and BBox crop rendering use the Pipeline-normalized
+`*_origin.pdf` artifact first, so rendered pixels share the OCR coordinate system
+and older PDFium builds do not need to parse unusual source PDFs. They fall back
+to the uploaded task input when no normalized PDF exists. The preview endpoint
 also regenerates a missing `*_span.pdf` on demand for completed tasks and validates
 that the generated PDF is non-empty with the expected page count. Run `doctor`
 after deployment; `pypdf` and `reportlab` are required for these visualization

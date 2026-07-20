@@ -39,6 +39,7 @@ from projects.custom_hybrid.workflow import (
     resolve_upstream_max_model_len,
     run_extract,
     run_doctor,
+    _optional_bearer_headers,
     _generate_fused_visualizations,
     _index_input_documents,
     _resolve_visualization_pdf,
@@ -48,6 +49,22 @@ from projects.custom_hybrid.workflow import (
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_bearer_header_requires_explicit_environment_setting(self):
+        with mock.patch.dict(
+            "os.environ",
+            {"VLLM_API_KEY": "local-secret"},
+            clear=False,
+        ):
+            self.assertEqual(_optional_bearer_headers({}), {})
+            self.assertEqual(
+                _optional_bearer_headers({"api_key_env": None}),
+                {},
+            )
+            self.assertEqual(
+                _optional_bearer_headers({"api_key_env": "VLLM_API_KEY"}),
+                {"authorization": "Bearer local-secret"},
+            )
+
     def test_visualization_source_falls_back_to_fused_origin_pdf(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             parse_dir = Path(temp_dir)
@@ -58,6 +75,22 @@ class WorkflowTests(unittest.TestCase):
                 parse_dir,
                 "renamed",
                 source_document=None,
+            )
+
+            self.assertEqual(resolved, origin)
+
+    def test_visualization_and_bbox_source_prefers_pipeline_origin_pdf(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parse_dir = Path(temp_dir)
+            source = parse_dir / "uploaded.pdf"
+            source.write_bytes(b"source")
+            origin = parse_dir / "renamed_origin.pdf"
+            origin.write_bytes(b"normalized")
+
+            resolved = _resolve_visualization_pdf(
+                parse_dir,
+                "renamed",
+                source,
             )
 
             self.assertEqual(resolved, origin)
@@ -177,7 +210,7 @@ class WorkflowTests(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
-            self.assertEqual(marker["bbox_renderer_version"], 6)
+            self.assertEqual(marker["bbox_renderer_version"], 8)
             self.assertEqual(marker["form_detector_version"], 1)
             self.assertEqual(marker["form_segmenter_version"], 4)
             self.assertTrue((parse_dir / "renamed_forms.pdf").is_file())
@@ -1306,6 +1339,7 @@ class WorkflowTests(unittest.TestCase):
                 json.dumps(build_middle("Hybrid")),
                 encoding="utf-8",
             )
+            (hybrid_root / "sample_origin.pdf").write_bytes(b"normalized")
             (ocr_root / "sample_middle.json").write_text(
                 json.dumps(build_middle("OCR", 0.99)),
                 encoding="utf-8",
@@ -1331,7 +1365,7 @@ class WorkflowTests(unittest.TestCase):
 
         recognizer_class.assert_called_once_with(
             "http://vision.test",
-            input_pdf.resolve(),
+            fused_root / "sample" / "hybrid_ocr" / "sample_origin.pdf",
             config["fusion"]["recognizer"],
         )
         recognizer.assert_called_once()
@@ -1419,6 +1453,7 @@ class WorkflowTests(unittest.TestCase):
                 json.dumps(build_table_middle()),
                 encoding="utf-8",
             )
+            (ocr_dir / "sample_origin.pdf").write_bytes(b"normalized")
             with (
                 mock.patch(
                     "projects.custom_hybrid.workflow.OpenAIBBoxRecognizer",
@@ -1445,7 +1480,7 @@ class WorkflowTests(unittest.TestCase):
         effective.update(config["fusion"]["recovery"])
         reviewer_class.assert_called_once_with(
             "http://recovery.test",
-            input_pdf.resolve(),
+            root / "fused" / "sample" / "ocr" / "sample_origin.pdf",
             effective,
             page_provider=mock.sentinel.shared_page_provider,
         )

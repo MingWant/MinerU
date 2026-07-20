@@ -500,6 +500,14 @@ class CustomHybridApiTests(unittest.TestCase):
             quality["fusion"]["recognizer"]["native_max_requests_per_page"],
             24,
         )
+        self.assertEqual(
+            quality["fusion"]["recovery"]["max_proposals_per_document"],
+            500,
+        )
+        self.assertEqual(
+            quality["fusion"]["recovery"]["max_proposals_per_table"],
+            100,
+        )
         recovery = _normalize_task_parameters(
             cost_profile="balanced",
             extraction_mode="bbox_vlm_recovery",
