@@ -268,6 +268,23 @@ def middle(text):
 
 
 class BBoxRecognitionTests(unittest.TestCase):
+    def test_forced_recovery_candidate_bypasses_small_print_filter(self):
+        recognizer = OpenAIBBoxRecognizer(
+            "http://vision.test",
+            "unused.pdf",
+            {"native_min_bbox_height": 16.0},
+        )
+        ordinary = {
+            "bbox": [10, 10, 100, 20],
+            "ocr_text": "1. Content",
+        }
+        forced = {**ordinary, "force_recognition": True}
+        try:
+            self.assertFalse(recognizer._native_candidate_selected(ordinary))
+            self.assertTrue(recognizer._native_candidate_selected(forced))
+        finally:
+            recognizer.close()
+
     def test_recognizer_bearer_header_is_opt_in(self):
         with mock.patch.dict(
             "os.environ",

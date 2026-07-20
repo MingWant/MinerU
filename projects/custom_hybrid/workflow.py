@@ -292,6 +292,7 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         "checkbox_recovery_enabled",
         "checkbox_accept_existing_label_bbox",
         "checkbox_merge_label_enabled",
+        "list_marker_merge_enabled",
         "table_diagonal_rule_enabled",
     ):
         field = recovery.get(key)
@@ -340,6 +341,8 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         "checkbox_unchecked_interior_ratio",
         "checkbox_checked_interior_ratio",
         "checkbox_label_min_vertical_overlap",
+        "list_marker_confidence",
+        "list_marker_min_vertical_overlap",
     ):
         field = recovery.get(key)
         if field is not None and (
@@ -400,6 +403,7 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         "max_requests_per_document",
         "table_orphan_max_boxes_per_table",
         "checkbox_max_boxes_per_table",
+        "list_marker_max_merges_per_table",
     ):
         field = recovery.get(key)
         if field is not None and (
@@ -474,6 +478,7 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         ("table_orphan_horizontal_gap", 12.0, False),
         ("table_fringe_bottom_extension", 72.0, True),
         ("checkbox_label_max_gap", 24.0, True),
+        ("list_marker_max_gap", 24.0, True),
     ):
         field = recovery.get(key, default)
         if (

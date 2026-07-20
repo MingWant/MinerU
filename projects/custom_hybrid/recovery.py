@@ -7,6 +7,7 @@ import io
 import json
 import math
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -14,6 +15,11 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from projects.custom_hybrid.fusion import PageCropProvider
+
+
+_LIST_MARKER_RE = re.compile(
+    r"^(?:\(\s*\d{1,3}\s*\)|\d{1,3}\s*[.)、:：])$"
+)
 
 
 def _valid_bbox(value: Any) -> tuple[float, float, float, float] | None:
@@ -127,6 +133,7 @@ class OpenAIBBoxRecoveryReviewer:
         self.checkbox_candidates = 0
         self.checkbox_boxes_proposed = 0
         self.checkbox_labels_merged = 0
+        self.list_marker_labels_merged = 0
         self.checkbox_checked = 0
         self.checkbox_unchecked = 0
         self.checkbox_ambiguous = 0
@@ -1512,6 +1519,152 @@ class OpenAIBBoxRecoveryReviewer:
         finally:
             crop.close()
 
+    def _table_list_marker_proposals(
+        self,
+        table: Mapping[str, Any],
+        max_items: int,
+    ) -> list[dict[str, Any]]:
+        """Merge a standalone numbered-list marker with its same-line label."""
+        if (
+            not self.config.get("list_marker_merge_enabled", True)
+            or max_items <= 0
+        ):
+            return []
+        table_id = table.get("id")
+        if not isinstance(table_id, str):
+            return []
+        maximum_gap = max(
+            float(self.config.get("list_marker_max_gap", 24.0)),
+            0.0,
+        )
+        minimum_vertical_overlap = min(
+            max(
+                float(
+                    self.config.get(
+                        "list_marker_min_vertical_overlap",
+                        0.5,
+                    )
+                ),
+                0.0,
+            ),
+            1.0,
+        )
+        confidence = float(
+            self.config.get("list_marker_confidence", 0.98)
+        )
+        proposals = []
+        used_targets: set[str] = set()
+        for cell in table.get("cells", []):
+            if not isinstance(cell, Mapping):
+                continue
+            cell_id = cell.get("id")
+            if not isinstance(cell_id, str):
+                continue
+            records = []
+            for item in cell.get("existing", []):
+                if not isinstance(item, Mapping):
+                    continue
+                item_id = item.get("id")
+                bbox = _valid_bbox(item.get("bbox"))
+                text = str(item.get("text", "")).strip()
+                if (
+                    not isinstance(item_id, str)
+                    or bbox is None
+                    or not text
+                    or item.get("checkbox")
+                    or item.get("orphan")
+                    or item.get("grouped_list_marker")
+                    or item.get("grouped_list_item")
+                ):
+                    continue
+                records.append((item_id, bbox, text))
+            for marker_id, marker_bbox, marker_text in records:
+                if _LIST_MARKER_RE.fullmatch(marker_text) is None:
+                    continue
+                candidates = []
+                for target_id, target_bbox, target_text in records:
+                    if (
+                        target_id == marker_id
+                        or target_id in used_targets
+                        or _LIST_MARKER_RE.fullmatch(target_text) is not None
+                        or not any(character.isalpha() for character in target_text)
+                    ):
+                        continue
+                    gap = target_bbox[0] - marker_bbox[2]
+                    vertical_overlap = max(
+                        0.0,
+                        min(marker_bbox[3], target_bbox[3])
+                        - max(marker_bbox[1], target_bbox[1]),
+                    )
+                    minimum_height = min(
+                        marker_bbox[3] - marker_bbox[1],
+                        target_bbox[3] - target_bbox[1],
+                    )
+                    overlap_ratio = (
+                        vertical_overlap / minimum_height
+                        if minimum_height > 0
+                        else 0.0
+                    )
+                    if not (
+                        0.0 <= gap <= maximum_gap
+                        and overlap_ratio >= minimum_vertical_overlap
+                    ):
+                        continue
+                    union_bbox = (
+                        min(marker_bbox[0], target_bbox[0]),
+                        min(marker_bbox[1], target_bbox[1]),
+                        max(marker_bbox[2], target_bbox[2]),
+                        max(marker_bbox[3], target_bbox[3]),
+                    )
+                    already_combined = any(
+                        other_id not in {marker_id, target_id}
+                        and _bbox_overlap_ratio(union_bbox, other_bbox) >= 0.9
+                        for other_id, other_bbox, _other_text in records
+                    )
+                    if already_combined:
+                        continue
+                    center_delta = abs(
+                        (marker_bbox[1] + marker_bbox[3]) / 2
+                        - (target_bbox[1] + target_bbox[3]) / 2
+                    )
+                    candidates.append(
+                        (
+                            gap,
+                            -overlap_ratio,
+                            center_delta,
+                            target_id,
+                            target_bbox,
+                            target_text,
+                            union_bbox,
+                        )
+                    )
+                target = min(candidates, default=None)
+                if target is None:
+                    continue
+                target_id = target[3]
+                target_text = target[5]
+                union_bbox = target[6]
+                proposals.append(
+                    {
+                        "action": "merge_list_marker",
+                        "table_id": table_id,
+                        "cell_id": cell_id,
+                        "target_id": target_id,
+                        "marker_id": marker_id,
+                        "bbox": list(union_bbox),
+                        "confidence": confidence,
+                        "text": f"{marker_text} {target_text}",
+                        "list_marker_text": marker_text,
+                        "recovery_reasons": ["split_list_marker_bbox"],
+                        "recovery_source": "local_list_marker_merge",
+                    }
+                )
+                used_targets.add(target_id)
+                self.list_marker_labels_merged += 1
+                if len(proposals) >= max_items:
+                    return proposals
+        return proposals
+
     def _overlay_data_url(
         self,
         image,
@@ -1865,6 +2018,7 @@ class OpenAIBBoxRecoveryReviewer:
         checkbox_candidates_before = self.checkbox_candidates
         checkbox_boxes_before = self.checkbox_boxes_proposed
         checkbox_merged_before = self.checkbox_labels_merged
+        list_marker_merged_before = self.list_marker_labels_merged
         checkbox_checked_before = self.checkbox_checked
         checkbox_unchecked_before = self.checkbox_unchecked
         checkbox_ambiguous_before = self.checkbox_ambiguous
@@ -1936,13 +2090,43 @@ class OpenAIBBoxRecoveryReviewer:
                 int(self.config.get("max_proposals_per_table", 30)),
                 0,
             )
+            list_marker_limit = min(
+                remaining_proposals,
+                per_table_limit,
+                max(
+                    int(
+                        self.config.get(
+                            "list_marker_max_merges_per_table",
+                            40,
+                        )
+                    ),
+                    0,
+                ),
+            )
+            list_marker_items = self._table_list_marker_proposals(
+                table,
+                list_marker_limit,
+            )
             missing_items = self._local_missing_proposals(
                 suspicious,
-                min(remaining_proposals, per_table_limit),
+                min(
+                    max(remaining_proposals - len(list_marker_items), 0),
+                    max(per_table_limit - len(list_marker_items), 0),
+                ),
             )
             checkbox_limit = min(
-                max(remaining_proposals - len(missing_items), 0),
-                max(per_table_limit - len(missing_items), 0),
+                max(
+                    remaining_proposals
+                    - len(list_marker_items)
+                    - len(missing_items),
+                    0,
+                ),
+                max(
+                    per_table_limit
+                    - len(list_marker_items)
+                    - len(missing_items),
+                    0,
+                ),
                 max(
                     int(
                         self.config.get(
@@ -1966,12 +2150,16 @@ class OpenAIBBoxRecoveryReviewer:
             orphan_limit = min(
                 max(
                     remaining_proposals
+                    - len(list_marker_items)
                     - len(missing_items)
                     - len(checkbox_items),
                     0,
                 ),
                 max(
-                    per_table_limit - len(missing_items) - len(checkbox_items),
+                    per_table_limit
+                    - len(list_marker_items)
+                    - len(missing_items)
+                    - len(checkbox_items),
                     0,
                 ),
                 max(
@@ -1995,7 +2183,12 @@ class OpenAIBBoxRecoveryReviewer:
                 )
             finally:
                 pixel_analysis_seconds += time.monotonic() - pixel_started
-            local_items = missing_items + checkbox_items + orphan_items
+            local_items = (
+                list_marker_items
+                + missing_items
+                + checkbox_items
+                + orphan_items
+            )
             fringe_items = [
                 item for item in orphan_items if item.get("action") == "add_fringe"
             ]
@@ -2028,6 +2221,9 @@ class OpenAIBBoxRecoveryReviewer:
                         "orphan_proposals": len(table_orphan_items),
                         "fringe_proposals": len(fringe_items),
                         "checkbox_proposals": len(checkbox_items),
+                        "list_marker_merge_proposals": len(
+                            list_marker_items
+                        ),
                     }
                 )
                 if not self.config.get("review_after_local_recovery", False):
@@ -2154,6 +2350,9 @@ class OpenAIBBoxRecoveryReviewer:
             "checkbox_candidates": self.checkbox_candidates - checkbox_candidates_before,
             "checkbox_proposals": self.checkbox_boxes_proposed - checkbox_boxes_before,
             "checkbox_merged": self.checkbox_labels_merged - checkbox_merged_before,
+            "list_marker_merged": (
+                self.list_marker_labels_merged - list_marker_merged_before
+            ),
             "checkbox_checked": self.checkbox_checked - checkbox_checked_before,
             "checkbox_unchecked": self.checkbox_unchecked - checkbox_unchecked_before,
             "checkbox_ambiguous": self.checkbox_ambiguous - checkbox_ambiguous_before,

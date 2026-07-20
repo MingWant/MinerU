@@ -524,6 +524,88 @@ class BBoxRecoveryReviewerTests(unittest.TestCase):
         self.assertGreaterEqual(merged[0]["bbox"][2], 120)
         self.assertEqual(result["checkbox_merged"], 1)
 
+    def test_list_marker_recovery_merges_same_line_text_bbox(self):
+        reviewer = OpenAIBBoxRecoveryReviewer(
+            "http://vision.test",
+            "unused.pdf",
+            {
+                "list_marker_merge_enabled": True,
+                "list_marker_max_gap": 24.0,
+            },
+            page_provider=mock.Mock(),
+        )
+        table = {
+            "id": "p0-table-0",
+            "cells": [
+                {
+                    "id": "p0-t0-c0",
+                    "existing": [
+                        {
+                            "id": "p0-t0-c0-b0",
+                            "bbox": [20, 20, 30, 32],
+                            "text": "1.",
+                        },
+                        {
+                            "id": "p0-t0-c0-b1",
+                            "bbox": [38, 18, 170, 50],
+                            "text": "ContentABCDEFG",
+                        },
+                    ],
+                }
+            ],
+        }
+
+        proposals = reviewer._table_list_marker_proposals(table, 10)
+
+        self.assertEqual(len(proposals), 1)
+        self.assertEqual(proposals[0]["action"], "merge_list_marker")
+        self.assertEqual(proposals[0]["marker_id"], "p0-t0-c0-b0")
+        self.assertEqual(proposals[0]["target_id"], "p0-t0-c0-b1")
+        self.assertEqual(proposals[0]["bbox"], [20.0, 18.0, 170.0, 50.0])
+        self.assertEqual(proposals[0]["text"], "1. ContentABCDEFG")
+        self.assertEqual(reviewer.list_marker_labels_merged, 1)
+
+    def test_list_marker_recovery_rejects_codes_amounts_and_distant_text(self):
+        reviewer = OpenAIBBoxRecoveryReviewer(
+            "http://vision.test",
+            "unused.pdf",
+            {
+                "list_marker_merge_enabled": True,
+                "list_marker_max_gap": 12.0,
+            },
+            page_provider=mock.Mock(),
+        )
+        table = {
+            "id": "p0-table-0",
+            "cells": [
+                {
+                    "id": "p0-t0-c0",
+                    "existing": [
+                        {"id": "p0-t0-c0-b0", "bbox": [10, 10, 20, 22], "text": "1"},
+                        {"id": "p0-t0-c0-b1", "bbox": [25, 10, 60, 22], "text": "Code"},
+                    ],
+                },
+                {
+                    "id": "p0-t0-c1",
+                    "existing": [
+                        {"id": "p0-t0-c1-b0", "bbox": [10, 30, 20, 42], "text": "2."},
+                        {"id": "p0-t0-c1-b1", "bbox": [25, 30, 60, 42], "text": "50.00"},
+                    ],
+                },
+                {
+                    "id": "p0-t0-c2",
+                    "existing": [
+                        {"id": "p0-t0-c2-b0", "bbox": [10, 50, 20, 62], "text": "3."},
+                        {"id": "p0-t0-c2-b1", "bbox": [50, 50, 100, 62], "text": "Far text"},
+                    ],
+                },
+            ],
+        }
+
+        proposals = reviewer._table_list_marker_proposals(table, 10)
+
+        self.assertEqual(proposals, [])
+
     def test_local_pixel_recovery_removes_long_table_rules_from_content_bbox(self):
         from PIL import Image, ImageDraw
 

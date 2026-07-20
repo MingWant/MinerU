@@ -38,6 +38,9 @@ TEXT_SPAN_TYPES = {"text", "hyperlink"}
 FUSION_MODES = {"hybrid_fusion", "bbox_vlm"}
 LEGACY_FUSION_MODE_ALIASES = {"bbox_vlm_recovery": "bbox_vlm"}
 RECOGNITION_SELECTION_POLICIES = {"conservative", "vlm_primary"}
+LIST_MARKER_RE = re.compile(
+    r"^(?:\(\s*\d{1,3}\s*\)|\d{1,3}\s*[.)、:：])$"
+)
 TEXT_BLOCK_TYPES = {
     "text",
     "title",
@@ -723,7 +726,12 @@ def collect_table_ocr_lines(
                 continue
             raw_content_spans = cell.get("content_spans", [])
             content_spans = (
-                [item for item in raw_content_spans if isinstance(item, Mapping)]
+                [
+                    item
+                    for item in raw_content_spans
+                    if isinstance(item, Mapping)
+                    and not item.get("fusion_grouped_list_marker")
+                ]
                 if isinstance(raw_content_spans, list)
                 else []
             )
@@ -918,6 +926,12 @@ def build_bbox_recovery_manifest(
                             "source": "content_span",
                             "orphan": bool(span.get("fusion_recovery_orphan")),
                             "checkbox": bool(span.get("fusion_recovery_checkbox")),
+                            "grouped_list_marker": bool(
+                                span.get("fusion_grouped_list_marker")
+                            ),
+                            "grouped_list_item": bool(
+                                span.get("fusion_list_marker_grouped")
+                            ),
                         }
                     )
             if not existing:
@@ -1071,6 +1085,7 @@ def apply_bbox_recovery_proposals(
         "fringe_added": 0,
         "checkbox_added": 0,
         "checkbox_merged": 0,
+        "list_marker_merged": 0,
         "rejected": 0,
         "errors": 0,
     }
@@ -1100,6 +1115,7 @@ def apply_bbox_recovery_proposals(
         table_id = item.get("table_id")
         cell_id = item.get("cell_id")
         target_id = item.get("target_id")
+        marker_id = item.get("marker_id")
         confidence = item.get("confidence")
         bbox = _valid_bbox(item.get("bbox"))
         decision = {
@@ -1109,6 +1125,7 @@ def apply_bbox_recovery_proposals(
             "table_id": table_id,
             "cell_id": cell_id,
             "target_id": target_id,
+            "marker_id": marker_id,
             "bbox": list(bbox) if bbox is not None else item.get("bbox"),
             "confidence": confidence,
         }
@@ -1118,6 +1135,7 @@ def apply_bbox_recovery_proposals(
         table_key = cell_id.rsplit("-c", 1)[0] if isinstance(cell_id, str) else ""
         expected_table_id = table_key.replace("-t", "-table-")
         detached_actions = {"add_orphan", "add_fringe", "add_checkbox"}
+        table_scoped_actions = detached_actions | {"merge_list_marker"}
         if action not in detached_actions:
             table_id = expected_table_id
         table = tables.get(table_id) if isinstance(table_id, str) else None
@@ -1130,11 +1148,12 @@ def apply_bbox_recovery_proposals(
             "add_fringe",
             "add_checkbox",
             "merge_checkbox",
+            "merge_list_marker",
         }:
             reason = "unsupported_action"
         elif cell is None or cell_bbox is None:
             reason = "unknown_cell"
-        elif action in detached_actions and (
+        elif action in table_scoped_actions and (
             table is None or table_id != expected_table_id
         ):
             reason = "unknown_table"
@@ -1155,7 +1174,7 @@ def apply_bbox_recovery_proposals(
                 )
             else:
                 outer_bbox = (
-                    table_bbox if action in detached_actions else cell_bbox
+                    table_bbox if action in table_scoped_actions else cell_bbox
                 )
             bbox = _clip_bbox_to_outer(
                 bbox,
@@ -1164,7 +1183,7 @@ def apply_bbox_recovery_proposals(
             if bbox is None:
                 reason = (
                     "bbox_outside_table"
-                    if action in detached_actions
+                    if action in table_scoped_actions
                     else "bbox_outside_cell"
                 )
         if reason is None:
@@ -1176,7 +1195,7 @@ def apply_bbox_recovery_proposals(
                 )
             else:
                 outer_bbox = (
-                    table_bbox if action in detached_actions else cell_bbox
+                    table_bbox if action in table_scoped_actions else cell_bbox
                 )
             cell_area = (outer_bbox[2] - outer_bbox[0]) * (
                 outer_bbox[3] - outer_bbox[1]
@@ -1202,7 +1221,11 @@ def apply_bbox_recovery_proposals(
                 area_ratio = bbox_area / cell_area if cell_area > 0 else 0.0
                 minimum_area_ratio = (
                     0.0
-                    if action in {"add_orphan", "add_fringe"}
+                    if action in {
+                        "add_orphan",
+                        "add_fringe",
+                        "merge_list_marker",
+                    }
                     else settings.bbox_recovery_min_area_ratio
                 )
                 if not minimum_area_ratio <= area_ratio <= settings.bbox_recovery_max_area_ratio:
@@ -1259,6 +1282,7 @@ def apply_bbox_recovery_proposals(
                 existing_records.append((content_bbox, str(cell_id or "")))
         existing_bboxes = [record[0] for record in existing_records]
         target = boxes.get(target_id) if isinstance(target_id, str) else None
+        marker = boxes.get(marker_id) if isinstance(marker_id, str) else None
         if reason is None and action == "add" and any(
             owner_id != cell_id
             and _bbox_coverage(bbox, existing)
@@ -1283,7 +1307,11 @@ def apply_bbox_recovery_proposals(
             "add_checkbox",
         } and target_id not in {"", None}:
             reason = "unexpected_add_target"
-        if reason is None and action in {"adjust", "merge_checkbox"}:
+        if reason is None and action in {
+            "adjust",
+            "merge_checkbox",
+            "merge_list_marker",
+        }:
             if (
                 target is None
                 or not isinstance(target_id, str)
@@ -1302,6 +1330,38 @@ def apply_bbox_recovery_proposals(
                     reason = "invalid_target_bbox"
                 elif _bbox_iou(bbox, original_bbox) < settings.bbox_recovery_adjust_min_iou:
                     reason = "adjust_iou_guard"
+        if reason is None and action == "merge_list_marker":
+            if (
+                marker is None
+                or not isinstance(marker_id, str)
+                or not isinstance(cell_id, str)
+                or marker_id == target_id
+                or not marker_id.startswith(cell_id + "-")
+            ):
+                reason = "unknown_list_marker"
+            else:
+                raw_marker, marker_source = marker
+                raw_target, target_source = target
+                marker_bbox = _valid_bbox(
+                    raw_marker.get("bbox")
+                    if marker_source == "content_span"
+                    else raw_marker.get("content_bbox")
+                )
+                marker_text = _content_span_text(raw_marker).strip()
+                target_text = _content_span_text(raw_target).strip()
+                if (
+                    marker_source != "content_span"
+                    or target_source != "content_span"
+                    or marker_bbox is None
+                    or LIST_MARKER_RE.fullmatch(marker_text) is None
+                    or not any(character.isalpha() for character in target_text)
+                ):
+                    reason = "list_marker_guard"
+                elif (
+                    _bbox_coverage(marker_bbox, bbox) < 0.95
+                    or _bbox_coverage(original_bbox, bbox) < 0.95
+                ):
+                    reason = "list_marker_union_guard"
         if reason is not None:
             stats["rejected"] += 1
             decision.update(result="rejected", reason=reason)
@@ -1318,6 +1378,7 @@ def apply_bbox_recovery_proposals(
             "fusion_recovery_fringe": action == "add_fringe",
             "fusion_recovery_checkbox": action == "add_checkbox",
             "fusion_checkbox_grouped": action == "merge_checkbox",
+            "fusion_list_marker_grouped": action == "merge_list_marker",
         }
         if action in {"add_checkbox", "merge_checkbox"}:
             recovery_metadata.update(
@@ -1365,9 +1426,31 @@ def apply_bbox_recovery_proposals(
                 )
                 raw_target["content_bbox"] = list(bbox)
                 raw_target.update(recovery_metadata)
+            if action == "merge_list_marker":
+                raw_marker, _marker_source = marker
+                marker_text = _content_span_text(raw_marker).strip()
+                target_text = _content_span_text(raw_target).strip()
+                combined_text = f"{marker_text} {target_text}".strip()
+                raw_target["fusion_list_marker_text"] = marker_text
+                raw_target["fusion_list_item_original_text"] = target_text
+                raw_target["fusion_force_recognition"] = True
+                if "text" in raw_target:
+                    raw_target["text"] = combined_text
+                if "content" in raw_target:
+                    raw_target["content"] = combined_text
+                if "text" not in raw_target and "content" not in raw_target:
+                    raw_target["text"] = combined_text
+                raw_marker["fusion_grouped_list_marker"] = True
+                raw_marker["fusion_grouped_into"] = target_id
+                raw_marker["fusion_visualization_hidden"] = True
+                raw_marker[
+                    "fusion_visualization_hidden_reason"
+                ] = "merged_list_marker"
             stats["adjusted"] += 1
             if action == "merge_checkbox":
                 stats["checkbox_merged"] += 1
+            elif action == "merge_list_marker":
+                stats["list_marker_merged"] += 1
         accepted_count += 1
         table_counts[table_key] += 1
         stats["accepted"] += 1
@@ -1385,6 +1468,7 @@ def apply_bbox_recovery_proposals(
         stats["fringe_added"] = 0
         stats["checkbox_added"] = 0
         stats["checkbox_merged"] = 0
+        stats["list_marker_merged"] = 0
         stats["rejected"] += rolled_back
         stats["errors"] += 1
         for decision in decisions:
@@ -1456,6 +1540,7 @@ def build_bbox_recognition_manifest(
         candidate_id = f"p{page_index}-bbox-{len(manifest)}"
         metadata = line.spans[0]
         recovered_bbox = bool(metadata.get("fusion_recovered_bbox"))
+        force_recognition = bool(metadata.get("fusion_force_recognition"))
         candidate = {
             "id": candidate_id,
             "bbox": [round(value, 3) for value in line.bbox],
@@ -1465,7 +1550,9 @@ def build_bbox_recognition_manifest(
             else None,
             "type": line.block_type,
             "recovered_bbox": recovered_bbox,
-            "recovered": recovered_bbox and not line.text.strip(),
+            "force_recognition": force_recognition,
+            "recovered": recovered_bbox
+            and (not line.text.strip() or force_recognition),
             "contexts": {
                 "target": [round(value, 3) for value in line.bbox],
             },
@@ -1673,6 +1760,22 @@ def select_bbox_recognition_candidate(
         return "ocr", "bbox_protocol_id_echo", field_type, similarity, length_ratio
     if len(vlm_text) > settings.bbox_recognition_max_text_chars:
         return "ocr", "vlm_candidate_too_long", field_type, similarity, length_ratio
+    list_marker_text = str(
+        (line.spans[0] if line.spans else {}).get(
+            "fusion_list_marker_text",
+            "",
+        )
+    ).strip()
+    if list_marker_text and not re.sub(r"\s+", "", vlm_text).startswith(
+        re.sub(r"\s+", "", list_marker_text)
+    ):
+        return (
+            "ocr",
+            "list_marker_omission_guard",
+            field_type,
+            similarity,
+            length_ratio,
+        )
     if not normalized_ocr:
         if settings.bbox_recognition_empty_ocr_enabled:
             metadata = line.spans[0] if line.spans else {}
@@ -1964,6 +2067,7 @@ def apply_recognition_batch_quality_guard(
         "candidate_length_guard",
         "empty_ocr_vlm_recovery",
         "vlm_primary_quality_guard",
+        "list_marker_omission_guard",
     }
     for batch in batches:
         raw_ids = batch.get("ids")
@@ -3511,6 +3615,7 @@ def fuse_middle_json(
         "bbox_recovery_checkbox_candidates": 0,
         "bbox_recovery_checkbox_proposals": 0,
         "bbox_recovery_checkbox_merge_proposals": 0,
+        "bbox_recovery_list_marker_merge_proposals": 0,
         "bbox_recovery_checkbox_checked": 0,
         "bbox_recovery_checkbox_unchecked": 0,
         "bbox_recovery_checkbox_ambiguous": 0,
@@ -3527,6 +3632,7 @@ def fuse_middle_json(
         "bbox_recovery_fringe_added": 0,
         "bbox_recovery_checkbox_added": 0,
         "bbox_recovery_checkbox_merged": 0,
+        "bbox_recovery_list_marker_merged": 0,
         "bbox_recovery_rejected": 0,
         "bbox_recovery_errors": 0,
         "table_targets": 0,
@@ -3659,6 +3765,10 @@ def fuse_middle_json(
                             "checkbox_merged",
                             "bbox_recovery_checkbox_merge_proposals",
                         ),
+                        (
+                            "list_marker_merged",
+                            "bbox_recovery_list_marker_merge_proposals",
+                        ),
                         ("checkbox_checked", "bbox_recovery_checkbox_checked"),
                         ("checkbox_unchecked", "bbox_recovery_checkbox_unchecked"),
                         ("checkbox_ambiguous", "bbox_recovery_checkbox_ambiguous"),
@@ -3703,6 +3813,7 @@ def fuse_middle_json(
                         "fringe_added",
                         "checkbox_added",
                         "checkbox_merged",
+                        "list_marker_merged",
                         "rejected",
                         "errors",
                     ):
@@ -3739,7 +3850,10 @@ def fuse_middle_json(
                         line
                         for line in recognition_lines
                         if line.spans[0].get("fusion_recovered_bbox")
-                        and not line.text.strip()
+                        and (
+                            not line.text.strip()
+                            or line.spans[0].get("fusion_force_recognition")
+                        )
                     ]
                     ordinary_lines = [
                         line

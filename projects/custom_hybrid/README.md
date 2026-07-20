@@ -298,6 +298,15 @@ right-hand label were split only by OCR spacing, `checkbox_merge_label_enabled`
 updates the label content bbox to cover both; a checkbox already covered by a
 label bbox does not create a redundant square-only box.
 
+`list_marker_merge_enabled=true` applies the same post-OCR grouping principle
+to numbered list markers. A strict standalone marker such as `1.`, `2)`, or
+`(3)` is merged only with the nearest right-hand text bbox in the same Cell when
+their line overlap and gap pass the configured guards. The marker's original
+bbox remains in middle JSON for audit but is hidden from visualization and
+recognition; the combined bbox and fallback text (for example,
+`1. ContentABCDEFG`) are sent to vLLM. Amount-only, code-like, distant, and
+vertically misaligned neighbors are not merged.
+
 `structured_output_mode=json_schema` is the default example and sends a dynamic
 strict schema whose ID enum and item count match the current batch. vLLM-native
 `structured_outputs`, strict ordered `regex`, legacy `json_object`, and `none`

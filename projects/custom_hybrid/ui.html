@@ -503,6 +503,8 @@
           <div class="coverage-metric"><strong id="checkboxBoxesValue">-</strong><span>Checkbox Boxes Added</span></div>
           <div class="coverage-metric"><strong id="checkboxMergeProposalsValue">-</strong><span>Checkbox Merge Proposals</span></div>
           <div class="coverage-metric"><strong id="checkboxMergedValue">-</strong><span>Checkbox Labels Merged</span></div>
+          <div class="coverage-metric"><strong id="listMarkerMergeProposalsValue">-</strong><span>List Marker Merge Proposals</span></div>
+          <div class="coverage-metric"><strong id="listMarkerMergedValue">-</strong><span>List Markers Merged</span></div>
           <div class="coverage-metric"><strong id="checkboxCheckedValue">-</strong><span>Checked Controls</span></div>
           <div class="coverage-metric"><strong id="checkboxUncheckedValue">-</strong><span>Unchecked Controls</span></div>
           <div class="coverage-metric"><strong id="checkboxAmbiguousValue">-</strong><span>Ambiguous Controls</span></div>
@@ -982,7 +984,7 @@
   }
 
   function renderCoverageSummary(report) {
-    const totals = {total: 0, matched: 0, recovered: 0, uncovered: 0, unreliableTables: 0, keyValuePairs: 0, vlmRecognized: 0, ocrRetained: 0, protocolEchoes: 0, invalidRecognition: 0, recognitionErrors: 0, recognitionRebatches: 0, nativeRecognitionRequests: 0, nativeRecognitionSkipped: 0, nativeCacheHits: 0, nativeCacheMisses: 0, nativeBudgetSkipped: 0, recoveredBboxCandidates: 0, recoveredBboxResponses: 0, recoveredBboxNoResponse: 0, recoveredBboxHidden: 0, recoveredBboxUnsent: 0, recoveredBboxBypasses: 0, recognitionCircuitBreakers: 0, recoveryTables: 0, localRecovery: 0, recoveryCellsAnalyzed: 0, recoveryCellsSkipped: 0, recoveryDiagonalRules: 0, recoveryPixelMs: 0, orphanTables: 0, orphanBoxes: 0, fringeProposals: 0, fringeBoxes: 0, checkboxBoxes: 0, checkboxMergeProposals: 0, checkboxMerged: 0, checkboxChecked: 0, checkboxUnchecked: 0, checkboxAmbiguous: 0, recoveryAdded: 0, recoveryAdjusted: 0, recoveryRejected: 0};
+    const totals = {total: 0, matched: 0, recovered: 0, uncovered: 0, unreliableTables: 0, keyValuePairs: 0, vlmRecognized: 0, ocrRetained: 0, protocolEchoes: 0, invalidRecognition: 0, recognitionErrors: 0, recognitionRebatches: 0, nativeRecognitionRequests: 0, nativeRecognitionSkipped: 0, nativeCacheHits: 0, nativeCacheMisses: 0, nativeBudgetSkipped: 0, recoveredBboxCandidates: 0, recoveredBboxResponses: 0, recoveredBboxNoResponse: 0, recoveredBboxHidden: 0, recoveredBboxUnsent: 0, recoveredBboxBypasses: 0, recognitionCircuitBreakers: 0, recoveryTables: 0, localRecovery: 0, recoveryCellsAnalyzed: 0, recoveryCellsSkipped: 0, recoveryDiagonalRules: 0, recoveryPixelMs: 0, orphanTables: 0, orphanBoxes: 0, fringeProposals: 0, fringeBoxes: 0, checkboxBoxes: 0, checkboxMergeProposals: 0, checkboxMerged: 0, listMarkerMergeProposals: 0, listMarkerMerged: 0, checkboxChecked: 0, checkboxUnchecked: 0, checkboxAmbiguous: 0, recoveryAdded: 0, recoveryAdjusted: 0, recoveryRejected: 0};
     const documents = report && report.documents ? Object.values(report.documents) : [];
     documents.forEach(documentResult => {
       const counts = documentResult && documentResult.counts ? documentResult.counts : {};
@@ -1023,6 +1025,8 @@
       totals.checkboxBoxes += Number(counts.bbox_recovery_checkbox_added || 0);
       totals.checkboxMergeProposals += Number(counts.bbox_recovery_checkbox_merge_proposals || 0);
       totals.checkboxMerged += Number(counts.bbox_recovery_checkbox_merged || 0);
+      totals.listMarkerMergeProposals += Number(counts.bbox_recovery_list_marker_merge_proposals || 0);
+      totals.listMarkerMerged += Number(counts.bbox_recovery_list_marker_merged || 0);
       totals.checkboxChecked += Number(counts.bbox_recovery_checkbox_checked || 0);
       totals.checkboxUnchecked += Number(counts.bbox_recovery_checkbox_unchecked || 0);
       totals.checkboxAmbiguous += Number(counts.bbox_recovery_checkbox_ambiguous || 0);
@@ -1067,6 +1071,8 @@
     document.querySelector('#checkboxBoxesValue').textContent = String(totals.checkboxBoxes);
     document.querySelector('#checkboxMergeProposalsValue').textContent = String(totals.checkboxMergeProposals);
     document.querySelector('#checkboxMergedValue').textContent = String(totals.checkboxMerged);
+    document.querySelector('#listMarkerMergeProposalsValue').textContent = String(totals.listMarkerMergeProposals);
+    document.querySelector('#listMarkerMergedValue').textContent = String(totals.listMarkerMerged);
     document.querySelector('#checkboxCheckedValue').textContent = String(totals.checkboxChecked);
     document.querySelector('#checkboxUncheckedValue').textContent = String(totals.checkboxUnchecked);
     document.querySelector('#checkboxAmbiguousValue').textContent = String(totals.checkboxAmbiguous);

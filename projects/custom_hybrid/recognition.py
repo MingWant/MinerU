@@ -191,6 +191,8 @@ class OpenAIBBoxRecognizer:
     def _native_candidate_selected(self, candidate: Mapping[str, Any]) -> bool:
         if self.config.get("native_all_candidates", False):
             return True
+        if candidate.get("force_recognition"):
+            return True
         if not str(candidate.get("ocr_text", "")).strip():
             return True
         bbox = candidate.get("bbox")

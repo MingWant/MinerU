@@ -833,6 +833,78 @@ class FusionTests(unittest.TestCase):
         self.assertEqual(decisions[0]["result"], "accepted")
         self.assertTrue(unchanged)
 
+    def test_bbox_recovery_merges_list_marker_and_forces_combined_recognition(self):
+        page = structured_middle(
+            "table",
+            html="<table><tr><td>1. ContentABCDEFG</td></tr></table>",
+            table_cells=[
+                {
+                    "bbox": [25, 10, 190, 80],
+                    "text": "1. ContentABCDEFG",
+                    "content_spans": [
+                        {"bbox": [20, 20, 30, 32], "text": "1."},
+                        {
+                            "bbox": [38, 20, 160, 32],
+                            "text": "ContentABCDEFG",
+                        },
+                    ],
+                    "row_start": 0,
+                    "row_end": 0,
+                    "col_start": 0,
+                    "col_end": 0,
+                }
+            ],
+        )["pdf_info"][0]
+
+        stats, decisions, _batches, unchanged = apply_bbox_recovery_proposals(
+            page,
+            0,
+            {
+                "items": [
+                    {
+                        "action": "merge_list_marker",
+                        "table_id": "p0-table-0",
+                        "cell_id": "p0-t0-c0",
+                        "marker_id": "p0-t0-c0-b0",
+                        "target_id": "p0-t0-c0-b1",
+                        "bbox": [20, 20, 160, 32],
+                        "confidence": 0.98,
+                        "recovery_source": "local_list_marker_merge",
+                    }
+                ]
+            },
+            FusionSettings.from_mapping({"mode": "bbox_vlm"}),
+            remaining_document_budget=10,
+        )
+
+        spans = page["preproc_blocks"][0]["lines"][0]["spans"][0][
+            "table_cells"
+        ][0]["content_spans"]
+        marker, content = spans
+        self.assertEqual(stats["list_marker_merged"], 1)
+        self.assertTrue(marker["fusion_grouped_list_marker"])
+        self.assertTrue(marker["fusion_visualization_hidden"])
+        self.assertEqual(content["bbox"], [20.0, 20.0, 160.0, 32.0])
+        self.assertEqual(content["text"], "1. ContentABCDEFG")
+        self.assertTrue(content["fusion_force_recognition"])
+        lines = collect_table_ocr_lines(page, 0)
+        manifest, _by_id = build_bbox_recognition_manifest(0, lines)
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0].text, "1. ContentABCDEFG")
+        self.assertTrue(manifest[0]["force_recognition"])
+        self.assertTrue(manifest[0]["recovered"])
+        settings = FusionSettings.from_mapping({"mode": "bbox_vlm"})
+        self.assertEqual(
+            select_bbox_recognition_candidate(
+                lines[0],
+                "ContentABCDEFG",
+                settings,
+            )[1],
+            "list_marker_omission_guard",
+        )
+        self.assertEqual(decisions[0]["result"], "accepted")
+        self.assertTrue(unchanged)
+
     def test_bbox_recovery_enforces_confidence_area_and_document_budgets(self):
         page = structured_middle(
             "table",
