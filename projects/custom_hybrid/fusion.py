@@ -132,8 +132,10 @@ class FusionSettings:
     bbox_recognition_empty_ocr_enabled: bool = True
     bbox_recognition_selection_policy: str = "conservative"
     bbox_recognition_vlm_primary_min_quality: float = 0.5
+    bbox_recognition_script_guard_enabled: bool = True
     bbox_recognition_recovered_empty_min_confidence: float = 0.9
     bbox_recognition_empty_max_chars_per_em: float = 4.0
+    bbox_recognition_empty_thin_line_max_chars_per_em: float = 2.5
     bbox_recovery_enabled: bool = False
     bbox_recovery_min_confidence: float = 0.85
     bbox_recovery_min_area_ratio: float = 0.001
@@ -321,11 +323,17 @@ class FusionSettings:
             bbox_recognition_vlm_primary_min_quality=float(
                 recognizer.get("vlm_primary_min_quality", 0.5)
             ),
+            bbox_recognition_script_guard_enabled=bool(
+                recognizer.get("script_guard_enabled", True)
+            ),
             bbox_recognition_recovered_empty_min_confidence=float(
                 recognizer.get("recovered_empty_min_confidence", 0.9)
             ),
             bbox_recognition_empty_max_chars_per_em=float(
                 recognizer.get("empty_max_chars_per_em", 4.0)
+            ),
+            bbox_recognition_empty_thin_line_max_chars_per_em=float(
+                recognizer.get("empty_thin_line_max_chars_per_em", 2.5)
             ),
             bbox_recovery_enabled=(
                 mode == "bbox_vlm"
@@ -1846,6 +1854,16 @@ def _looks_like_identifier_field(text: str) -> bool:
     )
 
 
+def _drops_identifier_letter_prefix(ocr_text: str, vlm_text: str) -> bool:
+    ocr_compact = re.sub(r"\s+", "", ocr_text.strip())
+    vlm_compact = re.sub(r"\s+", "", vlm_text.strip())
+    return bool(
+        re.fullmatch(r"[A-Z][A-Z0-9._/-]*", ocr_compact)
+        and any(character.isdigit() for character in ocr_compact[1:])
+        and re.fullmatch(r"\d[\d._/-]*", vlm_compact)
+    )
+
+
 def _recognition_field_type(ocr_text: str) -> str:
     if len(ocr_text) <= 40 and (
         _valid_date_candidate(ocr_text) or _DATE_LIKE_RE.search(ocr_text)
@@ -1874,6 +1892,34 @@ def _recognition_candidate_quality(text: str) -> float:
     if text.count("[") != text.count("]") or text.count("(") != text.count(")"):
         score -= 0.15
     return max(score, 0.0)
+
+
+def _dominant_recognition_script(text: str) -> str | None:
+    latin = len(re.findall(r"[A-Za-z]", text))
+    cjk = len(re.findall(r"[\u3400-\u9fff]", text))
+    total = latin + cjk
+    if total < 8:
+        return None
+    if latin / total >= 0.85:
+        return "latin"
+    if cjk / total >= 0.85:
+        return "cjk"
+    return None
+
+
+def _repeated_empty_recovery_phrase(text: str) -> bool:
+    parts = [
+        normalize_for_comparison(part)
+        for part in re.split(r"[\s,，。:：;；/|]+", text)
+        if normalize_for_comparison(part)
+    ]
+    if parts and re.fullmatch(r"\d+[.)、]?", parts[0]):
+        parts = parts[1:]
+    return bool(
+        len(parts) >= 3
+        and len(set(parts)) == 1
+        and len(parts[0]) >= 2
+    )
 
 
 def select_bbox_recognition_candidate(
@@ -1919,6 +1965,14 @@ def select_bbox_recognition_candidate(
                 return (
                     "ocr",
                     "empty_ocr_placeholder_guard",
+                    "general",
+                    similarity,
+                    length_ratio,
+                )
+            if not checkbox and _repeated_empty_recovery_phrase(vlm_text):
+                return (
+                    "ocr",
+                    "empty_ocr_repetition_guard",
                     "general",
                     similarity,
                     length_ratio,
@@ -1973,6 +2027,29 @@ def select_bbox_recognition_candidate(
                     similarity,
                     length_ratio,
                 )
+            thin_line_maximum = max(
+                16,
+                int(
+                    width
+                    / max(height, 1.0)
+                    * settings.bbox_recognition_empty_thin_line_max_chars_per_em
+                ),
+            )
+            if (
+                not checkbox
+                and line_count == 1
+                and height <= 12.0
+                and width <= 240.0
+                and visible_characters >= 24
+                and visible_characters > thin_line_maximum
+            ):
+                return (
+                    "ocr",
+                    "empty_ocr_thin_line_density_guard",
+                    "general",
+                    similarity,
+                    length_ratio,
+                )
             return (
                 "vlm",
                 "empty_ocr_vlm_recovery",
@@ -1983,6 +2060,22 @@ def select_bbox_recognition_candidate(
         return "ocr", "empty_ocr_disabled", "general", similarity, length_ratio
     if normalized_ocr == normalized_vlm:
         return "ocr", "recognition_consensus", field_type, similarity, length_ratio
+    if settings.bbox_recognition_script_guard_enabled:
+        ocr_script = _dominant_recognition_script(ocr_text)
+        vlm_script = _dominant_recognition_script(vlm_text)
+        if (
+            ocr_script is not None
+            and vlm_script is not None
+            and ocr_script != vlm_script
+            and similarity < settings.bbox_recognition_min_similarity
+        ):
+            return (
+                "ocr",
+                "candidate_script_guard",
+                field_type,
+                similarity,
+                length_ratio,
+            )
     validators = {
         "date": _valid_date_candidate,
         "amount": _valid_amount_candidate,
@@ -2011,6 +2104,17 @@ def select_bbox_recognition_candidate(
             return (
                 "ocr",
                 f"invalid_vlm_{field_type}",
+                field_type,
+                similarity,
+                length_ratio,
+            )
+        if field_type == "identifier" and _drops_identifier_letter_prefix(
+            ocr_text,
+            vlm_text,
+        ):
+            return (
+                "ocr",
+                "identifier_prefix_guard",
                 field_type,
                 similarity,
                 length_ratio,
@@ -2199,8 +2303,11 @@ def apply_recognition_batch_quality_guard(
         "bbox_protocol_id_echo",
         "vlm_candidate_too_long",
         "candidate_similarity_guard",
+        "candidate_script_guard",
         "candidate_length_guard",
         "empty_ocr_vlm_recovery",
+        "empty_ocr_thin_line_density_guard",
+        "empty_ocr_repetition_guard",
         "vlm_primary_quality_guard",
         "list_marker_omission_guard",
     }
@@ -2297,10 +2404,13 @@ def apply_bbox_recognition(
         "native_recovered_unsent": 0,
         "circuit_breaker_trips": 0,
         "high_risk_fallbacks": 0,
+        "script_guard_fallbacks": 0,
         "protocol_echoes": 0,
         "batch_quality_fallbacks": 0,
         "empty_ocr_recoveries": 0,
         "empty_ocr_context_fallbacks": 0,
+        "empty_ocr_density_fallbacks": 0,
+        "empty_ocr_quality_fallbacks": 0,
     }
     decisions: list[dict[str, Any]] = []
     batches: list[dict[str, Any]] = []
@@ -2438,8 +2548,14 @@ def apply_bbox_recognition(
                 stats["recovered_hidden"] += 1
             if candidate_reason.startswith("high_risk_"):
                 stats["high_risk_fallbacks"] += 1
+            if candidate_reason == "candidate_script_guard":
+                stats["script_guard_fallbacks"] += 1
             if candidate_reason == "bbox_protocol_id_echo":
                 stats["protocol_echoes"] += 1
+            if candidate_reason == "empty_ocr_thin_line_density_guard":
+                stats["empty_ocr_density_fallbacks"] += 1
+            if candidate_reason == "empty_ocr_repetition_guard":
+                stats["empty_ocr_quality_fallbacks"] += 1
         decision = {
             "kind": "bbox_recognition",
             "page": page_index,
@@ -3739,10 +3855,13 @@ def fuse_middle_json(
         "bbox_recognition_native_recovered_unsent": 0,
         "bbox_recognition_circuit_breaker_trips": 0,
         "bbox_recognition_high_risk_fallbacks": 0,
+        "bbox_recognition_script_guard_fallbacks": 0,
         "bbox_recognition_protocol_echoes": 0,
         "bbox_recognition_batch_quality_fallbacks": 0,
         "bbox_recognition_empty_ocr_recoveries": 0,
         "bbox_recognition_empty_ocr_context_fallbacks": 0,
+        "bbox_recognition_empty_ocr_density_fallbacks": 0,
+        "bbox_recognition_empty_ocr_quality_fallbacks": 0,
         "bbox_recognition_candidate_limit": 0,
         "bbox_recognition_tables_rebuilt": 0,
         "bbox_recognition_table_rebuild_rejections": 0,
@@ -4138,10 +4257,13 @@ def fuse_middle_json(
                     "native_recovered_unsent",
                     "circuit_breaker_trips",
                     "high_risk_fallbacks",
+                    "script_guard_fallbacks",
                     "protocol_echoes",
                     "batch_quality_fallbacks",
                     "empty_ocr_recoveries",
                     "empty_ocr_context_fallbacks",
+                    "empty_ocr_density_fallbacks",
+                    "empty_ocr_quality_fallbacks",
                 ):
                     counts[f"bbox_recognition_{key}"] += recognition_stats[key]
                 rebuilt, rejected = synchronize_recognized_table_html(

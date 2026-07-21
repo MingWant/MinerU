@@ -442,6 +442,14 @@ class CustomHybridApiTests(unittest.TestCase):
         fusion = captured_configs[0]["fusion"]
         self.assertEqual(fusion["mode"], "bbox_vlm")
         self.assertTrue(fusion["enabled"])
+        self.assertEqual(
+            fusion["semantic_markdown"],
+            {
+                "enabled": True,
+                "replace_primary": True,
+                "preserve_native": True,
+            },
+        )
         self.assertTrue(fusion["recognizer"]["enabled"])
         self.assertFalse(fusion["recognizer"]["normal_ocr_enabled"])
         self.assertTrue(fusion["recognizer"]["table_ocr_enabled"])

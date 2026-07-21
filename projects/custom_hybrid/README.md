@@ -125,11 +125,15 @@ renderer uses OCR span geometry, Cell row/column metadata, and conservative
 field-type checks rather than document-specific names or coordinates. It pairs
 labels with values in the same Cell or an adjacent value Cell, joins split
 checkbox/list markers, rebuilds ledger tables, removes repeated page metadata,
-and normalizes common dates and amounts. The label vocabulary covers common
+and normalizes common dates and amounts. Version 4 treats Cell text as the
+authority when an OCR span crosses neighboring Cells, anchors repeated
+policy-owner/insured and physician signature grids by row and column, and emits
+diagnostic, treatment, laboratory, and follow-up grids as Markdown tables instead
+of flattening their columns. The label vocabulary covers common
 claim, member, provider, contact, identifier, address, date, email, postal-code,
 and amount fields, so new form layouts do not require PDF-specific rules. Set
 `preserve_native=true` to keep `<document>_native.md` for direct A/B comparison
-with MinerU's original Markdown. The output marker `semantic-markdown-v3`
+with MinerU's original Markdown. The output marker `semantic-markdown-v4`
 identifies this renderer version.
 
 Each fused parse directory also contains `<document>_fusion.json`, which records
@@ -371,6 +375,9 @@ Candidate selection is conservative:
 - when two valid dates, amounts, or identifiers disagree, OCR is retained and
   the high-risk conflict is audited;
 - unrelated text and abnormal length changes are rejected;
+- low-similarity jumps between strongly Latin and strongly CJK text are rejected,
+  including in `vlm_primary` mode; mixed bilingual fields and empty-BBox recovery
+  are unaffected (`script_guard_enabled=true` by default);
 - high-confidence OCR stays unless it is demonstrably lower quality;
 - unscored OCR may prefer VLM only when all guards pass.
 - batches with fewer than the configured proportion of plausible responses
@@ -382,6 +389,14 @@ candidates when `empty_ocr_enabled=true`. An empty candidate can be filled only
 when a batch of at least `batch_guard_min_candidates` passes the configured
 quality ratio using non-empty OCR anchors. Isolated empty boxes and low-quality
 batches remain empty and are audited as `empty_ocr_context_guard`.
+Very thin single-line recovery boxes also apply a stricter physical text-density
+limit (`empty_thin_line_max_chars_per_em`, default `2.5`), preventing a tiny ink
+fragment from accepting an implausible sentence. The stricter limit applies only
+to local boxes up to 240 page units wide, leaving full-width printed lines and
+taller handwriting regions on the normal geometry budget.
+Repeated short phrases in an empty recovery candidate are also rejected as
+`empty_ocr_repetition_guard`; this catches compact looped hallucinations that do
+not exceed the geometry limit.
 Accepted recovery boxes are marked separately from ordinary OCR candidates and
 always enter MinerU-native recognition even after the ordinary page/document
 request limits are exhausted. The limits still cap non-recovery OCR review;

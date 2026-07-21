@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 
-SEMANTIC_MARKDOWN_VERSION = 3
+SEMANTIC_MARKDOWN_VERSION = 4
 
 SECTION_RE = re.compile(
     r"^(?:PART\s+(?:[IVXLC]+|\d+|[A-Z])\b|POINTS? TO NOTE\b|IMPORTANT NOTES?\b|"
@@ -138,6 +138,18 @@ OPTION_TEXT_RE = re.compile(
     r"yes|no|by cheque|others?)\b",
     flags=re.IGNORECASE,
 )
+POLICY_OWNER_SIGNATURE_RE = re.compile(
+    r"Signature\s+of\s+Policy\s+Owner|保單主[權权橙榷]人.*簽署",
+    flags=re.IGNORECASE,
+)
+INSURED_SIGNATURE_RE = re.compile(
+    r"Signature\s+of\s+Insured|受保人[簽签]署",
+    flags=re.IGNORECASE,
+)
+BLOCK_NAME_LABEL_RE = re.compile(
+    r"Name\s*\(\s*in\s+block\s+letters\s*\)|姓名\s*[（(].*?[大人].*?[）)]",
+    flags=re.IGNORECASE,
+)
 COMPACT_DATE_RE = re.compile(
     r"(?<!\d)(\d{1,2})\s*/\s*(\d{2})(\d{2})(?!\d)"
 )
@@ -146,6 +158,11 @@ PIPE_DATE_RE = re.compile(
 )
 REPEATED_GROUPED_AMOUNT_RE = re.compile(
     r"(?<!\d)(\d{1,3})[.,](\d{3})[.,](\d{2})(?!\d)"
+)
+FORMULA_TEXT_RE = re.compile(
+    r"\\(?:begin|end|frac|sqrt|cdot|mathrm|mathsf|ldots|cos|sin|alpha|beta)\b|"
+    r"[_^]\s*\{",
+    flags=re.IGNORECASE,
 )
 
 LEDGER_PATTERNS = {
@@ -168,6 +185,12 @@ LEDGER_LABELS = {
     "amount": "Amount / 金額",
     "balance": "Balance / 結餘",
 }
+
+MEDICAL_GRID_SCHEMAS = (
+    frozenset(("date", "test", "result")),
+    frozenset(("date", "investigation_result", "medical_treatment")),
+    frozenset(("date", "conditions", "treatment", "recovery")),
+)
 
 
 @dataclass(frozen=True)
@@ -252,15 +275,50 @@ def _clean_text(value: Any) -> str:
 
 
 def _span_text(span: Mapping[str, Any]) -> str:
+    original_ocr = _clean_text(span.get("fusion_recognition_original_ocr"))
+    selected_text = ""
     for key in ("text", "content"):
         text = _clean_text(span.get(key))
         if text:
-            return text
-    return ""
+            selected_text = text
+            break
+    if original_ocr and selected_text:
+        ocr_compact = re.sub(r"\s+", "", original_ocr)
+        selected_compact = re.sub(r"\s+", "", selected_text)
+        if (
+            re.fullmatch(r"[A-Z][A-Z0-9._/-]*", ocr_compact)
+            and any(character.isdigit() for character in ocr_compact[1:])
+            and re.fullmatch(r"\d[\d._/-]*", selected_compact)
+        ):
+            return original_ocr
+    return selected_text
+
+
+def _semantic_cell_text(cell: Mapping[str, Any]) -> str:
+    text = _clean_text(cell.get("text"))
+    raw_spans = cell.get("content_spans", [])
+    if not text or not isinstance(raw_spans, list):
+        return text
+    for span in raw_spans:
+        if not isinstance(span, Mapping):
+            continue
+        raw_text = ""
+        for key in ("text", "content"):
+            raw_text = _clean_text(span.get(key))
+            if raw_text:
+                break
+        semantic_text = _span_text(span)
+        if raw_text and semantic_text and raw_text != semantic_text:
+            text = text.replace(raw_text, semantic_text)
+    return text
 
 
 def _normalized(text: str) -> str:
     return re.sub(r"\W+", "", text, flags=re.UNICODE).casefold()
+
+
+def _looks_like_formula_text(text: str) -> bool:
+    return bool(FORMULA_TEXT_RE.search(text))
 
 
 def _iter_objects(value: Any) -> Iterable[Mapping[str, Any]]:
@@ -291,6 +349,46 @@ def _checkbox_text(span: Mapping[str, Any], text: str) -> str:
         text
         if text.startswith(("☑", "☐", "◫", "☒", "✓", "✔", "■", "□"))
         else f"{prefix} {text}"
+    )
+
+
+def _implausible_recovered_text_density(
+    span: Mapping[str, Any],
+    bbox: tuple[float, float, float, float],
+    text: str,
+) -> bool:
+    if (
+        not span.get("fusion_recovery_source")
+        or span.get("fusion_recognition_original_ocr") not in {None, ""}
+    ):
+        return False
+    width = bbox[2] - bbox[0]
+    height = bbox[3] - bbox[1]
+    visible = len(re.sub(r"\s+", "", text))
+    line_count = max(text.count("\n") + 1, 1)
+    maximum = max(16, int(width / max(height, 1.0) * 2.5))
+    repeated_parts = [
+        _normalized(part)
+        for part in re.split(r"[\s,，。:：;；/|]+", text)
+        if _normalized(part)
+    ]
+    if repeated_parts and re.fullmatch(r"\d+[.)、]?", repeated_parts[0]):
+        repeated_parts = repeated_parts[1:]
+    repeated = bool(
+        len(repeated_parts) >= 3
+        and len(set(repeated_parts)) == 1
+        and len(repeated_parts[0]) >= 2
+    )
+    return repeated or bool(
+        line_count >= 3
+        and height / line_count < 5.5
+        and visible >= 24
+    ) or bool(
+        height <= 12.0
+        and width <= 240.0
+        and line_count == 1
+        and visible >= 24
+        and visible > maximum
     )
 
 
@@ -383,7 +481,12 @@ def _visible_cell_lines(
                 continue
             bbox = _valid_bbox(span.get("bbox"))
             text = _checkbox_text(span, _span_text(span))
-            if bbox is not None and text:
+            if (
+                bbox is not None
+                and text
+                and not _looks_like_formula_text(text)
+                and not _implausible_recovered_text_density(span, bbox, text)
+            ):
                 records.append((span, bbox, text))
         for _span, bbox, text in _prune_aggregate_span_records(records):
             result.extend(
@@ -401,8 +504,8 @@ def _visible_cell_lines(
                 )
     if not result:
         bbox = _valid_bbox(cell.get("content_bbox")) or cell_bbox
-        text = _clean_text(cell.get("text"))
-        if bbox is not None and text:
+        text = _semantic_cell_text(cell)
+        if bbox is not None and text and not _looks_like_formula_text(text):
             result.extend(
                 line
                 for line in _lines_from_text(
@@ -611,17 +714,229 @@ def _join_row_lines(lines: Sequence[SemanticLine]) -> str:
     return " ".join(parts)
 
 
+def _cell_key(cell: Mapping[str, Any]) -> tuple[int, int] | None:
+    row = cell.get("row_start")
+    col = cell.get("col_start")
+    if not isinstance(row, int) or not isinstance(col, int):
+        return None
+    return row, col
+
+
+def _line_for_cell(
+    line: SemanticLine,
+    cell: Mapping[str, Any],
+    *,
+    text: str | None = None,
+) -> SemanticLine:
+    key = _cell_key(cell)
+    cell_bbox = _valid_bbox(cell.get("bbox"))
+    bbox = line.bbox
+    if cell_bbox is not None:
+        clipped = (
+            max(line.bbox[0], cell_bbox[0]),
+            max(line.bbox[1], cell_bbox[1]),
+            min(line.bbox[2], cell_bbox[2]),
+            min(line.bbox[3], cell_bbox[3]),
+        )
+        bbox = clipped if _valid_bbox(clipped) is not None else cell_bbox
+    return SemanticLine(
+        bbox,
+        line.text if text is None else text,
+        key[0] if key is not None else None,
+        key[1] if key is not None else None,
+        cell_bbox,
+    )
+
+
+def _reassign_lines_to_matching_cells(
+    lines: Sequence[SemanticLine],
+    cells: Sequence[Mapping[str, Any]],
+) -> list[SemanticLine]:
+    """Move a span when only another Cell's authoritative text contains it."""
+    cell_texts = [(_normalized(_semantic_cell_text(cell)), cell) for cell in cells]
+    result = []
+    for line in lines:
+        line_key = (line.cell_row, line.cell_col)
+        normalized = _normalized(line.text)
+        if len(normalized) < 4 or _looks_like_field_label(line.text):
+            result.append(line)
+            continue
+        own_text = next(
+            (
+                text
+                for text, cell in cell_texts
+                if _cell_key(cell) == line_key
+            ),
+            "",
+        )
+        if normalized in own_text:
+            result.append(line)
+            continue
+        matches = [
+            cell
+            for text, cell in cell_texts
+            if normalized in text and _cell_key(cell) != line_key
+        ]
+        if len(matches) == 1:
+            result.append(_line_for_cell(line, matches[0]))
+        else:
+            result.append(line)
+    return result
+
+
+def _cell_text_suffix(cell_text: str, label_text: str) -> str:
+    clean_cell = _clean_text(cell_text)
+    clean_label = _clean_text(label_text).rstrip(":：")
+    if not clean_cell or not clean_label:
+        return ""
+    start = clean_cell.casefold().find(clean_label.casefold())
+    if start < 0:
+        return ""
+    return clean_cell[start + len(clean_label) :].lstrip(" :：\n\t")
+
+
+def _line_spills_outside_cell(line: SemanticLine) -> bool:
+    if line.cell_bbox is None:
+        return False
+    left, top, right, bottom = line.cell_bbox
+    tolerance = max(4.0, min(right - left, bottom - top) * 0.08)
+    return bool(
+        line.bbox[0] < left - tolerance
+        or line.bbox[1] < top - tolerance
+        or line.bbox[2] > right + tolerance
+        or line.bbox[3] > bottom + tolerance
+    )
+
+
+def _restore_authoritative_cell_values(
+    lines: Sequence[SemanticLine],
+    cells: Sequence[Mapping[str, Any]],
+) -> list[SemanticLine]:
+    """Recover per-Cell values hidden inside a cross-Cell aggregate OCR span."""
+    result = list(lines)
+    for cell in cells:
+        key = _cell_key(cell)
+        cell_bbox = _valid_bbox(cell.get("bbox"))
+        cell_text = _semantic_cell_text(cell)
+        if key is None or cell_bbox is None or not cell_text:
+            continue
+        owned = [
+            (index, line)
+            for index, line in enumerate(result)
+            if (line.cell_row, line.cell_col) == key
+        ]
+        labels = [
+            (index, line)
+            for index, line in owned
+            if _looks_like_field_label(line.text) and not _is_section(line.text)
+        ]
+        if len(labels) != 1:
+            continue
+        _label_index, label = labels[0]
+        value = _cell_text_suffix(cell_text, label.text)
+        if not _form_value_candidate(value) or not _field_value_compatible(
+            label.text,
+            value,
+        ):
+            continue
+        normalized_value = _normalized(value)
+        value_lines = [
+            (index, line)
+            for index, line in owned
+            if index != _label_index
+            and _form_value_candidate(line.text)
+            and _field_value_compatible(label.text, line.text)
+        ]
+        represented = False
+        for index, line in value_lines:
+            normalized_line = _normalized(line.text)
+            if normalized_line == normalized_value:
+                represented = True
+                break
+            if normalized_value in normalized_line and _line_spills_outside_cell(line):
+                result[index] = _line_for_cell(line, cell, text=value)
+                represented = True
+                break
+            if normalized_line in normalized_value:
+                represented = True
+                break
+        if represented:
+            continue
+        value_top = max(cell_bbox[1], min(label.bbox[3] + 1.0, cell_bbox[3] - 1.0))
+        value_bbox = (
+            cell_bbox[0],
+            value_top,
+            cell_bbox[2],
+            cell_bbox[3],
+        )
+        result.append(
+            SemanticLine(
+                value_bbox,
+                value,
+                key[0],
+                key[1],
+                cell_bbox,
+            )
+        )
+    return result
+
+
+def _prune_cross_cell_aggregate_labels(
+    lines: Sequence[SemanticLine],
+) -> list[SemanticLine]:
+    """Drop a wide OCR label that duplicates multiple tighter field labels."""
+    skipped: set[int] = set()
+    for index, aggregate in enumerate(lines):
+        if not _looks_like_field_label(aggregate.text):
+            continue
+        aggregate_text = _normalized(aggregate.text)
+        represented = []
+        for other_index, other in enumerate(lines):
+            if other_index == index or not _looks_like_field_label(other.text):
+                continue
+            other_text = _normalized(other.text)
+            if (
+                len(other_text) < 5
+                or other_text == aggregate_text
+                or other_text not in aggregate_text
+            ):
+                continue
+            horizontal_margin = max(12.0, aggregate.height * 2.0)
+            vertical_margin = max(12.0, aggregate.height * 1.5)
+            if (
+                aggregate.bbox[0] - horizontal_margin
+                <= other.center_x
+                <= aggregate.bbox[2] + horizontal_margin
+                and aggregate.bbox[1] - vertical_margin
+                <= other.center_y
+                <= aggregate.bbox[3] + vertical_margin
+            ):
+                represented.append(other_text)
+        distinct = set(represented)
+        if len(distinct) >= 2 and sum(map(len, distinct)) >= len(aggregate_text) * 0.45:
+            skipped.add(index)
+    return [line for index, line in enumerate(lines) if index not in skipped]
+
+
 def _table_lines(
     table: Mapping[str, Any],
     excluded_keys: set[str] | None = None,
 ) -> list[SemanticLine]:
+    cells = [
+        cell
+        for cell in table.get("table_cells", [])
+        if isinstance(cell, Mapping)
+    ]
+    lines = [
+        line
+        for cell in cells
+        for line in _visible_cell_lines(cell, excluded_keys)
+    ]
+    lines = _reassign_lines_to_matching_cells(lines, cells)
+    lines = _restore_authoritative_cell_values(lines, cells)
+    lines = _prune_cross_cell_aggregate_labels(lines)
     return _deduplicate_lines(
-        [
-            line
-            for cell in table.get("table_cells", [])
-            if isinstance(cell, Mapping)
-            for line in _visible_cell_lines(cell, excluded_keys)
-        ]
+        lines
     )
 
 
@@ -1003,6 +1318,13 @@ def _merge_isolated_list_markers(
 
 def _looks_like_field_label(text: str) -> bool:
     stripped = text.strip()
+    if re.search(
+        r"diagnostic procedures?.*medication.*treatment.*operation|"
+        r"診斷程序.*藥物.*治療.*手術",
+        stripped,
+        re.IGNORECASE,
+    ):
+        return False
     match = FIELD_LABEL_RE.search(text)
     if not match or match.start() > 35 or len(stripped) > 120:
         return False
@@ -1351,6 +1673,83 @@ def _has_assignment_boundary(
     return False
 
 
+def _merge_adjacent_value_text(left: str, right: str, gap: float) -> str:
+    left = left.rstrip()
+    right = right.lstrip()
+    maximum_overlap = min(len(left), len(right), 16)
+    overlap = 0
+    for size in range(maximum_overlap, 0, -1):
+        if left[-size:].casefold() == right[:size].casefold() and (
+            size >= 2 or gap <= 4.0
+        ):
+            overlap = size
+            break
+    right = right[overlap:].lstrip()
+    if not right:
+        return left
+    cjk_boundary = bool(
+        re.search(r"[\u3400-\u9fff]$", left)
+        or re.match(r"^[\u3400-\u9fff]", right)
+    )
+    separator = "" if cjk_boundary else " "
+    return f"{left}{separator}{right}".strip()
+
+
+def _join_field_values(values: Sequence[SemanticLine]) -> str:
+    groups = _group_visual_rows(values)
+    rendered_groups = []
+    for group in groups:
+        ordered = sorted(group, key=lambda item: item.bbox[0])
+        chunks: list[tuple[str, SemanticLine]] = []
+        for line in ordered:
+            if not chunks:
+                chunks.append((line.text.strip(), line))
+                continue
+            previous_text, previous_line = chunks[-1]
+            gap = line.bbox[0] - previous_line.bbox[2]
+            if gap <= max(6.0, previous_line.height * 0.55, line.height * 0.55):
+                chunks[-1] = (
+                    _merge_adjacent_value_text(previous_text, line.text, gap),
+                    SemanticLine(
+                        (
+                            previous_line.bbox[0],
+                            min(previous_line.bbox[1], line.bbox[1]),
+                            max(previous_line.bbox[2], line.bbox[2]),
+                            max(previous_line.bbox[3], line.bbox[3]),
+                        ),
+                        "",
+                    ),
+                )
+            else:
+                chunks.append((line.text.strip(), line))
+        rendered_groups.append(" / ".join(text for text, _line in chunks if text))
+    return " / ".join(group for group in rendered_groups if group)
+
+
+def _adjacent_value_continues_own_fragment(
+    label: SemanticLine,
+    value: SemanticLine,
+    own_values: Sequence[SemanticLine],
+    labels: Sequence[tuple[int, SemanticLine]],
+) -> bool:
+    if not own_values or any(
+        other.cell_row == value.cell_row
+        and other.cell_col == value.cell_col
+        for _index, other in labels
+    ):
+        return False
+    for own in own_values:
+        gap = value.bbox[0] - own.bbox[2]
+        if (
+            len(_normalized(own.text)) <= 12
+            and -4.0 <= gap <= 8.0
+            and _vertical_overlap(own, value) >= 0.35
+            and value.center_x > label.center_x
+        ):
+            return True
+    return False
+
+
 def _pair_form_fields(lines: Sequence[SemanticLine]) -> list[SemanticLine]:
     lines = _merge_stacked_field_labels(lines)
     labels = [
@@ -1359,19 +1758,24 @@ def _pair_form_fields(lines: Sequence[SemanticLine]) -> list[SemanticLine]:
         if _looks_like_field_label(line.text) and not _is_section(line.text)
     ]
     label_indices = {index for index, _line in labels}
-    labels_with_own_values = {
-        label_index
-        for label_index, label in labels
-        if any(
-            value_index not in label_indices
+    own_values_by_label = {
+        label_index: [
+            value
+            for value_index, value in enumerate(lines)
+            if value_index not in label_indices
             and label.cell_row is not None
             and value.cell_row == label.cell_row
             and label.cell_col is not None
             and value.cell_col == label.cell_col
             and _form_value_candidate(value.text)
             and _field_value_compatible(label.text, value.text)
-            for value_index, value in enumerate(lines)
-        )
+        ]
+        for label_index, label in labels
+    }
+    labels_with_own_values = {
+        label_index
+        for label_index, values in own_values_by_label.items()
+        if values
     }
     assignments: dict[int, list[int]] = defaultdict(list)
     assigned_values: set[int] = set()
@@ -1388,7 +1792,16 @@ def _pair_form_fields(lines: Sequence[SemanticLine]) -> list[SemanticLine]:
                 and value.cell_col is not None
                 and value.cell_col == label.cell_col + 1
             )
-            if adjacent_value_cell and label_index in labels_with_own_values:
+            if (
+                adjacent_value_cell
+                and label_index in labels_with_own_values
+                and not _adjacent_value_continues_own_fragment(
+                    label,
+                    value,
+                    own_values_by_label[label_index],
+                    labels,
+                )
+            ):
                 continue
             if (
                 label_index >= value_index
@@ -1411,6 +1824,32 @@ def _pair_form_fields(lines: Sequence[SemanticLine]) -> list[SemanticLine]:
         assignments[selected[1]].append(value_index)
         assigned_values.add(value_index)
 
+    for value_index, value in enumerate(lines):
+        if value_index in assigned_values or value_index in label_indices:
+            continue
+        if not _form_value_candidate(value.text) or any(
+            label.cell_row == value.cell_row and label.cell_col == value.cell_col
+            for _label_index, label in labels
+        ):
+            continue
+        continuations = []
+        for label_index, label in labels:
+            if not _field_value_compatible(label.text, value.text):
+                continue
+            for assigned_index in assignments.get(label_index, []):
+                assigned = lines[assigned_index]
+                gap = value.bbox[0] - assigned.bbox[2]
+                if (
+                    len(_normalized(assigned.text)) <= 12
+                    and -4.0 <= gap <= 8.0
+                    and _vertical_overlap(assigned, value) >= 0.35
+                ):
+                    continuations.append((abs(gap), label_index))
+        selected_continuation = min(continuations, default=None)
+        if selected_continuation is not None:
+            assignments[selected_continuation[1]].append(value_index)
+            assigned_values.add(value_index)
+
     result = []
     for index, line in enumerate(lines):
         if index in assigned_values:
@@ -1419,7 +1858,9 @@ def _pair_form_fields(lines: Sequence[SemanticLine]) -> list[SemanticLine]:
         if values:
             related = [line, *(lines[value_index] for value_index in values)]
             label = line.text.strip().rstrip(":：")
-            value = " / ".join(lines[value_index].text.strip() for value_index in values)
+            value = _join_field_values(
+                [lines[value_index] for value_index in values]
+            )
             result.append(
                 SemanticLine(
                     (
@@ -1496,6 +1937,543 @@ def _append_unique_output(
     parts.append(text)
 
 
+def _signature_row_bounds(
+    anchors: Sequence[SemanticLine],
+    lines: Sequence[SemanticLine],
+) -> list[tuple[float, float]]:
+    centers = [anchor.center_y for anchor in anchors]
+    top = min(line.bbox[1] for line in lines)
+    bottom = max(line.bbox[3] for line in lines)
+    bounds = []
+    for index, center in enumerate(centers):
+        row_top = (
+            (centers[index - 1] + center) / 2
+            if index
+            else max(top, center - max(16.0, anchors[index].height * 2.0))
+        )
+        row_bottom = (
+            (center + centers[index + 1]) / 2
+            if index + 1 < len(centers)
+            else bottom
+        )
+        bounds.append((row_top, row_bottom))
+    return bounds
+
+
+def _signature_name_value(text: str) -> str:
+    value = _clean_text(text)
+    value = re.split(
+        r"\b(?:ID\s*/?\s*P\w*|Passport|Date)\b|身份[證证詮]",
+        value,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    value = re.sub(r"^[^A-Za-z\u3400-\u9fff]+", "", value).strip()
+    value = re.sub(r"^[\u3400-\u9fff]\s*[)）]\s*", "", value).strip()
+    if (
+        len(_normalized(value)) < 4
+        or any(character.isdigit() for character in value)
+        or _looks_like_field_label(value)
+        or POLICY_OWNER_SIGNATURE_RE.search(value)
+        or INSURED_SIGNATURE_RE.search(value)
+        or BLOCK_NAME_LABEL_RE.search(value)
+    ):
+        return ""
+    words = re.findall(r"[A-Za-z]+|[\u3400-\u9fff]+", value)
+    return value if words and len(words) <= 6 else ""
+
+
+def _signature_identifier_value(text: str) -> str:
+    value = _clean_text(text)
+    value = re.sub(
+        r"^.*?(?:ID\s*/\s*Passport\s*No\.?|ID\s*/?P\w*|"
+        r"身份[證证詮]\s*/?\s*(?:護照)?號碼)",
+        "",
+        value,
+        count=1,
+        flags=re.IGNORECASE,
+    ).strip(" :：/")
+    if DATE_TOKEN_RE.search(value) or not any(character.isdigit() for character in value):
+        return ""
+    match = re.search(
+        r"/?[A-Za-z]?[A-Za-z0-9/.-]*\d[A-Za-z0-9/().-]*",
+        value,
+    )
+    if match is None:
+        return ""
+    candidate = match.group(0).lstrip("/")
+    return candidate if 4 <= len(_normalized(candidate)) <= 24 else ""
+
+
+def _signature_label(
+    lines: Sequence[SemanticLine],
+    pattern: re.Pattern[str],
+    fallback: str,
+) -> str:
+    matches = [line.text.strip().rstrip(":：") for line in lines if pattern.search(line.text)]
+    if not matches:
+        return fallback
+    return min(matches, key=len)
+
+
+def _signature_identifier_quality(value: str) -> int:
+    compact = value.strip()
+    score = int("/" not in compact and "." not in compact)
+    score += int(compact.count("(") == compact.count(")"))
+    score += 3 * int(
+        re.fullmatch(r"[A-Za-z]\d{6}\(\d\)", compact) is not None
+    )
+    return score
+
+
+def _render_signature_table(
+    table: Mapping[str, Any],
+    excluded_keys: set[str] | None = None,
+) -> str | None:
+    lines = _table_lines(table, excluded_keys)
+    policy_anchors = [line for line in lines if POLICY_OWNER_SIGNATURE_RE.search(line.text)]
+    insured_anchors = [line for line in lines if INSURED_SIGNATURE_RE.search(line.text)]
+    if not policy_anchors or not insured_anchors:
+        return None
+    anchors = [
+        min(policy_anchors, key=lambda line: line.center_y),
+        min(insured_anchors, key=lambda line: line.center_y),
+    ]
+    anchors.sort(key=lambda line: line.center_y)
+    zone_top = min(anchor.bbox[1] for anchor in anchors) - 8.0
+    pre_lines = [line for line in lines if line.center_y < zone_top]
+    zone_lines = [line for line in lines if line.center_y >= zone_top]
+    global_id_lefts = [
+        line.bbox[0]
+        for line in zone_lines
+        if re.search(r"\bID\s*/\s*Passport", line.text, re.IGNORECASE)
+    ]
+    global_date_lefts = [
+        line.bbox[0]
+        for line in zone_lines
+        if re.search(r"\bDate\s*\(", line.text, re.IGNORECASE)
+    ]
+    global_id_left = (
+        statistics.median(global_id_lefts) if global_id_lefts else float("inf")
+    )
+    global_date_left = (
+        statistics.median(global_date_lefts)
+        if global_date_lefts
+        else float("inf")
+    )
+
+    parts: list[str] = []
+    seen: list[str] = []
+    for line in _pair_form_fields(pre_lines):
+        rendered = _render_form_line(line.text)
+        if rendered is not None:
+            _append_unique_output(parts, seen, rendered)
+
+    row_bounds = _signature_row_bounds(anchors, zone_lines)
+    parsed_rows = []
+    for anchor, (row_top, row_bottom) in zip(anchors, row_bounds):
+        row_lines = [
+            line
+            for line in zone_lines
+            if row_top <= line.center_y < row_bottom
+        ]
+        id_left = global_id_left
+        date_left = global_date_left
+        name_labels = [line for line in row_lines if BLOCK_NAME_LABEL_RE.search(line.text)]
+        name_values = []
+        id_values = []
+        dates = []
+        for line in row_lines:
+            if not (
+                POLICY_OWNER_SIGNATURE_RE.search(line.text)
+                or INSURED_SIGNATURE_RE.search(line.text)
+                or BLOCK_NAME_LABEL_RE.search(line.text)
+            ):
+                name = _signature_name_value(line.text)
+                if name and line.center_x < id_left:
+                    name_values.append((abs(line.center_y - anchor.center_y), line.bbox[0], name))
+            identifier = _signature_identifier_value(line.text)
+            if identifier and line.center_x >= id_left - 20.0 and line.center_x < date_left:
+                id_values.append((abs(line.center_y - anchor.center_y), identifier))
+            for date in DATE_TOKEN_RE.findall(line.text):
+                dates.append((abs(line.center_y - anchor.center_y), _clean_text(date)))
+        parsed_rows.append(
+            {
+                "anchor": anchor,
+                "row_lines": row_lines,
+                "name_label": _signature_label(
+                    name_labels,
+                    BLOCK_NAME_LABEL_RE,
+                    "Name (in block letters)",
+                ),
+                "name": min(name_values, default=(0.0, 0.0, ""))[2],
+                "id_label": "ID / Passport No. / 身份證/護照號碼",
+                "identifier": min(id_values, default=(0.0, ""))[1],
+                "date_label": "Date (DD/MM/YY) / 日期(日/月/年)",
+                "date": min(dates, default=(0.0, ""))[1],
+            }
+        )
+
+    known_dates = [row["date"] for row in parsed_rows if row["date"]]
+    if len(set(known_dates)) == 1:
+        for row in parsed_rows:
+            if not row["date"]:
+                row["date"] = known_dates[0]
+
+    identifiers = [row["identifier"] for row in parsed_rows]
+    if len(identifiers) == 2 and all(identifiers):
+        normalized = [_normalized(value) for value in identifiers]
+        if (
+            normalized[0][:1] == normalized[1][:1]
+            and SequenceMatcher(None, *normalized).ratio() >= 0.84
+        ):
+            best = max(identifiers, key=_signature_identifier_quality)
+            if _signature_identifier_quality(best) > min(
+                _signature_identifier_quality(value) for value in identifiers
+            ):
+                for row in parsed_rows:
+                    row["identifier"] = best
+
+    for row in parsed_rows:
+        signature_label = row["anchor"].text.strip().rstrip(":：")
+        parts.append(f"- **{signature_label}**")
+        name = f"- **{row['name_label']}**"
+        if row["name"]:
+            name += f": {row['name']}"
+        parts.append(name)
+        identifier = f"- **{row['id_label']}**"
+        if row["identifier"]:
+            identifier += f": {row['identifier']}"
+        parts.append(identifier)
+        date = f"- **{row['date_label']}**"
+        if row["date"]:
+            date += f": {row['date']}"
+        parts.append(date)
+    return "\n\n".join(parts)
+
+
+def _medical_grid_category(text: str) -> str | None:
+    stripped = text.strip()
+    if len(stripped) > 100:
+        return None
+    patterns = (
+        ("recovery", r"%\s*of\s*recovery|康復程度"),
+        ("conditions", r"Conditions?\s*/\s*Impairment|情況\s*/?\s*身體缺陷"),
+        (
+            "medical_treatment",
+            r"Medication\s*/\s*Treatment\s*/\s*Operation|藥物\s*/\s*治療\s*/\s*手術",
+        ),
+        (
+            "investigation_result",
+            r"Investigation\s*/\s*Result|檢查\s*/\s*結果",
+        ),
+        ("test", r"Test\s*/\s*Investigation|化驗\s*/\s*檢查"),
+        ("result", r"^Result\b|^結果\b"),
+        ("treatment", r"^Treatment\b|^治療\b"),
+        ("date", r"^Date\s*日期\s*[:：]?$"),
+    )
+    matches = [
+        category
+        for category, pattern in patterns
+        if re.search(pattern, stripped, re.IGNORECASE)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _medical_grid_header(
+    lines: Sequence[SemanticLine],
+) -> list[tuple[str, SemanticLine]] | None:
+    candidates = [
+        (category, line)
+        for line in lines
+        for category in [_medical_grid_category(line.text)]
+        if category is not None
+    ]
+    best: tuple[int, float, list[tuple[str, SemanticLine]]] | None = None
+    for _category, seed in candidates:
+        cluster = [
+            item
+            for item in candidates
+            if abs(item[1].center_y - seed.center_y) <= 18.0
+        ]
+        by_category: dict[str, SemanticLine] = {}
+        for category, line in cluster:
+            current = by_category.get(category)
+            if current is None or abs(line.center_y - seed.center_y) < abs(
+                current.center_y - seed.center_y
+            ):
+                by_category[category] = line
+        categories = frozenset(by_category)
+        if categories not in MEDICAL_GRID_SCHEMAS:
+            continue
+        ordered = sorted(by_category.items(), key=lambda item: item[1].bbox[0])
+        candidate = (len(ordered), -seed.center_y, ordered)
+        if best is None or candidate[:2] > best[:2]:
+            best = candidate
+    return best[2] if best is not None else None
+
+
+def _medical_data_rows(
+    lines: Sequence[SemanticLine],
+) -> list[list[SemanticLine]]:
+    visual_rows = _group_visual_rows(lines)
+    if not visual_rows:
+        return []
+    result: list[list[SemanticLine]] = []
+    current: list[SemanticLine] = []
+    current_bottom = 0.0
+    for visual_row in visual_rows:
+        row_top = min(line.bbox[1] for line in visual_row)
+        row_bottom = max(line.bbox[3] for line in visual_row)
+        if current and row_top - current_bottom > 24.0:
+            result.append(current)
+            current = []
+        current.extend(visual_row)
+        current_bottom = max(current_bottom, row_bottom) if current else row_bottom
+    if current:
+        result.append(current)
+    return result
+
+
+def _render_plain_form_lines(lines: Sequence[SemanticLine]) -> list[str]:
+    parts: list[str] = []
+    seen: list[str] = []
+    for line in _pair_form_fields(lines):
+        rendered = _render_form_line(line.text)
+        if rendered is not None:
+            _append_unique_output(parts, seen, rendered)
+    return parts
+
+
+def _physician_footer_value_lines(
+    row_lines: Sequence[SemanticLine],
+    *,
+    left: float,
+    right: float | None = None,
+) -> list[SemanticLine]:
+    result = []
+    for line in row_lines:
+        if line.center_x < left or (right is not None and line.center_x >= right):
+            continue
+        if (
+            re.search(
+                r"^\s*(?:Signed|Qualifications|Date|Name of physician|Address|"
+                r"Telephone Number)\b|^(?:簽名|資歷|日期|醫生的姓名|地址|電話號碼)",
+                line.text,
+                re.IGNORECASE,
+            )
+            or LABEL_QUALIFIER_RE.fullmatch(line.text.strip())
+            or FOOTER_RE.search(line.text)
+            or (
+                len(_normalized(line.text)) <= 1
+                and line.bbox[2] - line.bbox[0] <= max(20.0, line.height * 2.5)
+            )
+        ):
+            continue
+        result.append(line)
+    return result
+
+
+def _render_physician_footer_lines(
+    lines: Sequence[SemanticLine],
+) -> list[str] | None:
+    signed = [line for line in lines if re.search(r"^Signed\b|^簽名", line.text, re.IGNORECASE)]
+    qualifications = [
+        line
+        for line in lines
+        if re.search(r"^Qualifications\b|^資歷", line.text, re.IGNORECASE)
+    ]
+    dates = [
+        line
+        for line in lines
+        if re.search(r"^Date\s*日期", line.text, re.IGNORECASE)
+    ]
+    physician_labels = [
+        line
+        for line in lines
+        if re.search(r"Name of physician|醫生的姓名", line.text, re.IGNORECASE)
+    ]
+    address_labels = [
+        line for line in lines if re.search(r"^Address\b|^地址", line.text, re.IGNORECASE)
+    ]
+    telephone_labels = [
+        line
+        for line in lines
+        if re.search(r"Telephone Number|電話號碼", line.text, re.IGNORECASE)
+    ]
+    if not all(
+        (
+            signed,
+            qualifications,
+            dates,
+            physician_labels,
+            address_labels,
+            telephone_labels,
+        )
+    ):
+        return None
+    anchors = [
+        min(signed, key=lambda line: line.center_y),
+        min(qualifications, key=lambda line: line.center_y),
+        min(dates, key=lambda line: line.center_y),
+    ]
+    anchors.sort(key=lambda line: line.center_y)
+    zone_top = anchors[0].bbox[1] - 6.0
+    prefix = [line for line in lines if line.center_y < zone_top]
+    zone_lines = [line for line in lines if line.center_y >= zone_top]
+    right_label_left = statistics.median(
+        line.bbox[0]
+        for line in (*physician_labels, *address_labels, *telephone_labels)
+    )
+    right_value_left = max(
+        right_label_left + 75.0,
+        statistics.median(
+            line.bbox[2]
+            for line in (*physician_labels, *address_labels, *telephone_labels)
+        ),
+    )
+    left_value_left = max(anchor.bbox[2] for anchor in anchors) - 4.0
+    bounds = _signature_row_bounds(anchors, zone_lines)
+    parsed = []
+    for anchor, (row_top, row_bottom) in zip(anchors, bounds):
+        row_lines = [line for line in zone_lines if row_top <= line.center_y < row_bottom]
+        left_values = _physician_footer_value_lines(
+            row_lines,
+            left=left_value_left,
+            right=right_label_left,
+        )
+        right_values = _physician_footer_value_lines(
+            row_lines,
+            left=right_value_left,
+        )
+        parsed.append((anchor, left_values, right_values))
+
+    parts = _render_plain_form_lines(prefix)
+    signed_anchor, signed_values, physician_values = parsed[0]
+    signature_present = bool(signed_values)
+    parts.append(
+        f"- **{signed_anchor.text.strip().rstrip(':：')}**"
+        + (": [Signature]" if signature_present else "")
+    )
+    physician_names = [
+        value
+        for line in physician_values
+        for value in [_signature_name_value(line.text)]
+        if value
+    ]
+    parts.append(
+        "- **Name of physician (with stamp) / 醫生的姓名(蓋印)**"
+        + (f": {physician_names[0]}" if physician_names else "")
+    )
+
+    qualifications_anchor, qualification_values, address_values = parsed[1]
+    qualification_text = _join_field_values(qualification_values)
+    parts.append(
+        "- **Qualifications / 資歷**"
+        + (f": {qualification_text}" if qualification_text else "")
+    )
+    address_text = _join_field_values(address_values)
+    parts.append(
+        "- **Address 地址**" + (f": {address_text}" if address_text else "")
+    )
+
+    date_anchor, date_values, telephone_values = parsed[2]
+    date_text = next(
+        (
+            _clean_text(match.group(0))
+            for line in date_values
+            for match in [DATE_TOKEN_RE.search(line.text)]
+            if match is not None
+        ),
+        _join_field_values(date_values),
+    )
+    parts.append(
+        "- **Date / 日期**" + (f": {date_text}" if date_text else "")
+    )
+    telephone_text = _join_field_values(telephone_values)
+    parts.append(
+        "- **Telephone Number / 電話號碼**"
+        + (f": {telephone_text}" if telephone_text else "")
+    )
+    return parts
+
+
+def _render_generic_form_lines(lines: Sequence[SemanticLine]) -> list[str]:
+    physician_footer = _render_physician_footer_lines(lines)
+    if physician_footer is not None:
+        return physician_footer
+    return _render_plain_form_lines(lines)
+
+
+def _render_medical_grid_table(
+    table: Mapping[str, Any],
+    excluded_keys: set[str] | None = None,
+) -> str | None:
+    lines = _table_lines(table, excluded_keys)
+    header = _medical_grid_header(lines)
+    if header is None:
+        return None
+    header_indices = {id(line) for _category, line in header}
+    header_top = min(line.bbox[1] for _category, line in header)
+    header_bottom = max(line.bbox[3] for _category, line in header)
+    left_anchor = min(line.bbox[0] for _category, line in header)
+    boundary_candidates = [
+        line
+        for line in lines
+        if line.bbox[1] > header_bottom + 6.0
+        and line.bbox[0] <= left_anchor + 35.0
+        and FORM_PROMPT_RE.match(line.text.strip())
+    ]
+    boundary_top = min(
+        (line.bbox[1] for line in boundary_candidates),
+        default=float("inf"),
+    )
+    prefix = [line for line in lines if line.center_y < header_top]
+    data_lines = [
+        line
+        for line in lines
+        if id(line) not in header_indices
+        and line.center_y > header_bottom
+        and line.bbox[1] < boundary_top
+        and not FOOTER_RE.search(line.text)
+        and not NOISE_TEXT_RE.fullmatch(line.text)
+        and not (
+            ISOLATED_LIST_MARKER_RE.fullmatch(line.text.strip())
+            and line.bbox[2] - line.bbox[0] <= max(20.0, line.height * 2.5)
+        )
+    ]
+    suffix = [line for line in lines if line.bbox[1] >= boundary_top]
+    if not data_lines:
+        return None
+
+    headers = [line.text.strip() for _category, line in header]
+    column_lefts = [line.bbox[0] for _category, line in header]
+    rows = []
+    for row_lines in _medical_data_rows(data_lines):
+        columns: list[list[SemanticLine]] = [[] for _header in header]
+        for line in row_lines:
+            column = min(
+                range(len(header)),
+                key=lambda index: abs(line.bbox[0] - column_lefts[index]),
+            )
+            columns[column].append(line)
+        rows.append(
+            [
+                "\n".join(
+                    line.text.strip()
+                    for line in sorted(column, key=lambda item: (item.bbox[1], item.bbox[0]))
+                    if line.text.strip()
+                )
+                for column in columns
+            ]
+        )
+
+    parts = _render_generic_form_lines(prefix)
+    parts.append(_markdown_table(headers, rows))
+    parts.extend(_render_generic_form_lines(suffix))
+    return "\n\n".join(part for part in parts if part)
+
+
 def _render_form_cell(
     cell: Mapping[str, Any],
     excluded_keys: set[str] | None = None,
@@ -1543,18 +2521,14 @@ def _render_form_table(
     table: Mapping[str, Any],
     excluded_keys: set[str] | None = None,
 ) -> str:
-    lines = _pair_form_fields(
-        _merge_isolated_list_markers(
-            _table_lines(table, excluded_keys)
-        )
-    )
-    parts: list[str] = []
-    seen: list[str] = []
-    for line in lines:
-        rendered = _render_form_line(line.text)
-        if rendered is not None:
-            _append_unique_output(parts, seen, rendered)
-    return "\n\n".join(parts)
+    signature = _render_signature_table(table, excluded_keys)
+    if signature is not None:
+        return signature
+    medical_grid = _render_medical_grid_table(table, excluded_keys)
+    if medical_grid is not None:
+        return medical_grid
+    lines = _merge_isolated_list_markers(_table_lines(table, excluded_keys))
+    return "\n\n".join(_render_generic_form_lines(lines))
 
 
 def _repeatable_value(text: str) -> bool:
@@ -1684,6 +2658,8 @@ def generate_semantic_markdown(middle_json: Mapping[str, Any]) -> str:
                 text = line.text
                 key = _normalized(text)
                 if FOOTER_RE.search(text) or NOISE_TEXT_RE.fullmatch(text):
+                    continue
+                if _looks_like_formula_text(text):
                     continue
                 if (
                     page_height > 0

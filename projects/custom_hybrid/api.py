@@ -83,6 +83,14 @@ BALANCED_FUSION_OVERRIDES = {
 BBOX_VLM_FUSION_OVERRIDES = {
     "enabled": True,
     "mode": "bbox_vlm",
+    # BBox VLM is the OCR post-processing path used by the UI/API. Keep the
+    # semantic view enabled at task scope so a stale server config cannot
+    # silently return native Markdown after a successful repair run.
+    "semantic_markdown": {
+        "enabled": True,
+        "replace_primary": True,
+        "preserve_native": True,
+    },
     "max_verifications_per_document": 0,
     "table_fallback_enabled": False,
     "formula_fallback_enabled": False,

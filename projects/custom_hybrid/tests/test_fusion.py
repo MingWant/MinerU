@@ -1172,6 +1172,22 @@ class FusionTests(unittest.TestCase):
             select_bbox_recognition_candidate(identifier, "wrong value", settings)[:2],
             ("ocr", "invalid_vlm_identifier"),
         )
+        self.assertEqual(
+            select_bbox_recognition_candidate(
+                collect_text_lines(middle("H112233")["pdf_info"][0], 0)[0],
+                "11112233",
+                settings,
+            )[:3],
+            ("ocr", "identifier_prefix_guard", "identifier"),
+        )
+        self.assertEqual(
+            select_bbox_recognition_candidate(
+                collect_text_lines(middle("341F")["pdf_info"][0], 0)[0],
+                "34/F",
+                settings,
+            )[:2],
+            ("vlm", "bbox_vlm_primary"),
+        )
 
     def test_bbox_vlm_mode_replaces_only_table_text_and_preserves_pipeline_geometry(self):
         original_html = "<table><tr><td>Name</td><td>B1aine Bai</td></tr></table>"
@@ -2183,6 +2199,131 @@ class FusionTests(unittest.TestCase):
             1,
         )
         self.assertEqual(report["counts"]["bbox_recognition_vlm_selected"], 0)
+
+    def test_vlm_primary_rejects_unrelated_cross_script_hallucination(self):
+        line = collect_text_lines(
+            middle("Shareholders Agreement")['pdf_info'][0],
+            0,
+        )[0]
+        settings = FusionSettings(
+            bbox_recognition_enabled=True,
+            bbox_recognition_selection_policy="vlm_primary",
+        )
+
+        selected = select_bbox_recognition_candidate(
+            line,
+            "公司股份協議內容",
+            settings,
+        )
+
+        self.assertEqual(selected[0:2], ("ocr", "candidate_script_guard"))
+
+        def recognize(_page, _size, candidates):
+            return {
+                "items": [
+                    {"id": candidates[0]["id"], "text": "公司股份協議內容"}
+                ]
+            }
+
+        stats, decisions, _batches = apply_bbox_recognition(
+            0,
+            [200, 300],
+            [line],
+            settings,
+            recognize,
+        )
+
+        self.assertEqual(stats["script_guard_fallbacks"], 1)
+        self.assertEqual(decisions[0]["reason"], "candidate_script_guard")
+
+    def test_script_guard_allows_bilingual_and_empty_bbox_recovery(self):
+        bilingual = collect_text_lines(
+            middle("Name 姓名")['pdf_info'][0],
+            0,
+        )[0]
+        settings = FusionSettings(
+            bbox_recognition_enabled=True,
+            bbox_recognition_selection_policy="vlm_primary",
+        )
+
+        bilingual_selected = select_bbox_recognition_candidate(
+            bilingual,
+            "Name 名稱",
+            settings,
+        )
+        self.assertNotEqual(bilingual_selected[1], "candidate_script_guard")
+
+        empty = collect_text_lines(middle("")['pdf_info'][0], 0)[0]
+        empty_selected = select_bbox_recognition_candidate(
+            empty,
+            "手寫內容",
+            settings,
+        )
+        self.assertNotEqual(empty_selected[1], "candidate_script_guard")
+
+    def test_empty_ocr_thin_line_rejects_implausible_sentence_density(self):
+        line = collect_text_lines(middle("")['pdf_info'][0], 0)[0]
+        line.bbox = (432.696, 318.7, 563.051, 326.233)
+        settings = FusionSettings(
+            bbox_recognition_enabled=True,
+            bbox_recognition_selection_policy="vlm_primary",
+        )
+        hallucination = (
+            "1. 2016年，公司与上海华谊（集团）股份有限公司"
+            "（以下简称“公司”）签署的《股份转让协议》。"
+        )
+
+        selected = select_bbox_recognition_candidate(
+            line,
+            hallucination,
+            settings,
+        )
+
+        self.assertEqual(
+            selected[0:2],
+            ("ocr", "empty_ocr_thin_line_density_guard"),
+        )
+
+        line.bbox = (20.0, 20.0, 560.0, 90.0)
+        handwriting = select_bbox_recognition_candidate(
+            line,
+            "Long handwritten treatment details remain eligible in a tall box.",
+            settings,
+        )
+        self.assertNotEqual(
+            handwriting[1],
+            "empty_ocr_thin_line_density_guard",
+        )
+
+        line.bbox = (20.0, 20.0, 560.0, 28.0)
+        full_width_print = select_bbox_recognition_candidate(
+            line,
+            "A full-width legal sentence remains eligible for recognition even "
+            "when its printed line box is thin.",
+            settings,
+        )
+        self.assertNotEqual(
+            full_width_print[1],
+            "empty_ocr_thin_line_density_guard",
+        )
+
+    def test_empty_ocr_rejects_repeated_short_phrase_hallucination(self):
+        line = collect_text_lines(middle("")['pdf_info'][0], 0)[0]
+        settings = FusionSettings(
+            bbox_recognition_enabled=True,
+            bbox_recognition_selection_policy="vlm_primary",
+        )
+
+        selected = select_bbox_recognition_candidate(
+            line,
+            "1. 证明：证明：证明：证明：",
+            settings,
+        )
+
+        self.assertEqual(
+            selected[0:2],
+            ("ocr", "empty_ocr_repetition_guard"),
+        )
 
     def test_bbox_recognition_batch_guard_rejects_isolated_plausible_output(self):
         lines = [

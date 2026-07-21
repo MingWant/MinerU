@@ -635,6 +635,7 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         "hide_ids_in_prompt_when_constrained",
         "batch_guard_enabled",
         "empty_ocr_enabled",
+        "script_guard_enabled",
         "native_all_candidates",
         "native_cache_enabled",
     ):
@@ -681,6 +682,7 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         "target_render_scale",
         "context_render_scale",
         "empty_max_chars_per_em",
+        "empty_thin_line_max_chars_per_em",
     ):
         value = recognizer.get(key)
         if value is not None and (

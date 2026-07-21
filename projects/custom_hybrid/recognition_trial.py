@@ -72,10 +72,13 @@ def run_trial(
         "invalid_outputs": 0,
         "errors": 0,
         "high_risk_fallbacks": 0,
+        "script_guard_fallbacks": 0,
         "protocol_echoes": 0,
         "batch_quality_fallbacks": 0,
         "empty_ocr_recoveries": 0,
         "empty_ocr_context_fallbacks": 0,
+        "empty_ocr_density_fallbacks": 0,
+        "empty_ocr_quality_fallbacks": 0,
     }
     bbox_unchanged = True
     table_structure_unchanged = True

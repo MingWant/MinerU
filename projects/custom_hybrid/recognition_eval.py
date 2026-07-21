@@ -79,8 +79,11 @@ def _operational_health(fusion_report: Mapping[str, Any]) -> dict[str, Any]:
         "errors",
         "protocol_echoes",
         "batch_quality_fallbacks",
+        "script_guard_fallbacks",
         "empty_ocr_recoveries",
         "empty_ocr_context_fallbacks",
+        "empty_ocr_density_fallbacks",
+        "empty_ocr_quality_fallbacks",
         "candidate_limit",
     )
     counts = {name: _recognition_count(fusion_report, name) for name in names}

@@ -104,7 +104,7 @@ class WorkflowTests(unittest.TestCase):
                 "native markdown",
             )
             semantic = primary_path.read_text(encoding="utf-8")
-            self.assertIn("semantic-markdown-v3", semantic)
+            self.assertIn("semantic-markdown-v4", semantic)
             self.assertIn("Hello", semantic)
 
     def test_bearer_header_requires_explicit_environment_setting(self):
@@ -696,6 +696,11 @@ class WorkflowTests(unittest.TestCase):
             ("context_reserve_tokens", 0, "context_reserve_tokens"),
             ("min_batch_acceptable_ratio", 1.1, "min_batch_acceptable_ratio"),
             ("batch_guard_min_candidates", 0, "batch_guard_min_candidates"),
+            (
+                "empty_thin_line_max_chars_per_em",
+                0,
+                "empty_thin_line_max_chars_per_em",
+            ),
             ("max_image_limit_retries", -1, "max_image_limit_retries"),
         ):
             with self.subTest(key=key), tempfile.TemporaryDirectory() as temp_dir:
@@ -722,6 +727,7 @@ class WorkflowTests(unittest.TestCase):
             ("model", ""),
             ("api_key_env", 42),
             ("empty_ocr_enabled", "yes"),
+            ("script_guard_enabled", "yes"),
         ):
             with self.subTest(key=key), tempfile.TemporaryDirectory() as temp_dir:
                 config = json.loads(source.read_text(encoding="utf-8"))

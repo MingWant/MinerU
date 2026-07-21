@@ -433,6 +433,340 @@ class SemanticMarkdownTests(unittest.TestCase):
         self.assertIn("- **Name 姓名**: 陳嘉欣", markdown)
         self.assertNotIn("P-12345 / 陳嘉欣", markdown)
 
+    def test_cross_cell_aggregate_uses_each_cells_authoritative_value(self):
+        cells = [
+            {
+                "row_start": 0,
+                "col_start": 0,
+                "bbox": [15, 591, 156, 639],
+                "text": "Policy No. 保單號碼SLHk4455667",
+                "content_spans": [
+                    content_span("Policy No. 保單號碼", [16, 588, 90, 601]),
+                    content_span(
+                        "SLHk4455667 Ho Tin Yan",
+                        [16, 606, 270, 637],
+                    ),
+                ],
+            },
+            {
+                "row_start": 0,
+                "col_start": 1,
+                "bbox": [158, 591, 299, 639],
+                "text": "Name of Insured 受保人姓名Ho Tin Yan",
+                "content_spans": [
+                    content_span(
+                        "Name of Insured 受保人姓名",
+                        [160, 590, 261, 600],
+                    ),
+                ],
+            },
+        ]
+
+        markdown = generate_semantic_markdown(middle(table_block(cells)))
+
+        self.assertIn("- **Policy No. 保單號碼**: SLHk4455667", markdown)
+        self.assertIn("- **Name of Insured 受保人姓名**: Ho Tin Yan", markdown)
+        self.assertNotIn("SLHk4455667 Ho Tin Yan", markdown)
+
+    def test_value_mounted_on_later_cell_returns_to_matching_field_cell(self):
+        cells = [
+            {
+                "row_start": 3,
+                "row_end": 4,
+                "col_start": 0,
+                "bbox": [17, 453, 149, 486],
+                "text": (
+                    "CONSULTANT'S INFORMATION 顧問資料 "
+                    "Name 姓名 Mary So"
+                ),
+                "content_spans": [
+                    content_span("Name 姓名", [20, 469, 60, 479]),
+                ],
+            },
+            {
+                "row_start": 5,
+                "col_start": 0,
+                "bbox": [18, 480, 345, 509],
+                "text": "Claimed Benefit(s) 索償保障類別:",
+                "content_spans": [
+                    content_span("Mary So", [23, 469, 127, 505]),
+                ],
+            },
+        ]
+
+        markdown = generate_semantic_markdown(middle(table_block(cells)))
+
+        self.assertIn("- **Name 姓名**: Mary So", markdown)
+        self.assertEqual(markdown.count("Mary So"), 1)
+
+    def test_cross_cell_aggregate_label_does_not_steal_individual_fields(self):
+        cells = [
+            {
+                "row_start": 0,
+                "col_start": 0,
+                "bbox": [20, 20, 150, 75],
+                "text": "Name 姓名梁志往",
+                "content_spans": [
+                    content_span("Name 姓名", [25, 25, 75, 36]),
+                    content_span("梁志", [30, 48, 75, 68]),
+                    content_span("往", [70, 48, 92, 68]),
+                    content_span(
+                        "District/Branch 區域/分行 Code 編號 "
+                        "Contact Phone No. 聯絡電話",
+                        [145, 24, 570, 40],
+                    ),
+                ],
+            },
+            {
+                "row_start": 0,
+                "col_start": 1,
+                "bbox": [155, 20, 290, 75],
+                "text": "District/Branch 區域/分行Hong Kong Island",
+                "content_spans": [
+                    content_span(
+                        "District/Branch 區域/分行",
+                        [160, 25, 265, 36],
+                    ),
+                    content_span("Hong Kong Island", [165, 48, 275, 68]),
+                ],
+            },
+            {
+                "row_start": 0,
+                "col_start": 2,
+                "bbox": [295, 20, 430, 75],
+                "text": "Code 編號1112233",
+                "content_spans": [
+                    content_span("Code 編號", [300, 25, 350, 36]),
+                    content_span("1112233", [305, 48, 365, 68]),
+                ],
+            },
+            {
+                "row_start": 0,
+                "col_start": 3,
+                "bbox": [435, 20, 580, 75],
+                "text": "Contact Phone No. 聯絡電話9876 5432",
+                "content_spans": [
+                    content_span(
+                        "Contact Phone No. 聯絡電話",
+                        [440, 25, 555, 36],
+                    ),
+                    content_span("9876 5432", [445, 48, 525, 68]),
+                ],
+            },
+        ]
+
+        markdown = generate_semantic_markdown(middle(table_block(cells)))
+
+        self.assertIn("- **Name 姓名**: 梁志往", markdown)
+        self.assertIn(
+            "- **District/Branch 區域/分行**: Hong Kong Island",
+            markdown,
+        )
+        self.assertIn("- **Code 編號**: 1112233", markdown)
+        self.assertIn(
+            "- **Contact Phone No. 聯絡電話**: 9876 5432",
+            markdown,
+        )
+        self.assertNotIn(
+            "District/Branch 區域/分行 Code 編號 Contact Phone No.",
+            markdown,
+        )
+
+    def test_signature_zone_uses_fixed_name_id_and_date_columns(self):
+        cells = [
+            {
+                "row_start": 0,
+                "col_start": 0,
+                "bbox": [20, 20, 580, 130],
+                "text": (
+                    "Signature of Policy Owner 保單主權人簽署 X\n"
+                    "Name (in block letters) 姓名(大寫) CHEUNG SIU LING\n"
+                    "ID / Passport No. V123456(7)\n"
+                    "Date (DD/MM/YY) 15/03/26\n"
+                    "Signature of Insured 受保人簽署 X\n"
+                    "Name (in block letters) 姓名(大寫) CHEUNG SIU LING\n"
+                    "ID / Passport No. V123456(7)\n"
+                    "Date (DD/MM/YY) 15/03/26"
+                ),
+                "content_spans": [
+                    content_span(
+                        "Signature of Policy Owner 保單主權人簽署 X",
+                        [25, 30, 170, 40],
+                    ),
+                    content_span(
+                        "Name (in block letters) 姓名(大寫)",
+                        [25, 42, 150, 52],
+                    ),
+                    content_span("CHEUNG SIU LING", [160, 42, 280, 60]),
+                    content_span("ID / Passport No.", [330, 30, 405, 40]),
+                    content_span("V/23456()", [395, 42, 460, 60]),
+                    content_span("Date (DD/MM/YY)", [470, 30, 560, 40]),
+                    content_span("15/03/26", [505, 42, 570, 60]),
+                    content_span(
+                        "Signature of Insured 受保人簽署 X",
+                        [25, 75, 165, 85],
+                    ),
+                    content_span(
+                        "Name (in block letters) 姓名(大寫)",
+                        [25, 87, 150, 97],
+                    ),
+                    content_span("CHEUNG SIU LING", [160, 87, 280, 105]),
+                    content_span("ID / Passport No.", [330, 75, 405, 85]),
+                    content_span("V123456(7)", [395, 87, 460, 105]),
+                    content_span("Date (DD/MM/YY)", [470, 75, 560, 85]),
+                    content_span("15/03/26", [505, 87, 570, 105]),
+                ],
+            }
+        ]
+
+        markdown = generate_semantic_markdown(middle(table_block(cells)))
+
+        self.assertEqual(markdown.count("CHEUNG SIU LING"), 2)
+        self.assertEqual(markdown.count("V123456(7)"), 2)
+        self.assertNotIn("V/23456()", markdown)
+        self.assertEqual(markdown.count("15/03/26"), 2)
+        self.assertNotIn("CHEUNG SIU LING / Signature", markdown)
+
+    def test_medical_grid_preserves_columns_and_stops_at_next_question(self):
+        cells = [
+            {
+                "row_start": 0,
+                "col_start": 0,
+                "bbox": [20, 20, 580, 180],
+                "content_spans": [
+                    content_span(
+                        "7. Type of diagnostic procedures, medication, treatment or operation required.",
+                        [25, 25, 555, 38],
+                    ),
+                    content_span("Date 日期", [30, 50, 75, 62]),
+                    content_span(
+                        "Investigation/ Result 檢查/結果",
+                        [140, 50, 275, 62],
+                    ),
+                    content_span(
+                        "Medication/ Treatment/ Operation 藥物/治療/手術",
+                        [350, 50, 555, 62],
+                    ),
+                    content_span("10/03/26", [30, 70, 90, 90]),
+                    content_span("X-ray of right ankle", [140, 70, 280, 88]),
+                    content_span("Partial ligament tear", [140, 90, 280, 108]),
+                    content_span("NSAIDS and RICE", [350, 70, 500, 90]),
+                    content_span(
+                        "8. Was the patient admitted into hospital?",
+                        [25, 125, 330, 140],
+                    ),
+                    content_span("No", [40, 145, 70, 160]),
+                ],
+            }
+        ]
+
+        markdown = generate_semantic_markdown(middle(table_block(cells)))
+
+        self.assertIn(
+            "| Date 日期 | Investigation/ Result 檢查/結果 | "
+            "Medication/ Treatment/ Operation 藥物/治療/手術 |",
+            markdown,
+        )
+        self.assertIn(
+            "| 10/03/26 | X-ray of right ankle<br>Partial ligament tear | "
+            "NSAIDS and RICE |",
+            markdown,
+        )
+        self.assertIn("8. Was the patient admitted into hospital?", markdown)
+        self.assertNotIn("NSAIDS and RICE<br>8. Was", markdown)
+
+    def test_physician_footer_uses_fixed_label_and_value_columns(self):
+        cells = [
+            {
+                "row_start": 0,
+                "col_start": 0,
+                "bbox": [20, 20, 580, 155],
+                "content_spans": [
+                    content_span("Certificate body", [25, 25, 300, 38]),
+                    content_span("Signed 簽名:", [25, 55, 90, 68]),
+                    content_span("scribble", [115, 48, 240, 75]),
+                    content_span("Name of physician", [275, 52, 365, 64]),
+                    content_span("(with stamp)", [275, 64, 340, 75]),
+                    content_span("Dr. Chan Chi Wai", [400, 52, 540, 75]),
+                    content_span("Qualifications 資歷", [25, 88, 105, 100]),
+                    content_span("MBBS", [115, 86, 180, 103]),
+                    content_span("FHKAM", [115, 101, 190, 118]),
+                    content_span("Address 地址", [275, 88, 345, 100]),
+                    content_span("10 Nathan Road", [400, 86, 540, 103]),
+                    content_span("Date 日期:", [25, 125, 85, 137]),
+                    content_span("31/03/26", [115, 122, 185, 145]),
+                    content_span("Telephone Number 電話號碼", [275, 125, 390, 137]),
+                    content_span("27894321", [410, 122, 500, 145]),
+                ],
+            }
+        ]
+
+        markdown = generate_semantic_markdown(middle(table_block(cells)))
+
+        self.assertIn("- **Signed 簽名**: [Signature]", markdown)
+        self.assertIn(
+            "- **Name of physician (with stamp) / 醫生的姓名(蓋印)**: "
+            "Dr. Chan Chi Wai",
+            markdown,
+        )
+        self.assertIn("- **Qualifications / 資歷**: MBBS / FHKAM", markdown)
+        self.assertIn("- **Address 地址**: 10 Nathan Road", markdown)
+        self.assertIn("- **Date / 日期**: 31/03/26", markdown)
+        self.assertIn("- **Telephone Number / 電話號碼**: 27894321", markdown)
+
+    def test_semantic_replay_suppresses_impossible_thin_recovery_sentence(self):
+        hallucination = (
+            "1. 2016年，公司与上海华谊（集团）股份有限公司"
+            "（以下简称“公司”）签署的《股份转让协议》。"
+        )
+        cells = [
+            {
+                "row_start": 0,
+                "col_start": 0,
+                "bbox": [430, 312, 565, 340],
+                "content_spans": [
+                    content_span(
+                        hallucination,
+                        [432.696, 318.7, 563.051, 326.233],
+                        fusion_recovery_source="local_uncovered_pixel_ink",
+                        fusion_recognition_original_ocr="",
+                        fusion_recognition_source="vlm",
+                    ),
+                    content_span(
+                        "ID / Passport No. 身份證/護照號碼",
+                        [432, 328, 560, 338],
+                    ),
+                ],
+            }
+        ]
+
+        markdown = generate_semantic_markdown(middle(table_block(cells)))
+
+        self.assertNotIn("股份转让协议", markdown)
+        self.assertIn("ID / Passport No.", markdown)
+
+    def test_semantic_replay_suppresses_repeated_empty_recovery_phrase(self):
+        cells = [
+            {
+                "row_start": 0,
+                "col_start": 0,
+                "bbox": [20, 20, 300, 70],
+                "content_spans": [
+                    content_span(
+                        "1. 证明：证明：证明：证明：",
+                        [25, 30, 280, 55],
+                        fusion_recovery_source="local_uncovered_pixel_ink",
+                        fusion_recognition_original_ocr="",
+                        fusion_recognition_source="vlm",
+                    )
+                ],
+            }
+        ]
+
+        markdown = generate_semantic_markdown(middle(table_block(cells)))
+
+        self.assertNotIn("证明", markdown)
+
     def test_question_and_partial_date_are_not_absorbed_as_name_or_age(self):
         cells = [
             {
@@ -493,6 +827,42 @@ class SemanticMarkdownTests(unittest.TestCase):
             markdown,
         )
         self.assertNotIn("(with stamp)", markdown)
+
+    def test_formula_noise_is_not_assigned_to_address_field(self):
+        cells = [
+            {
+                "row_start": 0,
+                "col_start": 0,
+                "bbox": [20, 20, 180, 80],
+                "content_spans": [
+                    content_span("Address 地址", [25, 25, 140, 38]),
+                ],
+            },
+            {
+                "row_start": 0,
+                "col_start": 1,
+                "bbox": [185, 20, 580, 80],
+                "content_spans": [
+                    content_span(
+                        "Room 1502, Mong Kok Plaza, Kowloon",
+                        [190, 25, 430, 42],
+                    ),
+                    content_span(
+                        r"<eq>N a = H _ { 2 } \cdot R _ { 2 } d</eq>",
+                        [190, 48, 430, 68],
+                    ),
+                ],
+            },
+        ]
+
+        markdown = generate_semantic_markdown(middle(table_block(cells)))
+
+        self.assertIn(
+            "- **Address 地址**: Room 1502, Mong Kok Plaza, Kowloon",
+            markdown,
+        )
+        self.assertNotIn(r"\cdot", markdown)
+        self.assertNotIn("H _ { 2 }", markdown)
 
     def test_trailing_date_punctuation_does_not_move_date_into_name_field(self):
         cells = [
@@ -651,6 +1021,65 @@ class SemanticMarkdownTests(unittest.TestCase):
         self.assertIn("74,791.00", markdown)
         self.assertIn("CH KELVIN", markdown)
         self.assertNotIn("### CH KELVIN", markdown)
+
+    def test_identifier_prefix_conflict_uses_preserved_ocr_value(self):
+        cells = [
+            {
+                "row_start": 0,
+                "col_start": 0,
+                "bbox": [20, 20, 300, 80],
+                "text": "Code 編號\n11112233",
+                "content_spans": [
+                    content_span("Code 編號", [25, 25, 90, 36]),
+                    content_span(
+                        "11112233",
+                        [25, 42, 100, 66],
+                        fusion_recognition_source="vlm",
+                        fusion_recognition_original_ocr="H112233",
+                        fusion_recognition_vlm="11112233",
+                    ),
+                ],
+            }
+        ]
+
+        markdown = generate_semantic_markdown(middle(table_block(cells)))
+
+        self.assertIn("- **Code 編號**: H112233", markdown)
+        self.assertNotIn("11112233", markdown)
+
+    def test_crowded_multiline_empty_ocr_recovery_is_suppressed(self):
+        cells = [
+            {
+                "row_start": 0,
+                "col_start": 0,
+                "bbox": [20, 20, 580, 90],
+                "text": "District/Branch 區域/分行\nHong Kong Island",
+                "content_spans": [
+                    content_span(
+                        "District/Branch 區域/分行",
+                        [25, 25, 180, 36],
+                    ),
+                    content_span("Hong Kong Island", [25, 48, 180, 68]),
+                    content_span(
+                        "ON 顧問資料\nDistrict Research 區域分行\nQ.1. 錢號\nQ.1.4. Place N.",
+                        [190, 44, 570, 60],
+                        fusion_recovery_source="local_split_pixel_ink_merge",
+                        fusion_recovery_spanning_cells=True,
+                        fusion_recognition_original_ocr="",
+                        fusion_recognition_reason="empty_ocr_vlm_recovery",
+                    ),
+                ],
+            }
+        ]
+
+        markdown = generate_semantic_markdown(middle(table_block(cells)))
+
+        self.assertIn(
+            "- **District/Branch 區域/分行**: Hong Kong Island",
+            markdown,
+        )
+        self.assertNotIn("District Research", markdown)
+        self.assertNotIn("Q.1.4. Place", markdown)
 
     def test_fragment_only_ocr_noise_page_is_suppressed(self):
         noise_blocks = [
