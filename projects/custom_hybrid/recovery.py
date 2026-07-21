@@ -352,6 +352,8 @@ class OpenAIBBoxRecoveryReviewer:
         region_bbox: Sequence[float],
         existing: Sequence[Mapping[str, Any]] = (),
         diagonal_rules: Sequence[Sequence[float]] = (),
+        minimum_row_ink_pixels: int | None = None,
+        maximum_line_gap_points: float | None = None,
     ) -> dict[str, Any]:
         scale_x, scale_y = self._page_scale(image, page_size)
         bbox = _valid_bbox(region_bbox)
@@ -544,18 +546,28 @@ class OpenAIBBoxRecoveryReviewer:
                 bbox,
             )
             minimum_row_ink = max(
-                int(self.config.get("cell_line_min_row_ink_pixels", 2)),
+                int(
+                    minimum_row_ink_pixels
+                    if minimum_row_ink_pixels is not None
+                    else self.config.get("cell_line_min_row_ink_pixels", 2)
+                ),
                 1,
             )
             active_rows = np.flatnonzero(
                 np.count_nonzero(visible_mask, axis=1) >= minimum_row_ink
             )
             line_bboxes: list[list[float]] = []
+            ink_lines: list[dict[str, Any]] = []
+            ink_components: list[dict[str, Any]] = []
             if active_rows.size:
                 maximum_gap = max(
                     int(
                         round(
-                            float(self.config.get("cell_line_gap", 1.5))
+                            (
+                                float(self.config.get("cell_line_gap", 1.5))
+                                if maximum_line_gap_points is None
+                                else float(maximum_line_gap_points)
+                            )
                             * scale_y
                         )
                     ),
@@ -627,11 +639,105 @@ class OpenAIBBoxRecoveryReviewer:
                     ):
                         continue
                     line_bboxes.append(list(line_bbox))
+                    pixel_area = max(
+                        (int(band_x.max()) - int(band_x.min()) + 1)
+                        * (int(band_y.max()) - int(band_y.min()) + 1),
+                        1,
+                    )
+                    ink_lines.append(
+                        {
+                            "bbox": list(line_bbox),
+                            "ink_density": round(float(band_x.size / pixel_area), 6),
+                            "dark_height": round(float(dark_height), 6),
+                        }
+                    )
+                    active_columns = np.flatnonzero(
+                        np.count_nonzero(band_mask, axis=0) > 0
+                    )
+                    if active_columns.size:
+                        maximum_component_gap = max(
+                            int(
+                                round(
+                                    float(
+                                        self.config.get(
+                                            "cell_component_horizontal_gap",
+                                            16.0,
+                                        )
+                                    )
+                                    * scale_x
+                                )
+                            ),
+                            1,
+                        )
+                        column_bands: list[tuple[int, int]] = []
+                        left = previous_column = int(active_columns[0])
+                        for raw_column in active_columns[1:]:
+                            column = int(raw_column)
+                            if column - previous_column > maximum_component_gap + 1:
+                                column_bands.append((left, previous_column + 1))
+                                left = column
+                            previous_column = column
+                        column_bands.append((left, previous_column + 1))
+                        for left, right in column_bands:
+                            component_mask = band_mask[:, left:right]
+                            component_y, component_x = np.nonzero(component_mask)
+                            if component_x.size == 0:
+                                continue
+                            component_min_x = left + int(component_x.min())
+                            component_max_x = left + int(component_x.max())
+                            component_min_y = top + int(component_y.min())
+                            component_max_y = top + int(component_y.max())
+                            component_dark_height = (
+                                component_max_y - component_min_y + 1
+                            ) / scale_y
+                            component_width = (
+                                component_max_x - component_min_x + 1
+                            ) / scale_x
+                            if (
+                                component_dark_height < minimum_dark_height
+                                or component_width < minimum_line_width
+                            ):
+                                continue
+                            component_bbox = _clip_bbox(
+                                (
+                                    (crop_box[0] + component_min_x) / scale_x
+                                    - 1.0,
+                                    (crop_box[1] + component_min_y) / scale_y
+                                    - 0.8,
+                                    (crop_box[0] + component_max_x) / scale_x
+                                    + 1.0,
+                                    (crop_box[1] + component_max_y) / scale_y
+                                    + 0.8,
+                                ),
+                                bbox,
+                            )
+                            if component_bbox is None:
+                                continue
+                            component_area = max(
+                                (component_max_x - component_min_x + 1)
+                                * (component_max_y - component_min_y + 1),
+                                1,
+                            )
+                            ink_components.append(
+                                {
+                                    "bbox": list(component_bbox),
+                                    "ink_density": round(
+                                        float(component_x.size / component_area),
+                                        6,
+                                    ),
+                                    "dark_height": round(
+                                        float(component_dark_height),
+                                        6,
+                                    ),
+                                }
+                            )
             return {
                 "ink_ratio": dark_count / total_pixels,
                 "uncovered_ratio": visible_count / dark_count,
                 "ink_bbox": list(ink_bbox) if ink_bbox is not None else None,
                 "ink_bboxes": line_bboxes,
+                "ink_lines": ink_lines,
+                "ink_components": ink_components,
                 "uncovered_ink_pixels": visible_count,
             }
         finally:
@@ -668,6 +774,11 @@ class OpenAIBBoxRecoveryReviewer:
             for item in related_cell.get("existing", [])
             if isinstance(item, Mapping)
         ]
+        table_existing.extend(
+            item
+            for item in table.get("page_existing", [])
+            if isinstance(item, Mapping)
+        )
         table_bbox = _valid_bbox(table.get("bbox"))
         numeric_rows = [
             int(cell["row_end"])
@@ -685,6 +796,41 @@ class OpenAIBBoxRecoveryReviewer:
             and any(
                 _TERMINAL_FIELD_RE.search(str(cell.get("text", "")))
                 for cell in terminal_cells
+            )
+        )
+        terminal_bottom_gap = (
+            table_bbox[3]
+            - max(
+                (
+                    bbox[3]
+                    for cell in terminal_cells
+                    for bbox in [_valid_bbox(cell.get("bbox"))]
+                    if bbox is not None
+                ),
+                default=table_bbox[3] if table_bbox is not None else 0.0,
+            )
+            if table_bbox is not None
+            else 0.0
+        )
+        terminal_content_overflow = any(
+            existing_bbox[3] > cell_bbox[3] + 1.0
+            for cell in terminal_cells
+            for cell_bbox in [_valid_bbox(cell.get("bbox"))]
+            if cell_bbox is not None
+            for item in cell.get("existing", [])
+            if isinstance(item, Mapping)
+            for existing_bbox in [_valid_bbox(item.get("bbox"))]
+            if existing_bbox is not None
+        )
+        incomplete_terminal_row = bool(
+            self.config.get("terminal_incomplete_row_extension_enabled", True)
+            and terminal_content_overflow
+            and float(
+                self.config.get("terminal_field_min_bottom_extension", 8.0)
+            )
+            <= terminal_bottom_gap
+            <= float(
+                self.config.get("terminal_field_max_bottom_extension", 80.0)
             )
         )
         previous_row_bottom = max(
@@ -728,7 +874,7 @@ class OpenAIBBoxRecoveryReviewer:
             if (
                 analysis_bbox is not None
                 and table_bbox is not None
-                and terminal_field_row
+                and (terminal_field_row or incomplete_terminal_row)
                 and terminal_row is not None
                 and cell.get("row_end") == terminal_row
             ):
@@ -774,6 +920,16 @@ class OpenAIBBoxRecoveryReviewer:
                 analysis_bbox or cell.get("bbox", []),
                 table_existing,
                 diagonal_rules,
+                minimum_row_ink_pixels=(
+                    int(self.config.get("form_line_min_row_ink_pixels", 6))
+                    if cell.get("form_region") or terminal_field_extended
+                    else None
+                ),
+                maximum_line_gap_points=(
+                    float(self.config.get("terminal_field_line_gap", 0.25))
+                    if terminal_field_extended
+                    else None
+                ),
             )
             reasons = list(
                 reason
@@ -792,7 +948,32 @@ class OpenAIBBoxRecoveryReviewer:
                 existing
                 and local_uncovered_enabled
                 and analysis["ink_ratio"] <= max_ink_ratio
-                and analysis["uncovered_ratio"] >= min_uncovered_ratio
+                and analysis["uncovered_ratio"]
+                >= (
+                    min(
+                        min_uncovered_ratio,
+                        float(
+                            self.config.get(
+                                "form_min_uncovered_ink_ratio",
+                                0.05,
+                            )
+                        ),
+                    )
+                    if cell.get("form_region")
+                    else min(
+                        min_uncovered_ratio,
+                        float(
+                            self.config.get(
+                                "small_field_min_uncovered_ink_ratio",
+                                0.12,
+                            )
+                        ),
+                    )
+                    if analysis_bbox is not None
+                    and analysis_bbox[3] - analysis_bbox[1] <= 35.0
+                    and analysis.get("uncovered_ink_pixels", 0) >= 48
+                    else min_uncovered_ratio
+                )
                 and analysis.get("uncovered_ink_pixels", 0)
                 >= minimum_uncovered_pixels
                 and analysis["ink_bbox"] is not None
@@ -807,6 +988,8 @@ class OpenAIBBoxRecoveryReviewer:
                     "reasons": sorted(set(reasons)),
                     "pixel_ink_bbox": analysis["ink_bbox"],
                     "pixel_ink_bboxes": analysis.get("ink_bboxes", []),
+                    "pixel_ink_lines": analysis.get("ink_lines", []),
+                    "pixel_ink_components": analysis.get("ink_components", []),
                     "ink_ratio": round(float(analysis["ink_ratio"]), 6),
                     "uncovered_ink_ratio": round(
                         float(analysis["uncovered_ratio"]),
@@ -1504,7 +1687,7 @@ class OpenAIBBoxRecoveryReviewer:
             ]
             merge_with_label = bool(
                 self.config.get("checkbox_merge_label_enabled", True)
-            )
+            ) and not bool(table.get("form_region"))
             label_max_gap = max(
                 float(self.config.get("checkbox_label_max_gap", 24.0)),
                 0.0,
@@ -1530,7 +1713,7 @@ class OpenAIBBoxRecoveryReviewer:
             )
             accept_existing_label_bbox = bool(
                 self.config.get("checkbox_accept_existing_label_bbox", True)
-            )
+            ) and not bool(table.get("form_region"))
             for candidate in sorted(
                 candidates,
                 key=lambda item: (item["bbox"][1], item["bbox"][0]),
@@ -2326,19 +2509,88 @@ class OpenAIBBoxRecoveryReviewer:
             cell_id = cell.get("id")
             if not isinstance(cell_id, str):
                 continue
-            raw_line_bboxes = cell.get("pixel_ink_bboxes")
-            has_line_analysis = isinstance(raw_line_bboxes, list)
-            line_bboxes = [
-                bbox
-                for raw_bbox in raw_line_bboxes
-                for bbox in [_valid_bbox(raw_bbox)]
+            is_form_region = bool(cell.get("form_region"))
+            if is_form_region and not cell.get("form_recover_text"):
+                continue
+            raw_ink_lines = (
+                cell.get("pixel_ink_components")
+                if is_form_region
+                else cell.get("pixel_ink_lines")
+            )
+            has_rich_line_analysis = isinstance(raw_ink_lines, list)
+            line_candidates = [
+                (bbox, raw_line)
+                for raw_line in raw_ink_lines
+                if isinstance(raw_line, Mapping)
+                for bbox in [_valid_bbox(raw_line.get("bbox"))]
                 if bbox is not None
-            ] if has_line_analysis else []
+            ] if has_rich_line_analysis else []
+            raw_line_bboxes = cell.get("pixel_ink_bboxes")
+            has_line_analysis = has_rich_line_analysis or isinstance(
+                raw_line_bboxes,
+                list,
+            )
+            if not has_rich_line_analysis and isinstance(raw_line_bboxes, list):
+                line_candidates = [
+                    (bbox, {})
+                    for raw_bbox in raw_line_bboxes
+                    for bbox in [_valid_bbox(raw_bbox)]
+                    if bbox is not None
+                ]
             if not has_line_analysis:
                 fallback_bbox = _valid_bbox(cell.get("pixel_ink_bbox"))
                 if fallback_bbox is not None:
-                    line_bboxes = [fallback_bbox]
-            for bbox in line_bboxes:
+                    line_candidates = [(fallback_bbox, {})]
+            for bbox, line_analysis in line_candidates:
+                if is_form_region:
+                    width = bbox[2] - bbox[0]
+                    height = bbox[3] - bbox[1]
+                    cell_bbox = _valid_bbox(cell.get("bbox"))
+                    density = line_analysis.get("ink_density")
+                    maximum_density = float(
+                        self.config.get("form_recovery_max_ink_density", 0.72)
+                    )
+                    maximum_height = float(
+                        self.config.get("form_recovery_max_line_height", 24.0)
+                    )
+                    maximum_width_ratio = float(
+                        self.config.get(
+                            "demoted_form_recovery_max_width_ratio"
+                            if cell.get("demoted_form_cell")
+                            else "form_recovery_max_width_ratio",
+                            0.8 if cell.get("demoted_form_cell") else 0.5,
+                        )
+                    )
+                    looks_like_checkbox = (
+                        4.0 <= width <= 20.0
+                        and 4.0 <= height <= 20.0
+                        and 0.65 <= width / height <= 1.4
+                    )
+                    if (
+                        isinstance(density, (int, float))
+                        and float(density) > maximum_density
+                    ) or (
+                        isinstance(density, (int, float))
+                        and float(density) < 0.02
+                    ) or (
+                        cell_bbox is not None
+                        and width
+                        > (cell_bbox[2] - cell_bbox[0]) * maximum_width_ratio
+                    ) or (
+                        width < 8.0 or height < 6.0
+                    ) or (
+                        cell_bbox is not None
+                        and cell.get("form_recover_text")
+                        and not cell.get("demoted_form_cell")
+                        and (bbox[1] + bbox[3]) / 2
+                        < (cell_bbox[1] + cell_bbox[3]) / 2
+                    ) or height > maximum_height or looks_like_checkbox:
+                        continue
+                elif (
+                    cell.get("terminal_field_extended")
+                    and bbox[2] - bbox[0] < 10.0
+                ):
+                    continue
                 terminal_field_extended = bool(
                     cell.get("terminal_field_extended")
                 )
@@ -2572,6 +2824,7 @@ class OpenAIBBoxRecoveryReviewer:
         protocol_skips = 0
         local_only_tables = 0
         for table in tables:
+            is_form_region = bool(table.get("form_region"))
             if mineru_local_only:
                 local_only_tables += 1
             pixel_started = time.monotonic()
@@ -2620,9 +2873,10 @@ class OpenAIBBoxRecoveryReviewer:
                     0,
                 ),
             )
-            list_marker_items = self._table_list_marker_proposals(
-                table,
-                list_marker_limit,
+            list_marker_items = (
+                []
+                if is_form_region or table.get("disable_marker_merges")
+                else self._table_list_marker_proposals(table, list_marker_limit)
             )
             ink_marker_limit = min(
                 max(remaining_proposals - len(list_marker_items), 0),
@@ -2639,17 +2893,21 @@ class OpenAIBBoxRecoveryReviewer:
             )
             pixel_started = time.monotonic()
             try:
-                ink_marker_items = self._table_ink_marker_proposals(
-                    image,
-                    page_size,
-                    table,
-                    ink_marker_limit,
-                    diagonal_rules,
-                    [
-                        str(item.get("target_id"))
-                        for item in list_marker_items
-                        if isinstance(item.get("target_id"), str)
-                    ],
+                ink_marker_items = (
+                    []
+                    if is_form_region or table.get("disable_marker_merges")
+                    else self._table_ink_marker_proposals(
+                        image,
+                        page_size,
+                        table,
+                        ink_marker_limit,
+                        diagonal_rules,
+                        [
+                            str(item.get("target_id"))
+                            for item in list_marker_items
+                            if isinstance(item.get("target_id"), str)
+                        ],
+                    )
                 )
             finally:
                 pixel_analysis_seconds += time.monotonic() - pixel_started
@@ -2734,12 +2992,16 @@ class OpenAIBBoxRecoveryReviewer:
             )
             pixel_started = time.monotonic()
             try:
-                orphan_items = self._table_orphan_proposals(
-                    image,
-                    page_size,
-                    table,
-                    orphan_limit,
-                    diagonal_rules,
+                orphan_items = (
+                    []
+                    if is_form_region or table.get("disable_orphan_recovery")
+                    else self._table_orphan_proposals(
+                        image,
+                        page_size,
+                        table,
+                        orphan_limit,
+                        diagonal_rules,
+                    )
                 )
             finally:
                 pixel_analysis_seconds += time.monotonic() - pixel_started

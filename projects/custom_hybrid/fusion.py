@@ -15,7 +15,7 @@ from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from html import escape, unescape
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, MutableMapping, Sequence
 
 from mineru.utils.table_cell_quality import (
     TableCellGeometryQuality,
@@ -593,6 +593,196 @@ def collect_table_geometry_quality(
     ]
 
 
+def _looks_like_narrative_false_table(
+    assessment: TableGeometryAssessment,
+    page_size: Sequence[float],
+) -> bool:
+    """Identify page-sized narrative text that Pipeline mislabeled as a Table."""
+    if len(page_size) < 2:
+        return False
+    try:
+        page_area = float(page_size[0]) * float(page_size[1])
+    except (TypeError, ValueError):
+        return False
+    table_width = assessment.bbox[2] - assessment.bbox[0]
+    table_height = assessment.bbox[3] - assessment.bbox[1]
+    if page_area <= 0 or table_width <= 0 or table_height <= 0:
+        return False
+    if table_width * table_height / page_area < 0.65:
+        return False
+    raw_cells = assessment.span.get("table_cells", [])
+    cells = (
+        [cell for cell in raw_cells if isinstance(cell, Mapping)]
+        if isinstance(raw_cells, list)
+        else []
+    )
+    if not 5 <= len(cells) <= 30:
+        return False
+    total_text_chars = sum(len(str(cell.get("text", "")).strip()) for cell in cells)
+    wide_narrative_rows = sum(
+        len(str(cell.get("text", "")).strip()) >= 300
+        and (bbox[2] - bbox[0]) / table_width >= 0.75
+        for cell in cells
+        for bbox in [_valid_bbox(cell.get("bbox"))]
+        if bbox is not None
+    )
+    return total_text_chars >= 1500 and wide_narrative_rows >= 2
+
+
+def _narrative_table_text_blocks(
+    span: Mapping[str, Any],
+    base_index: float,
+) -> list[dict[str, Any]]:
+    records = []
+    seen = set()
+    raw_cells = span.get("table_cells", [])
+    for cell in raw_cells if isinstance(raw_cells, list) else []:
+        if not isinstance(cell, Mapping):
+            continue
+        raw_spans = cell.get("content_spans", [])
+        candidates = (
+            [item for item in raw_spans if isinstance(item, Mapping)]
+            if isinstance(raw_spans, list)
+            else []
+        )
+        if not candidates:
+            candidates = [cell]
+        for item in candidates:
+            bbox = _valid_bbox(item.get("bbox") or item.get("content_bbox"))
+            text = _content_span_text(item)
+            if bbox is None or not text:
+                continue
+            key = bbox, normalize_for_comparison(text)
+            if key in seen:
+                continue
+            seen.add(key)
+            records.append((bbox, text, item))
+    records.sort(key=lambda item: (item[0][1], item[0][0], item[0][3], item[0][2]))
+    blocks = []
+    divisor = max(len(records) + 1, 2)
+    for position, (bbox, text, source) in enumerate(records, 1):
+        output_span = copy.deepcopy(dict(source))
+        output_span.update(
+            {
+                "type": "text",
+                "content": text,
+                "bbox": list(bbox),
+                "fusion_source": "narrative_false_table_demotion",
+            }
+        )
+        blocks.append(
+            {
+                "type": "text",
+                "bbox": list(bbox),
+                "index": base_index + position / divisor * 0.0001,
+                "lines": [{"bbox": list(bbox), "spans": [output_span]}],
+                "fusion_source": "narrative_false_table_demotion",
+            }
+        )
+    return blocks
+
+
+def demote_narrative_false_tables(
+    middle_json: MutableMapping[str, Any],
+) -> dict[str, int]:
+    """Demote page-sized narrative pseudo Tables after OCR, before BBox repair."""
+    pages = middle_json.get("pdf_info", [])
+    stats = {"tables": 0, "text_boxes": 0}
+    if not isinstance(pages, list):
+        return stats
+    for page_index, page in enumerate(pages):
+        if not isinstance(page, MutableMapping):
+            continue
+        flagged = {
+            id(item.span): item
+            for item in collect_table_geometry_quality(page, page_index)
+            if _looks_like_narrative_false_table(item, page.get("page_size", []))
+        }
+        if not flagged:
+            continue
+        demoted_recovery_regions = []
+        for assessment in flagged.values():
+            raw_cells = assessment.span.get("table_cells", [])
+            date_cells = [
+                copy.deepcopy(dict(cell))
+                for cell in (raw_cells if isinstance(raw_cells, list) else [])
+                if isinstance(cell, Mapping)
+                and _valid_bbox(cell.get("bbox")) is not None
+                and re.search(
+                    r"\bdate\b|日期",
+                    str(cell.get("text", "")),
+                    flags=re.IGNORECASE,
+                )
+                and (
+                    _valid_bbox(cell.get("bbox"))[2]
+                    - _valid_bbox(cell.get("bbox"))[0]
+                )
+                <= (assessment.bbox[2] - assessment.bbox[0]) * 0.35
+            ]
+            recovery_bbox = _union_bbox(cell.get("bbox") for cell in date_cells)
+            if recovery_bbox is not None and date_cells:
+                demoted_recovery_regions.append(
+                    {
+                        "bbox": list(recovery_bbox),
+                        "source_bbox": list(assessment.bbox),
+                        "cells": date_cells,
+                    }
+                )
+        if demoted_recovery_regions:
+            page["demoted_narrative_recovery_regions"] = demoted_recovery_regions
+
+        def transform_blocks(
+            raw_blocks: Any,
+            inherited_index: float = 0.0,
+        ) -> list[dict[str, Any]]:
+            transformed = []
+            for raw_block in raw_blocks if isinstance(raw_blocks, list) else []:
+                if not isinstance(raw_block, dict):
+                    continue
+                block_index = raw_block.get("index")
+                base_index = (
+                    float(block_index)
+                    if isinstance(block_index, (int, float))
+                    else inherited_index
+                )
+                matched_spans = []
+                for line in raw_block.get("lines", []):
+                    if not isinstance(line, dict):
+                        continue
+                    spans = line.get("spans", [])
+                    if not isinstance(spans, list):
+                        continue
+                    matched_spans.extend(
+                        span
+                        for span in spans
+                        if isinstance(span, dict) and id(span) in flagged
+                    )
+                    if matched_spans:
+                        line["spans"] = [
+                            span
+                            for span in spans
+                            if not isinstance(span, dict) or id(span) not in flagged
+                        ]
+                nested = raw_block.get("blocks")
+                if isinstance(nested, list):
+                    raw_block["blocks"] = transform_blocks(nested, base_index)
+                has_lines = any(
+                    isinstance(line, Mapping) and line.get("spans")
+                    for line in raw_block.get("lines", [])
+                )
+                if has_lines or raw_block.get("blocks"):
+                    transformed.append(raw_block)
+                for span in matched_spans:
+                    replacement = _narrative_table_text_blocks(span, base_index)
+                    transformed.extend(replacement)
+                    stats["tables"] += 1
+                    stats["text_boxes"] += len(replacement)
+            return transformed
+
+        page["preproc_blocks"] = transform_blocks(page.get("preproc_blocks", []))
+    return stats
+
+
 def _content_span_text(span: Mapping[str, Any]) -> str:
     for key in ("text", "content"):
         value = span.get(key)
@@ -895,16 +1085,17 @@ def build_bbox_recovery_manifest(
     page: Mapping[str, Any],
     page_index: int,
 ) -> list[dict[str, Any]]:
-    """Describe Pipeline Table/Cell geometry without granting mutation authority."""
+    """Describe post-OCR Table and Form geometry without granting mutation authority."""
     manifest: list[dict[str, Any]] = []
     structured_tables = collect_structured_spans(page, page_index, {"table"})
+    page_lines = collect_text_lines(page, page_index)
     page_existing = [
         {
             "bbox": list(line.bbox),
             "text": line.text,
             "source": line.block_type,
         }
-        for line in collect_text_lines(page, page_index)
+        for line in page_lines
     ]
     for table_index, table in enumerate(structured_tables):
         raw_cells = table.span.get("table_cells", [])
@@ -982,6 +1173,7 @@ def build_bbox_recovery_manifest(
             manifest.append(
                 {
                     "id": f"p{page_index}-table-{table_index}",
+                    "kind": "table",
                     "bbox": list(table.bbox),
                     "cells": cells,
                     "page_existing": page_existing,
@@ -990,6 +1182,183 @@ def build_bbox_recovery_manifest(
                         for other_index, other in enumerate(structured_tables)
                         if other_index != table_index
                     ],
+                }
+            )
+
+    raw_regions = page.get("form_regions", [])
+    raw_form_cells = page.get("form_cells", [])
+    if isinstance(raw_regions, list) and isinstance(raw_form_cells, list):
+        table_bboxes = [table.bbox for table in structured_tables]
+        for region_index, region in enumerate(raw_regions):
+            if not isinstance(region, Mapping):
+                continue
+            region_bbox = _valid_bbox(region.get("bbox"))
+            if region_bbox is None:
+                continue
+            cells = []
+            for cell_index, cell in enumerate(raw_form_cells):
+                if (
+                    not isinstance(cell, Mapping)
+                    or cell.get("form_region_index") != region_index
+                ):
+                    continue
+                structural_bbox = _valid_bbox(cell.get("bbox"))
+                cell_bbox = _valid_bbox(cell.get("recognition_bbox")) or structural_bbox
+                cell_bbox = (
+                    _clip_bbox_to_outer(cell_bbox, region_bbox)
+                    if cell_bbox is not None
+                    else None
+                )
+                if cell_bbox is None:
+                    continue
+                cell_area = (cell_bbox[2] - cell_bbox[0]) * (
+                    cell_bbox[3] - cell_bbox[1]
+                )
+                if any(
+                    _intersection_area(cell_bbox, table_bbox) / cell_area >= 0.5
+                    for table_bbox in table_bboxes
+                    if cell_area > 0
+                ):
+                    continue
+                existing = [
+                    {
+                        "id": (
+                            f"p{page_index}-f{region_index}-c{cell_index}"
+                            f"-line{line.sequence_index}"
+                        ),
+                        "bbox": list(line.bbox),
+                        "text": line.text,
+                        "source": "form_text_line",
+                    }
+                    for line in page_lines
+                    if _center_inside(line.bbox, cell_bbox)
+                    or overlap_over_smaller(line.bbox, cell_bbox) >= 0.5
+                ]
+                reasons = [] if existing else ["missing_content_bbox"]
+                ocr_text = str(cell.get("ocr_text", ""))
+                if ocr_text.strip() and not existing:
+                    reasons.append("metadata_text_without_bbox")
+                cells.append(
+                    {
+                        "id": f"p{page_index}-f{region_index}-c{cell_index}",
+                        "bbox": list(cell_bbox),
+                        "structural_bbox": list(structural_bbox)
+                        if structural_bbox is not None
+                        else list(cell_bbox),
+                        "row_start": cell.get("row_index"),
+                        "row_end": cell.get("row_index"),
+                        "col_start": cell.get("column_index"),
+                        "col_end": cell.get("column_index"),
+                        "text": ocr_text,
+                        "existing": existing,
+                        "reasons": reasons,
+                        "form_region": True,
+                        "form_cell_index": cell_index,
+                        "form_cell_kind": cell.get("kind"),
+                        "form_recover_text": bool(
+                            cell.get("kind") == "semantic_row"
+                            and (
+                                (
+                                    "admission" in ocr_text.casefold()
+                                    and "discharge" in ocr_text.casefold()
+                                )
+                                or ("入院" in ocr_text and "出院" in ocr_text)
+                            )
+                        ),
+                    }
+                )
+            if cells:
+                manifest.append(
+                    {
+                        "id": f"p{page_index}-form-{region_index}",
+                        "kind": "form_region",
+                        "form_region": True,
+                        "bbox": list(region_bbox),
+                        "cells": cells,
+                        "page_existing": page_existing,
+                        "page_exclusions": [
+                            list(bbox)
+                            for bbox in (
+                                table_bboxes
+                                + [
+                                    other_bbox
+                                    for other_index, other in enumerate(raw_regions)
+                                    if other_index != region_index
+                                    and isinstance(other, Mapping)
+                                    for other_bbox in [
+                                        _valid_bbox(other.get("bbox"))
+                                    ]
+                                    if other_bbox is not None
+                                ]
+                            )
+                        ],
+                        "disable_orphan_recovery": True,
+                        "disable_marker_merges": True,
+                    }
+                )
+
+    raw_demoted_regions = page.get("demoted_narrative_recovery_regions", [])
+    table_bboxes = [table.bbox for table in structured_tables]
+    for region_index, region in enumerate(
+        raw_demoted_regions if isinstance(raw_demoted_regions, list) else []
+    ):
+        if not isinstance(region, Mapping):
+            continue
+        region_bbox = _valid_bbox(region.get("bbox"))
+        raw_cells = region.get("cells", [])
+        if region_bbox is None or not isinstance(raw_cells, list):
+            continue
+        cells = []
+        for cell_index, cell in enumerate(raw_cells):
+            if not isinstance(cell, Mapping):
+                continue
+            cell_bbox = _valid_bbox(cell.get("bbox"))
+            if cell_bbox is None:
+                continue
+            existing = [
+                {
+                    "id": (
+                        f"p{page_index}-d{region_index}-c{cell_index}"
+                        f"-line{line.sequence_index}"
+                    ),
+                    "bbox": list(line.bbox),
+                    "text": line.text,
+                    "source": "demoted_form_text_line",
+                }
+                for line in page_lines
+                if _center_inside(line.bbox, cell_bbox)
+                or overlap_over_smaller(line.bbox, cell_bbox) >= 0.5
+            ]
+            cells.append(
+                {
+                    "id": f"p{page_index}-d{region_index}-c{cell_index}",
+                    "bbox": list(cell_bbox),
+                    "structural_bbox": list(cell_bbox),
+                    "row_start": cell.get("row_start"),
+                    "row_end": cell.get("row_end"),
+                    "col_start": cell.get("col_start"),
+                    "col_end": cell.get("col_end"),
+                    "text": str(cell.get("text", "")),
+                    "existing": existing,
+                    "reasons": [] if existing else ["missing_content_bbox"],
+                    "form_region": True,
+                    "form_recover_text": True,
+                    "demoted_form_cell": True,
+                    "demoted_form_cell_index": cell_index,
+                }
+            )
+        if cells:
+            manifest.append(
+                {
+                    "id": f"p{page_index}-demoted-form-{region_index}",
+                    "kind": "demoted_form_region",
+                    "form_region": True,
+                    "bbox": list(region_bbox),
+                    "cells": cells,
+                    "page_existing": page_existing,
+                    "page_exclusions": [list(bbox) for bbox in table_bboxes],
+                    "disable_orphan_recovery": True,
+                    "disable_marker_merges": True,
                 }
             )
     return manifest
@@ -1002,6 +1371,7 @@ def _bbox_recovery_lookup(
     dict[str, tuple[dict[str, Any], tuple[float, float, float, float]]],
     dict[str, dict[str, Any]],
     dict[str, tuple[dict[str, Any], str]],
+    set[str],
 ]:
     tables: dict[
         str,
@@ -1009,6 +1379,7 @@ def _bbox_recovery_lookup(
     ] = {}
     cells: dict[str, dict[str, Any]] = {}
     boxes: dict[str, tuple[dict[str, Any], str]] = {}
+    form_cell_ids: set[str] = set()
     for table_index, table in enumerate(
         collect_structured_spans(page, page_index, {"table"})
     ):
@@ -1032,7 +1403,124 @@ def _bbox_recovery_lookup(
                         ] = (span, "content_span")
             if _valid_bbox(cell.get("content_bbox")) is not None:
                 boxes[f"{cell_id}-content"] = (cell, "content_bbox")
-    return tables, cells, boxes
+    raw_regions = page.get("form_regions", [])
+    raw_form_cells = page.get("form_cells", [])
+    if isinstance(raw_regions, list) and isinstance(raw_form_cells, list):
+        for region_index, region in enumerate(raw_regions):
+            if not isinstance(region, dict):
+                continue
+            region_bbox = _valid_bbox(region.get("bbox"))
+            if region_bbox is None:
+                continue
+            region_id = f"p{page_index}-form-{region_index}"
+            tables[region_id] = (region, region_bbox)
+            for cell_index, raw_cell in enumerate(raw_form_cells):
+                if (
+                    not isinstance(raw_cell, dict)
+                    or raw_cell.get("form_region_index") != region_index
+                ):
+                    continue
+                cell_bbox = (
+                    _valid_bbox(raw_cell.get("recognition_bbox"))
+                    or _valid_bbox(raw_cell.get("bbox"))
+                )
+                if cell_bbox is None:
+                    continue
+                cell_id = f"p{page_index}-f{region_index}-c{cell_index}"
+                recovery_cell = dict(raw_cell)
+                recovery_cell["bbox"] = list(cell_bbox)
+                recovery_cell["_fusion_form_cell"] = raw_cell
+                cells[cell_id] = recovery_cell
+                form_cell_ids.add(cell_id)
+    raw_demoted_regions = page.get("demoted_narrative_recovery_regions", [])
+    for region_index, region in enumerate(
+        raw_demoted_regions if isinstance(raw_demoted_regions, list) else []
+    ):
+        if not isinstance(region, dict):
+            continue
+        region_bbox = _valid_bbox(region.get("bbox"))
+        raw_cells = region.get("cells", [])
+        if region_bbox is None or not isinstance(raw_cells, list):
+            continue
+        region_id = f"p{page_index}-demoted-form-{region_index}"
+        tables[region_id] = (region, region_bbox)
+        for cell_index, raw_cell in enumerate(raw_cells):
+            if not isinstance(raw_cell, dict):
+                continue
+            cell_bbox = _valid_bbox(raw_cell.get("bbox"))
+            if cell_bbox is None:
+                continue
+            cell_id = f"p{page_index}-d{region_index}-c{cell_index}"
+            recovery_cell = dict(raw_cell)
+            recovery_cell["bbox"] = list(cell_bbox)
+            recovery_cell["_fusion_form_cell"] = raw_cell
+            recovery_cell["demoted_form_cell"] = True
+            cells[cell_id] = recovery_cell
+            form_cell_ids.add(cell_id)
+    return tables, cells, boxes, form_cell_ids
+
+
+def _append_form_recovery_block(
+    page: dict[str, Any],
+    bbox: Sequence[float],
+    text: str,
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    preproc_blocks = page.setdefault("preproc_blocks", [])
+    if not isinstance(preproc_blocks, list):
+        preproc_blocks = []
+        page["preproc_blocks"] = preproc_blocks
+    candidate_key = (float(bbox[1]), float(bbox[0]))
+    indexed = []
+    for block in preproc_blocks:
+        if not isinstance(block, Mapping):
+            continue
+        block_bbox = _block_bbox(block)
+        index = block.get("index")
+        if block_bbox is None or not isinstance(index, (int, float)):
+            continue
+        indexed.append(((block_bbox[1], block_bbox[0]), float(index)))
+    previous = [index for key, index in indexed if key <= candidate_key]
+    following = [index for key, index in indexed if key > candidate_key]
+    previous_index = max(previous, default=None)
+    following_index = min(following, default=None)
+    if (
+        previous_index is not None
+        and following_index is not None
+        and following_index > previous_index
+    ):
+        block_index = (previous_index + following_index) / 2
+    elif previous_index is not None:
+        block_index = previous_index + 0.0001
+    elif following_index is not None:
+        block_index = following_index - 0.0001
+    else:
+        block_index = 0.0
+    span = {
+        "type": "text",
+        "content": text,
+        "bbox": list(bbox),
+        "fusion_source": "form_bbox_recovery",
+        "fusion_recovered_bbox": True,
+        **dict(metadata),
+    }
+    if text:
+        span["fusion_force_recognition"] = True
+    block = {
+        "type": "text",
+        "bbox": list(bbox),
+        "index": block_index,
+        "lines": [{"bbox": list(bbox), "spans": [span]}],
+        "fusion_source": "form_bbox_recovery",
+        "fusion_recovery_type": "form_field",
+    }
+    preproc_blocks.append(block)
+    preproc_blocks.sort(
+        key=lambda item: float(item.get("index", 0))
+        if isinstance(item, Mapping)
+        else 0.0
+    )
+    return span
 
 
 def _page_recovery_invariant_snapshot(
@@ -1092,6 +1580,7 @@ def apply_bbox_recovery_proposals(
         "orphan_added": 0,
         "fringe_added": 0,
         "checkbox_added": 0,
+        "form_added": 0,
         "checkbox_merged": 0,
         "list_marker_merged": 0,
         "ink_marker_merged": 0,
@@ -1112,7 +1601,7 @@ def apply_bbox_recovery_proposals(
     if not isinstance(raw_items, list):
         stats["errors"] = 1
         return stats, decisions, batches, True
-    tables, cells, boxes = _bbox_recovery_lookup(page, page_index)
+    tables, cells, boxes, form_cell_ids = _bbox_recovery_lookup(page, page_index)
     table_counts: Counter[str] = Counter()
     accepted_count = 0
     for item in raw_items:
@@ -1142,8 +1631,15 @@ def apply_bbox_recovery_proposals(
         reason = None
         cell = cells.get(cell_id) if isinstance(cell_id, str) else None
         cell_bbox = _valid_bbox(cell.get("bbox")) if cell is not None else None
+        is_form_cell = isinstance(cell_id, str) and cell_id in form_cell_ids
         table_key = cell_id.rsplit("-c", 1)[0] if isinstance(cell_id, str) else ""
-        expected_table_id = table_key.replace("-t", "-table-")
+        expected_table_id = (
+            table_key.replace("-d", "-demoted-form-", 1)
+            if is_form_cell and "-d" in table_key
+            else table_key.replace("-f", "-form-", 1)
+            if is_form_cell
+            else table_key.replace("-t", "-table-")
+        )
         detached_actions = {"add_orphan", "add_fringe", "add_checkbox"}
         table_scoped_actions = detached_actions | {
             "merge_list_marker",
@@ -1185,6 +1681,7 @@ def apply_bbox_recovery_proposals(
             else None
         )
         decision["table_id"] = table_id
+        decision["region_kind"] = "form" if is_form_cell else "table"
         if action not in {
             "add",
             "adjust",
@@ -1196,6 +1693,8 @@ def apply_bbox_recovery_proposals(
             "merge_ink_marker",
         }:
             reason = "unsupported_action"
+        elif is_form_cell and action not in {"add", "add_checkbox"}:
+            reason = "form_action_guard"
         elif cell is None or cell_bbox is None:
             reason = "unknown_cell"
         elif action in table_scoped_actions and (
@@ -1215,7 +1714,9 @@ def apply_bbox_recovery_proposals(
         elif table_counts[table_key] >= settings.bbox_recovery_max_proposals_per_table:
             reason = "table_budget"
         if reason is None:
-            if action == "add_fringe" and table_bbox is not None:
+            if is_form_cell:
+                outer_bbox = cell_bbox
+            elif action == "add_fringe" and table_bbox is not None:
                 outer_bbox = _table_fringe_outer_bbox(
                     page,
                     table_bbox,
@@ -1238,7 +1739,9 @@ def apply_bbox_recovery_proposals(
                     else "bbox_outside_cell"
                 )
         if reason is None:
-            if action == "add_fringe":
+            if is_form_cell:
+                outer_bbox = cell_bbox
+            elif action == "add_fringe":
                 outer_bbox = _table_fringe_outer_bbox(
                     page,
                     table_bbox,
@@ -1306,7 +1809,14 @@ def apply_bbox_recovery_proposals(
         existing_records: list[
             tuple[tuple[float, float, float, float], str]
         ] = []
-        if action in detached_actions or action == "add":
+        if is_form_cell and cell_bbox is not None:
+            existing_records.extend(
+                (line.bbox, str(cell_id or ""))
+                for line in collect_text_lines(page, page_index)
+                if _center_inside(line.bbox, cell_bbox)
+                or overlap_over_smaller(line.bbox, cell_bbox) >= 0.5
+            )
+        elif action in detached_actions or action == "add":
             for related_id, related_cell in cells.items():
                 if not related_id.startswith(table_key + "-c"):
                     continue
@@ -1484,6 +1994,34 @@ def apply_bbox_recovery_proposals(
                 terminal_field_extension
             ),
         }
+        if is_form_cell:
+            form_source = cell.get("_fusion_form_cell")
+            form_text = str(
+                form_source.get("ocr_text") or form_source.get("text") or ""
+            ) if isinstance(form_source, Mapping) else ""
+            recovery_metadata.update(
+                {
+                    "fusion_recovery_form": True,
+                    "fusion_form_region_index": (
+                        form_source.get("form_region_index")
+                        if isinstance(form_source, Mapping)
+                        else None
+                    ),
+                    "fusion_form_cell_index": (
+                        int(cell_id.rsplit("-c", 1)[1])
+                        if isinstance(cell_id, str)
+                        else None
+                    ),
+                    "fusion_cell_bbox": list(cell_bbox),
+                    "fusion_form_bbox": list(table_bbox)
+                    if table_bbox is not None
+                    else None,
+                }
+            )
+            if re.search(r"\bdate\b|日期", form_text, flags=re.IGNORECASE):
+                recovery_metadata[
+                    "fusion_recovery_terminal_field_kind"
+                ] = "date"
         if spanning_cells:
             recovery_metadata["fusion_recovery_merged_cell_ids"] = list(
                 merged_cell_ids
@@ -1507,7 +2045,28 @@ def apply_bbox_recovery_proposals(
                     ),
                 }
             )
-        if action in {"add", "add_orphan", "add_fringe", "add_checkbox"}:
+        if is_form_cell and action in {"add", "add_checkbox"}:
+            recovery_text = (
+                str(item.get("text", ""))
+                if action == "add_checkbox"
+                else ""
+            )
+            recovered_span = _append_form_recovery_block(
+                page,
+                bbox,
+                recovery_text,
+                recovery_metadata,
+            )
+            form_source = cell.get("_fusion_form_cell")
+            if isinstance(form_source, dict):
+                recovered_spans = form_source.setdefault("recovered_spans", [])
+                if isinstance(recovered_spans, list):
+                    recovered_spans.append(copy.deepcopy(recovered_span))
+            stats["added"] += 1
+            stats["form_added"] += 1
+            if action == "add_checkbox":
+                stats["checkbox_added"] += 1
+        elif action in {"add", "add_orphan", "add_fringe", "add_checkbox"}:
             raw_spans = cell.setdefault("content_spans", [])
             if not isinstance(raw_spans, list):
                 raw_spans = []
@@ -1587,6 +2146,7 @@ def apply_bbox_recovery_proposals(
         stats["orphan_added"] = 0
         stats["fringe_added"] = 0
         stats["checkbox_added"] = 0
+        stats["form_added"] = 0
         stats["checkbox_merged"] = 0
         stats["list_marker_merged"] = 0
         stats["ink_marker_merged"] = 0
@@ -1682,7 +2242,11 @@ def build_bbox_recognition_manifest(
             ("cell", _valid_bbox(metadata.get("fusion_cell_bbox"))),
             ("row", _recognition_context_bbox(line, ordered, "row")),
             ("column", _recognition_context_bbox(line, ordered, "column")),
-            ("table", _valid_bbox(metadata.get("fusion_table_bbox"))),
+            (
+                "table",
+                _valid_bbox(metadata.get("fusion_table_bbox"))
+                or _valid_bbox(metadata.get("fusion_form_bbox")),
+            ),
         ):
             if bbox is not None:
                 candidate["contexts"][name] = [round(value, 3) for value in bbox]
@@ -1784,6 +2348,10 @@ _BBOX_EMPTY_PLACEHOLDER_RE = re.compile(
     r"blank|empty|none|n/?a|unknown)\s*[\]\)>}]?",
     flags=re.IGNORECASE,
 )
+_CHECKED_CHECKBOX_RE = re.compile(
+    r"^\s*(?:[☑☒✓✔■]|\[\s*[xX✓✔]\s*\])"
+)
+_UNCHECKED_CHECKBOX_RE = re.compile(r"^\s*(?:[☐□]|\[\s*\])")
 
 
 def _valid_date_candidate(text: str) -> bool:
@@ -1819,8 +2387,13 @@ def _normalize_recovered_terminal_date_candidate(
 ) -> str:
     """Extract one valid date from a trusted terminal-date recovery crop."""
     stripped = text.strip()
+    recovery_source = metadata.get("fusion_recovery_source")
+    trusted_date_crop = recovery_source == "local_terminal_field_ink" or (
+        recovery_source == "local_uncovered_pixel_ink"
+        and bool(metadata.get("fusion_recovery_form"))
+    )
     if (
-        metadata.get("fusion_recovery_source") != "local_terminal_field_ink"
+        not trusted_date_crop
         or metadata.get("fusion_recovery_terminal_field_kind") != "date"
     ):
         return stripped
@@ -1922,6 +2495,15 @@ def _repeated_empty_recovery_phrase(text: str) -> bool:
     )
 
 
+def _recognized_checkbox_state(text: str) -> str | None:
+    """Return only an explicit checkbox state at the start of a crop result."""
+    if _CHECKED_CHECKBOX_RE.match(text):
+        return "checked"
+    if _UNCHECKED_CHECKBOX_RE.match(text):
+        return "unchecked"
+    return None
+
+
 def select_bbox_recognition_candidate(
     line: TextLine,
     vlm_text: str,
@@ -1941,6 +2523,18 @@ def select_bbox_recognition_candidate(
         return "ocr", "bbox_protocol_id_echo", field_type, similarity, length_ratio
     if len(vlm_text) > settings.bbox_recognition_max_text_chars:
         return "ocr", "vlm_candidate_too_long", field_type, similarity, length_ratio
+    metadata = line.spans[0] if line.spans else line.source_span or {}
+    local_checkbox_state = str(metadata.get("fusion_checkbox_state", ""))
+    if local_checkbox_state in {"checked", "unchecked"}:
+        recognized_checkbox_state = _recognized_checkbox_state(vlm_text)
+        if recognized_checkbox_state != local_checkbox_state:
+            return (
+                "ocr",
+                "checkbox_state_guard",
+                "general",
+                similarity,
+                length_ratio,
+            )
     list_marker_text = str(
         (line.spans[0] if line.spans else {}).get(
             "fusion_list_marker_text",
@@ -1959,7 +2553,6 @@ def select_bbox_recognition_candidate(
         )
     if not normalized_ocr:
         if settings.bbox_recognition_empty_ocr_enabled:
-            metadata = line.spans[0] if line.spans else {}
             checkbox = bool(metadata.get("fusion_recovery_checkbox"))
             if not checkbox and _BBOX_EMPTY_PLACEHOLDER_RE.fullmatch(vlm_text):
                 return (
@@ -3802,6 +4395,11 @@ def fuse_middle_json(
         raise ValueError(
             f"Page count mismatch: hybrid={len(hybrid_pages)}, ocr={len(ocr_pages)}"
         )
+    demotion_stats = (
+        demote_narrative_false_tables(ocr_source)
+        if settings.mode == "bbox_vlm" and isinstance(ocr_source, MutableMapping)
+        else {"tables": 0, "text_boxes": 0}
+    )
 
     decisions: list[dict[str, Any]] = []
     counts = {
@@ -3866,6 +4464,7 @@ def fuse_middle_json(
         "bbox_recognition_tables_rebuilt": 0,
         "bbox_recognition_table_rebuild_rejections": 0,
         "bbox_recovery_table_candidates": 0,
+        "bbox_recovery_form_candidates": 0,
         "bbox_recovery_tables_reviewed": 0,
         "bbox_recovery_table_budget_skips": 0,
         "bbox_recovery_proposal_budget_skips": 0,
@@ -3897,6 +4496,7 @@ def fuse_middle_json(
         "bbox_recovery_orphan_added": 0,
         "bbox_recovery_fringe_added": 0,
         "bbox_recovery_checkbox_added": 0,
+        "bbox_recovery_form_added": 0,
         "bbox_recovery_checkbox_merged": 0,
         "bbox_recovery_list_marker_merged": 0,
         "bbox_recovery_ink_marker_merged": 0,
@@ -3936,6 +4536,8 @@ def fuse_middle_json(
         "structured_verifier_errors": 0,
         "structured_verifier_rejections": 0,
         "structured_verification_limit": 0,
+        "bbox_false_tables_demoted": demotion_stats["tables"],
+        "bbox_false_table_text_boxes": demotion_stats["text_boxes"],
     }
     verification_count = 0
     structured_verification_state = {"count": 0}
@@ -3957,7 +4559,13 @@ def fuse_middle_json(
         page_size = hybrid_page.get("page_size", [0, 0])
         if settings.bbox_recovery_enabled:
             recovery_manifest = build_bbox_recovery_manifest(ocr_page, page_index)
-            counts["bbox_recovery_table_candidates"] += len(recovery_manifest)
+            counts["bbox_recovery_table_candidates"] += sum(
+                item.get("kind") == "table" for item in recovery_manifest
+            )
+            counts["bbox_recovery_form_candidates"] += sum(
+                item.get("kind") in {"form_region", "demoted_form_region"}
+                for item in recovery_manifest
+            )
             if recovery_manifest and bbox_recovery_reviewer is None:
                 counts["bbox_recovery_errors"] += 1
                 recovery_batches.append(
@@ -4083,6 +4691,7 @@ def fuse_middle_json(
                         "orphan_added",
                         "fringe_added",
                         "checkbox_added",
+                        "form_added",
                         "checkbox_merged",
                         "list_marker_merged",
                         "ink_marker_merged",
@@ -4100,10 +4709,18 @@ def fuse_middle_json(
             else None
         )
         if settings.bbox_recognition_enabled:
+            all_normal_recognition_lines = collect_text_lines(
+                ocr_page,
+                page_index,
+            )
             normal_recognition_lines = (
-                collect_text_lines(ocr_page, page_index)
+                all_normal_recognition_lines
                 if settings.bbox_recognition_normal_ocr_enabled
-                else []
+                else [
+                    line
+                    for line in all_normal_recognition_lines
+                    if line.spans[0].get("fusion_recovered_bbox")
+                ]
             )
             table_recognition_lines = (
                 collect_table_ocr_lines(ocr_page, page_index)

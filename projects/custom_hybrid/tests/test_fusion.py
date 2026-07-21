@@ -10,6 +10,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from projects.custom_hybrid.fusion import (
     FusionSettings,
     OpenAIVisionVerifier,
+    _normalize_recovered_terminal_date_candidate,
     _parse_verifier_text,
     _parse_reconciliation_ids,
     apply_bbox_recognition,
@@ -21,6 +22,7 @@ from projects.custom_hybrid.fusion import (
     collect_table_ocr_lines,
     collect_text_lines,
     collect_unreliable_table_ocr_lines,
+    demote_narrative_false_tables,
     fuse_middle_json,
     recover_table_cell_geometry,
     select_bbox_recognition_candidate,
@@ -95,6 +97,84 @@ def structured_middle(
 
 
 class FusionTests(unittest.TestCase):
+    def test_page_sized_narrative_false_table_is_demoted_before_recovery(self):
+        narrative = "Narrative legal disclosure text " * 30
+        cells = [
+            {
+                "bbox": [10, 20, 190, 100],
+                "text": narrative,
+                "content_spans": [
+                    {"bbox": [12, 25, 188, 95], "text": narrative}
+                ],
+                "row_start": 0,
+                "row_end": 0,
+                "col_start": 0,
+                "col_end": 3,
+            },
+            {
+                "bbox": [10, 100, 190, 180],
+                "text": narrative,
+                "content_spans": [
+                    {"bbox": [12, 105, 188, 175], "text": narrative}
+                ],
+                "row_start": 1,
+                "row_end": 1,
+                "col_start": 0,
+                "col_end": 3,
+            },
+            {
+                "bbox": [140, 185, 190, 215],
+                "text": "Date (DD/MM/YYYY)",
+                "content_spans": [
+                    {"bbox": [142, 188, 175, 198], "text": "Date"}
+                ],
+                "row_start": 2,
+                "row_end": 2,
+                "col_start": 3,
+                "col_end": 3,
+            },
+            *[
+                {
+                    "bbox": [10 + index * 30, 220, 35 + index * 30, 240],
+                    "text": f"Cell {index}",
+                    "content_spans": [
+                        {
+                            "bbox": [12 + index * 30, 224, 33 + index * 30, 235],
+                            "text": f"Cell {index}",
+                        }
+                    ],
+                    "row_start": 3,
+                    "row_end": 3,
+                    "col_start": index,
+                    "col_end": index,
+                }
+                for index in range(3)
+            ],
+        ]
+        document = structured_middle(
+            "table",
+            html="<table><tr><td>narrative</td></tr></table>",
+            table_cells=cells,
+        )
+        page = document["pdf_info"][0]
+        page["page_size"] = [200, 300]
+        block = page["preproc_blocks"][0]
+        block["bbox"] = [10, 10, 190, 250]
+        block["lines"][0]["bbox"] = [10, 10, 190, 250]
+        block["lines"][0]["spans"][0]["bbox"] = [10, 10, 190, 250]
+
+        stats = demote_narrative_false_tables(document)
+
+        self.assertEqual(stats["tables"], 1)
+        self.assertEqual(len(collect_table_geometry_quality(page, 0)), 0)
+        self.assertEqual(len(collect_text_lines(page, 0)), 6)
+        self.assertEqual(
+            page["demoted_narrative_recovery_regions"][0]["cells"][0][
+                "text"
+            ],
+            "Date (DD/MM/YYYY)",
+        )
+
     def test_bbox_vlm_settings_enable_repair_and_table_recognizer(self):
         settings = FusionSettings.from_mapping(
             {
@@ -503,6 +583,79 @@ class FusionTests(unittest.TestCase):
         self.assertEqual(report["counts"]["bbox_recognition_native_cache_hits"], 1)
         self.assertTrue(
             report["recovery_invariants"]["table_and_cell_geometry_unchanged"]
+        )
+
+    def test_bbox_vlm_form_repair_runs_before_recognition_when_normal_ocr_disabled(self):
+        pipeline = middle(
+            "Admission Date / Discharge Date",
+            bbox=(10, 10, 105, 24),
+        )
+        page = pipeline["pdf_info"][0]
+        page["form_regions"] = [{"bbox": [5, 5, 195, 70]}]
+        page["form_cells"] = [
+            {
+                "bbox": [5, 5, 195, 70],
+                "recognition_bbox": [5, 5, 195, 70],
+                "form_region_index": 0,
+                "row_index": 0,
+                "column_index": 0,
+                "kind": "semantic_row",
+                "ocr_text": "Admission Date / Discharge Date",
+            }
+        ]
+
+        def review(_page, _size, manifest):
+            form = next(item for item in manifest if item["kind"] == "form_region")
+            self.assertTrue(form["cells"][0]["form_recover_text"])
+            return {
+                "tables_reviewed": 1,
+                "local_proposals": 1,
+                "items": [
+                    {
+                        "action": "add",
+                        "cell_id": "p0-f0-c0",
+                        "target_id": "",
+                        "bbox": [120, 35, 185, 52],
+                        "confidence": 0.96,
+                        "recovery_source": "local_uncovered_pixel_ink",
+                    }
+                ],
+            }
+
+        def recognize(_page, _size, candidates):
+            self.assertEqual(len(candidates), 1)
+            self.assertTrue(candidates[0]["recovered"])
+            self.assertEqual(candidates[0]["bbox"], [120.0, 35.0, 185.0, 52.0])
+            return {
+                "items": [
+                    {"id": candidates[0]["id"], "text": "10/10/2024"}
+                ]
+            }
+
+        fused, report = fuse_middle_json(
+            pipeline,
+            pipeline,
+            FusionSettings.from_mapping(
+                {
+                    "mode": "bbox_vlm",
+                    "recognizer": {"normal_ocr_enabled": False},
+                }
+            ),
+            bbox_recovery_reviewer=review,
+            bbox_recognizer=recognize,
+        )
+
+        recovered = [
+            line
+            for line in collect_text_lines(fused["pdf_info"][0], 0)
+            if line.spans[0].get("fusion_recovery_form")
+        ]
+        self.assertEqual([line.text for line in recovered], ["10/10/2024"])
+        self.assertEqual(report["counts"]["bbox_recovery_form_candidates"], 1)
+        self.assertEqual(report["counts"]["bbox_recovery_form_added"], 1)
+        self.assertEqual(
+            report["counts"]["bbox_recognition_recovered_candidates"],
+            1,
         )
 
     def test_bbox_vlm_candidate_budget_preserves_recovered_crop(self):
@@ -2493,6 +2646,89 @@ class FusionTests(unittest.TestCase):
             decisions[0]["vlm_text_normalization"],
             "terminal_date_extraction",
         )
+        self.assertFalse(
+            lines[0].source_span.get("fusion_visualization_hidden", False)
+        )
+
+    def test_form_date_recovery_extracts_date_from_uncovered_ink_crop(self):
+        metadata = {
+            "fusion_recovery_source": "local_uncovered_pixel_ink",
+            "fusion_recovery_form": True,
+            "fusion_recovery_terminal_field_kind": "date",
+        }
+
+        self.assertEqual(
+            _normalize_recovered_terminal_date_candidate(
+                r"\( ^{11} \) (1) 2/12/2024",
+                metadata,
+            ),
+            "2/12/2024",
+        )
+        self.assertEqual(
+            _normalize_recovered_terminal_date_candidate(
+                "reference 2/12/2024",
+                {**metadata, "fusion_recovery_form": False},
+            ),
+            "reference 2/12/2024",
+        )
+
+    def test_local_checkbox_state_is_not_overwritten_by_vlm_garbage(self):
+        page = structured_middle(
+            "table",
+            html="<table><tr><td></td></tr></table>",
+            table_cells=[
+                {
+                    "bbox": [10, 10, 190, 80],
+                    "content_spans": [
+                        {
+                            "bbox": [20, 20, 30, 30],
+                            "text": "☐",
+                            "fusion_recovery_source": "local_checkbox_detector",
+                            "fusion_recovery_confidence": 0.95,
+                            "fusion_recovery_action": "add_checkbox",
+                            "fusion_recovery_checkbox": True,
+                            "fusion_checkbox_state": "unchecked",
+                        }
+                    ],
+                    "text": "",
+                    "row_start": 0,
+                    "row_end": 0,
+                    "col_start": 0,
+                    "col_end": 0,
+                }
+            ],
+        )["pdf_info"][0]
+        lines = collect_table_ocr_lines(page, 0)
+        settings = FusionSettings.from_mapping({"mode": "bbox_vlm"})
+
+        garbage = select_bbox_recognition_candidate(lines[0], "图", settings)
+        opposite = select_bbox_recognition_candidate(lines[0], "☑", settings)
+        matching = select_bbox_recognition_candidate(lines[0], "☐", settings)
+
+        self.assertEqual(garbage[:2], ("ocr", "checkbox_state_guard"))
+        self.assertEqual(opposite[:2], ("ocr", "checkbox_state_guard"))
+        self.assertEqual(matching[:2], ("vlm", "empty_ocr_vlm_recovery"))
+
+        def recognize(_page, _size, candidates):
+            return {
+                "items": [{"id": candidates[0]["id"], "text": "[NO TEXT]"}],
+                "batches": [{"status": "ok", "ids": [candidates[0]["id"]]}],
+            }
+
+        stats, decisions, _batches = apply_bbox_recognition(
+            0,
+            [200, 300],
+            lines,
+            FusionSettings(
+                bbox_recognition_enabled=True,
+                bbox_recognition_batch_guard_enabled=False,
+            ),
+            recognize,
+        )
+
+        self.assertEqual(stats["ocr_kept"], 1)
+        self.assertEqual(lines[0].text, "☐")
+        self.assertEqual(decisions[0]["reason"], "checkbox_state_guard")
         self.assertFalse(
             lines[0].source_span.get("fusion_visualization_hidden", False)
         )

@@ -34,6 +34,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from projects.custom_hybrid.fusion import (
     FusionSettings,
     OpenAIVisionVerifier,
+    demote_narrative_false_tables,
     fuse_middle_json,
     normalize_fusion_mode,
     recover_table_cell_geometry,
@@ -1985,6 +1986,25 @@ def fuse_output_trees(
                 )
             hybrid_middle = json.loads(hybrid_path.read_text(encoding="utf-8"))
             ocr_middle = json.loads(ocr_path.read_text(encoding="utf-8"))
+            structure_report = None
+            structure_error = None
+            if (
+                form_detection_enabled
+                and settings.mode == "bbox_vlm"
+                and vision_document_path is not None
+            ):
+                try:
+                    demote_narrative_false_tables(ocr_middle)
+                    structure_report = annotate_form_structure(
+                        ocr_middle,
+                        vision_document_path,
+                        form_detection_settings,
+                    )
+                except Exception as exc:
+                    structure_error = {
+                        "status": "error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
             fused_middle, report = fuse_middle_json(
                 hybrid_middle,
                 ocr_middle,
@@ -2010,6 +2030,16 @@ def fuse_output_trees(
                         "status": "skipped",
                         "reason": "source_document_unavailable",
                     }
+                elif structure_report is not None:
+                    report["form_detection"] = structure_report[
+                        "form_detection"
+                    ]
+                    report["form_segmentation"] = structure_report[
+                        "form_segmentation"
+                    ]
+                elif structure_error is not None:
+                    report["form_detection"] = structure_error
+                    report["form_segmentation"] = dict(structure_error)
                 else:
                     try:
                         structure_report = annotate_form_structure(
