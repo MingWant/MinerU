@@ -1627,6 +1627,7 @@ def _regenerate_fused_outputs(
     parse_dir: Path,
     document_stem: str,
     source_document: Path | None = None,
+    semantic_markdown_config: Mapping[str, Any] | None = None,
 ) -> tuple[Path, ...]:
     if str(REPOSITORY_ROOT) not in sys.path:
         sys.path.insert(0, str(REPOSITORY_ROOT))
@@ -1634,12 +1635,46 @@ def _regenerate_fused_outputs(
 
     generated = list(regenerate_client_side_outputs(parse_dir, document_stem))
     generated.extend(
+        _generate_semantic_markdown_outputs(
+            parse_dir,
+            document_stem,
+            semantic_markdown_config or {},
+        )
+    )
+    generated.extend(
         _generate_fused_visualizations(
             parse_dir,
             document_stem,
             source_document,
         )
     )
+    return tuple(generated)
+
+
+def _generate_semantic_markdown_outputs(
+    parse_dir: Path,
+    document_stem: str,
+    config: Mapping[str, Any],
+) -> tuple[Path, ...]:
+    if not config.get("enabled", False):
+        return ()
+    from projects.custom_hybrid.semantic_markdown import write_semantic_markdown
+
+    middle_path = parse_dir / f"{document_stem}_middle.json"
+    primary_path = parse_dir / f"{document_stem}.md"
+    replace_primary = bool(config.get("replace_primary", True))
+    preserve_native = bool(config.get("preserve_native", True))
+    generated = []
+    if replace_primary:
+        if preserve_native and primary_path.is_file():
+            native_path = parse_dir / f"{document_stem}_native.md"
+            shutil.copy2(primary_path, native_path)
+            generated.append(native_path)
+        write_semantic_markdown(middle_path, primary_path)
+    else:
+        semantic_path = parse_dir / f"{document_stem}_semantic.md"
+        write_semantic_markdown(middle_path, semantic_path)
+        generated.append(semantic_path)
     return tuple(generated)
 
 
@@ -2006,6 +2041,7 @@ def fuse_output_trees(
                 fused_path.parent,
                 stem,
                 vision_document_path,
+                fusion_config.get("semantic_markdown", {}),
             )
             summary["documents"][stem] = {
                 "middle_json": str(fused_path),

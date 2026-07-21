@@ -119,6 +119,19 @@ guard. Repair is part of this same OCR post-processing pipeline: Table/Cell
 geometry and the Table grid remain immutable while missing or incomplete content
 boxes are added or adjusted before recognition.
 
+When `fusion.semantic_markdown.enabled=true`, the fused middle JSON is also
+rendered into a deterministic semantic Markdown view (`<document>.md`). The
+renderer uses OCR span geometry, Cell row/column metadata, and conservative
+field-type checks rather than document-specific names or coordinates. It pairs
+labels with values in the same Cell or an adjacent value Cell, joins split
+checkbox/list markers, rebuilds ledger tables, removes repeated page metadata,
+and normalizes common dates and amounts. The label vocabulary covers common
+claim, member, provider, contact, identifier, address, date, email, postal-code,
+and amount fields, so new form layouts do not require PDF-specific rules. Set
+`preserve_native=true` to keep `<document>_native.md` for direct A/B comparison
+with MinerU's original Markdown. The output marker `semantic-markdown-v3`
+identifies this renderer version.
+
 Each fused parse directory also contains `<document>_fusion.json`, which records
 the bbox, candidates, confidence, similarity, and decision for every conflict.
 The vLLM JSONL audit log contains applied parameter names, latency, status, and a

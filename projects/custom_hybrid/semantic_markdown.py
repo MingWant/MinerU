@@ -10,25 +10,38 @@ import re
 import statistics
 from collections import defaultdict
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 
-SEMANTIC_MARKDOWN_VERSION = 1
+SEMANTIC_MARKDOWN_VERSION = 3
 
 SECTION_RE = re.compile(
     r"^(?:PART\s+(?:[IVXLC]+|\d+|[A-Z])\b|POINTS? TO NOTE\b|IMPORTANT NOTES?\b|"
     r"CONSULTANT(?:'S)? INFORMATION\b|INSURED(?:'S)? INFORMATION\b|"
     r"PAYMENT INSTRUCTION\b|DETAILS? OF\b|STATEMENT OF ACCOUNT\b|"
-    r"HOSPITAL BILL\b|個人資料|注意事項|顧問資料|受保人資料|支付方式)",
+    r"HOSPITAL BILL\b|DECLARATION AND AUTHORIZATION\b|"
+    r"PERSONAL INFORMATION COLLECTION STATEMENT\b|"
+    r"(?:APPLICANT|PATIENT|CONTACT|MEMBER|PROVIDER) INFORMATION\b|"
+    r"MEDICAL HISTORY\b|PAYMENT DETAILS\b|DECLARATION\b|AUTHORIZATION\b|CONSENT\b|"
+    r"個人資料|注意事項|顧問資料|受保人資料|支付方式|聲明及授權)",
     flags=re.IGNORECASE,
 )
 FIELD_LABEL_RE = re.compile(
-    r"(?:\b(?:policy|claim|patient|hospital|account|invoice|bill|room|"
-    r"name|date|age|sex|gender|address|phone|telephone|mobile|email|"
-    r"code|occupation|diagnosis|result|amount|balance|doctor|physician)"
-    r"\b|保單|索償|病人|醫院|帳戶|賬單|房號|姓名|日期|年齡|性別|"
-    r"地址|電話|電郵|編號|職業|診斷|結果|金額|結餘|醫生)",
+    r"(?:\b(?:policy(?:\s*(?:no|number|id))?|"
+    r"claim(?:\s*(?:no|number|id|date|reference|amount)|ed\s+benefit)|"
+    r"case\s+type|patient\s*(?:no|number|name)|hospital\s*(?:no|number|name)|"
+    r"account\s*(?:no|number)|invoice\s*(?:no|number|date)|bill\s*(?:no|number|date)|"
+    r"(?:member|subscriber|customer|provider|employee|group)\s*(?:id|no|number|code)|"
+    r"(?:reference|certificate|application|order)\s*(?:id|no|number)|"
+    r"social\s+security(?:\s*(?:no|number))?|ssn|date\s+of\s+birth|dob|"
+    r"postal\s*code|zip\s*code|"
+    r"room\s*(?:no|number)|name|date|time|age|sex|gender|address|phone|telephone|"
+    r"mobile|email|code|occupation|diagnosis|result|amount|balance|doctor|physician|"
+    r"district|branch|id\s*/?\s*passport|i\.?d\.?\s*(?:no|number)|"
+    r"test|investigation|qualification)\b|保單|索償|病人|醫院|帳戶|賬單|房號|姓名|日期|年齡|性別|"
+    r"地址|電話|電郵|編號|身份[證証]|護照|職業|診斷|結果|金額|結餘|分行|區域)",
     flags=re.IGNORECASE,
 )
 LIST_ITEM_RE = re.compile(r"^(?:\d{1,3}[.)、:：]|\(\d{1,3}\))\s*")
@@ -48,18 +61,21 @@ NOISE_TEXT_RE = re.compile(
     flags=re.IGNORECASE,
 )
 DATE_VALUE_RE = re.compile(
-    r"^\s*\d{1,2}(?:[/.-]\d{1,2}[/.-]\d{2,4}|-[A-Za-z]{3}-\d{2,4})"
+    r"^\s*(?:\d{1,2}(?:[/.-]\d{1,2}[/.-]\d{2,4}|-[A-Za-z]{3}-\d{2,4})|"
+    r"\d{4}-\d{1,2}-\d{1,2})"
     r"(?:\s*[: ]?\s*\d{1,2}:\d{2})?\s*$",
     flags=re.IGNORECASE,
 )
 DATE_TOKEN_RE = re.compile(
-    r"\d{1,2}(?:[/.-]\d{1,2}[/.-]\d{2,4}|-[A-Za-z]{3}-\d{2,4})"
-    r"(?::?\d{1,2}:\d{2})?",
+    r"(?:\d{1,2}(?:[/.-]\d{1,2}[/.-]\d{2,4}|-[A-Za-z]{3}-\d{2,4})|"
+    r"\d{4}-\d{1,2}-\d{1,2})"
+    r"(?:\s*:?\s*\d{1,2}:\d{2})?",
     flags=re.IGNORECASE,
 )
 TIME_VALUE_RE = re.compile(r"^\s*\d{1,2}:\d{2}\s*$")
 MONEY_VALUE_RE = re.compile(
-    r"^\s*[$(]?[-+]?\s*[0-9OoIl][0-9OoIl, .]*-?"
+    r"^\s*(?:(?:HKD|USD|EUR|GBP|RMB|CNY)\s*)?[$€£¥(]?[-+]?\s*"
+    r"[0-9OoIl][0-9OoIl, .]*-?"
     r"\s*(?:\([^)]{1,40}\))?\s*\)?$",
     flags=re.IGNORECASE,
 )
@@ -82,6 +98,54 @@ TITLE_HINT_RE = re.compile(
     r"\b(?:CLAIM|FORM|BILL|RECEIPT|STATEMENT|INFORMATION|INSTRUCTION|NOTES?)\b|"
     r"申請表|賬單|帳單|收據|資料|指示|注意事項",
     flags=re.IGNORECASE,
+)
+INSTRUCTION_TEXT_RE = re.compile(
+    r"\b(?:if|please|must|shall|will|may|agree|authorize|authorise|"
+    r"subject to|according to|required|reserve the right)\b|"
+    r"(?:如有|若|必須|同意|授權|根據|要求|保留)",
+    flags=re.IGNORECASE,
+)
+FORM_PROMPT_RE = re.compile(
+    r"^(?:\d{1,3}[.)、:]|\([A-Za-z0-9]{1,3}\)|[ivx]{1,4}[.)])\s*",
+    flags=re.IGNORECASE,
+)
+QUESTION_PROMPT_RE = re.compile(
+    r"^(?:are|did|do|does|have|has|was|were|is|can|could|will|would)\b|[?？]\s*$",
+    flags=re.IGNORECASE,
+)
+LABEL_QUALIFIER_RE = re.compile(
+    r"^\(?\s*(?:with\s+stamp|dd\s*/\s*mm\s*/\s*yy|mm\s*/\s*yy|"
+    r"day\s*/\s*month\s*/\s*year)\s*\)?\s*[:：]?\s*$",
+    flags=re.IGNORECASE,
+)
+PARTIAL_DATE_VALUE_RE = re.compile(r"^\s*\d{1,2}\s*[/.-]\s*\d{2,4}\s*$")
+IDENTIFIER_LABEL_RE = re.compile(
+    r"\b(?:id|passport|member|subscriber|customer|provider|employee|group|"
+    r"reference|certificate|application|order)\s*(?:no|number|id|code)?\b|"
+    r"social\s+security|\bssn\b|身份[證証]|護照",
+    flags=re.IGNORECASE,
+)
+EMAIL_LABEL_RE = re.compile(r"\bemail\b|電郵", flags=re.IGNORECASE)
+POSTAL_LABEL_RE = re.compile(
+    r"\b(?:postal|zip)\s*code\b", flags=re.IGNORECASE
+)
+AMOUNT_LABEL_RE = re.compile(
+    r"\b(?:amount|total|charge|price|fee|balance)\b|金額|總計|結餘",
+    flags=re.IGNORECASE,
+)
+OPTION_TEXT_RE = re.compile(
+    r"^(?:new|further|mail|via|pay|credit|please|other|china unionpay|"
+    r"yes|no|by cheque|others?)\b",
+    flags=re.IGNORECASE,
+)
+COMPACT_DATE_RE = re.compile(
+    r"(?<!\d)(\d{1,2})\s*/\s*(\d{2})(\d{2})(?!\d)"
+)
+PIPE_DATE_RE = re.compile(
+    r"(?<!\d)(\d{1,2})\s*\|\s*(\d{1,2})\s*\|\s*(\d{2,4})(?!\d)"
+)
+REPEATED_GROUPED_AMOUNT_RE = re.compile(
+    r"(?<!\d)(\d{1,3})[.,](\d{3})[.,](\d{2})(?!\d)"
 )
 
 LEDGER_PATTERNS = {
@@ -110,6 +174,9 @@ LEDGER_LABELS = {
 class SemanticLine:
     bbox: tuple[float, float, float, float]
     text: str
+    cell_row: int | None = None
+    cell_col: int | None = None
+    cell_bbox: tuple[float, float, float, float] | None = None
 
     @property
     def center_x(self) -> float:
@@ -140,6 +207,20 @@ def _valid_bbox(value: Any) -> tuple[float, float, float, float] | None:
     return bbox
 
 
+def _repair_compact_date(match: re.Match[str]) -> str:
+    day, month, year = match.groups()
+    if 1 <= int(day) <= 31 and 1 <= int(month) <= 12:
+        return f"{int(day)}/{month}/{year}"
+    return match.group(0)
+
+
+def _repair_pipe_date(match: re.Match[str]) -> str:
+    day, month, year = match.groups()
+    if 1 <= int(day) <= 31 and 1 <= int(month) <= 12:
+        return f"{int(day)}/{int(month):02d}/{year}"
+    return match.group(0)
+
+
 def _clean_text(value: Any) -> str:
     if not isinstance(value, str):
         return ""
@@ -154,6 +235,18 @@ def _clean_text(value: Any) -> str:
         flags=re.IGNORECASE,
     )
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = COMPACT_DATE_RE.sub(_repair_compact_date, text)
+    text = PIPE_DATE_RE.sub(_repair_pipe_date, text)
+    text = REPEATED_GROUPED_AMOUNT_RE.sub(
+        lambda match: f"{match.group(1)},{match.group(2)}.{match.group(3)}",
+        text,
+    )
+    text = re.sub(
+        r"(\b\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4})[.;,。]+$",
+        r"\1",
+        text,
+    )
+    text = re.sub(r"(?<=\d{4})(?=\d{1,2}:\d{2}\b)", " ", text)
     lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines()]
     return "\n".join(line for line in lines if line).strip()
 
@@ -204,6 +297,10 @@ def _checkbox_text(span: Mapping[str, Any], text: str) -> str:
 def _lines_from_text(
     bbox: tuple[float, float, float, float],
     text: str,
+    *,
+    cell_row: int | None = None,
+    cell_col: int | None = None,
+    cell_bbox: tuple[float, float, float, float] | None = None,
 ) -> list[SemanticLine]:
     parts = [line.strip() for line in text.splitlines() if line.strip()]
     if not parts:
@@ -218,9 +315,46 @@ def _lines_from_text(
                 bbox[1] + (index + 1) * line_height,
             ),
             part,
+            cell_row,
+            cell_col,
+            cell_bbox,
         )
         for index, part in enumerate(parts)
     ]
+
+
+def _prune_aggregate_span_records(
+    records: Sequence[
+        tuple[Mapping[str, Any], tuple[float, float, float, float], str]
+    ],
+) -> list[tuple[Mapping[str, Any], tuple[float, float, float, float], str]]:
+    """Prefer content-tight child spans over a duplicated aggregate OCR span."""
+    skipped: set[int] = set()
+    for index, (_span, bbox, text) in enumerate(records):
+        normalized = _normalized(text)
+        if len(normalized) < 12:
+            continue
+        represented = []
+        for other_index, (_other_span, other_bbox, other_text) in enumerate(records):
+            if other_index == index:
+                continue
+            other_normalized = _normalized(other_text)
+            center_x = (other_bbox[0] + other_bbox[2]) / 2
+            center_y = (other_bbox[1] + other_bbox[3]) / 2
+            if (
+                len(other_normalized) >= 3
+                and other_normalized in normalized
+                and bbox[0] - 2.0 <= center_x <= bbox[2] + 2.0
+                and bbox[1] - 2.0 <= center_y <= bbox[3] + 2.0
+            ):
+                represented.append(other_normalized)
+        if (
+            len(set(represented)) >= 2
+            and sum(len(item) for item in set(represented))
+            >= len(normalized) * 0.45
+        ):
+            skipped.add(index)
+    return [record for index, record in enumerate(records) if index not in skipped]
 
 
 def _visible_cell_lines(
@@ -229,8 +363,12 @@ def _visible_cell_lines(
 ) -> list[SemanticLine]:
     result = []
     excluded = excluded_keys or set()
+    cell_bbox = _valid_bbox(cell.get("bbox"))
+    cell_row = cell.get("row_start") if isinstance(cell.get("row_start"), int) else None
+    cell_col = cell.get("col_start") if isinstance(cell.get("col_start"), int) else None
     raw_spans = cell.get("content_spans", [])
     if isinstance(raw_spans, list):
+        records = []
         for span in raw_spans:
             if (
                 not isinstance(span, Mapping)
@@ -246,20 +384,34 @@ def _visible_cell_lines(
             bbox = _valid_bbox(span.get("bbox"))
             text = _checkbox_text(span, _span_text(span))
             if bbox is not None and text:
-                result.extend(
+                records.append((span, bbox, text))
+        for _span, bbox, text in _prune_aggregate_span_records(records):
+            result.extend(
                     line
-                    for line in _lines_from_text(bbox, text)
+                    for line in _lines_from_text(
+                        bbox,
+                        text,
+                        cell_row=cell_row,
+                        cell_col=cell_col,
+                        cell_bbox=cell_bbox,
+                    )
                     if not FOOTER_RE.search(line.text)
                     and not NOISE_TEXT_RE.fullmatch(line.text)
                     and _normalized(line.text) not in excluded
                 )
     if not result:
-        bbox = _valid_bbox(cell.get("content_bbox")) or _valid_bbox(cell.get("bbox"))
+        bbox = _valid_bbox(cell.get("content_bbox")) or cell_bbox
         text = _clean_text(cell.get("text"))
         if bbox is not None and text:
             result.extend(
                 line
-                for line in _lines_from_text(bbox, text)
+                for line in _lines_from_text(
+                    bbox,
+                    text,
+                    cell_row=cell_row,
+                    cell_col=cell_col,
+                    cell_bbox=cell_bbox,
+                )
                 if not FOOTER_RE.search(line.text)
                 and not NOISE_TEXT_RE.fullmatch(line.text)
                 and _normalized(line.text) not in excluded
@@ -267,19 +419,151 @@ def _visible_cell_lines(
     return _deduplicate_lines(result)
 
 
-def _deduplicate_lines(lines: Sequence[SemanticLine]) -> list[SemanticLine]:
-    result = []
-    seen = set()
-    for line in sorted(lines, key=lambda item: (item.bbox[1], item.bbox[0])):
-        key = (
-            _normalized(line.text),
-            tuple(round(value, 1) for value in line.bbox),
+def _same_visual_position(left: SemanticLine, right: SemanticLine) -> bool:
+    horizontal = max(
+        0.0,
+        min(left.bbox[2], right.bbox[2]) - max(left.bbox[0], right.bbox[0]),
+    )
+    vertical = max(
+        0.0,
+        min(left.bbox[3], right.bbox[3]) - max(left.bbox[1], right.bbox[1]),
+    )
+    minimum_width = min(
+        left.bbox[2] - left.bbox[0],
+        right.bbox[2] - right.bbox[0],
+    )
+    minimum_height = min(left.height, right.height)
+    return bool(
+        minimum_width > 0
+        and minimum_height > 0
+        and horizontal / minimum_width >= 0.45
+        and vertical / minimum_height >= 0.45
+    )
+
+
+def _equivalent_semantic_text(left: str, right: str) -> bool:
+    normalized_left = _normalized(left)
+    normalized_right = _normalized(right)
+    if not normalized_left or not normalized_right:
+        return False
+    if normalized_left == normalized_right:
+        return True
+    shorter, longer = sorted(
+        (normalized_left, normalized_right),
+        key=len,
+    )
+    if len(shorter) >= 6 and shorter in longer and len(shorter) / len(longer) >= 0.8:
+        return True
+    similarity = SequenceMatcher(None, normalized_left, normalized_right).ratio()
+    same_field = _same_field_label(left, right)
+    return similarity >= (0.72 if same_field else 0.92)
+
+
+def _same_field_label(left: str, right: str) -> bool:
+    left_fields = {
+        _normalized(match.group(0)) for match in FIELD_LABEL_RE.finditer(left)
+    }
+    right_fields = {
+        _normalized(match.group(0)) for match in FIELD_LABEL_RE.finditer(right)
+    }
+    return bool(left_fields & right_fields)
+
+
+def _uses_cell_bbox(line: SemanticLine) -> bool:
+    return bool(
+        line.cell_bbox is not None
+        and all(
+            abs(value - cell_value) <= 1.0
+            for value, cell_value in zip(line.bbox, line.cell_bbox)
         )
-        if not key[0] or key in seen:
+    )
+
+
+def _same_row_adjacent_field_duplicate(
+    left: SemanticLine,
+    right: SemanticLine,
+) -> bool:
+    if (
+        left.cell_row is None
+        or right.cell_row is None
+        or left.cell_row != right.cell_row
+        or left.cell_col is None
+        or right.cell_col is None
+        or abs(left.cell_col - right.cell_col) > 1
+        or not _same_field_label(left.text, right.text)
+    ):
+        return False
+    horizontal_gap = max(
+        left.bbox[0] - right.bbox[2],
+        right.bbox[0] - left.bbox[2],
+        0.0,
+    )
+    return bool(
+        horizontal_gap <= max(12.0, left.height, right.height)
+        and abs(left.center_y - right.center_y)
+        <= max(left.height, right.height) * 0.75
+    )
+
+
+def _preferred_duplicate_line(
+    existing: SemanticLine,
+    candidate: SemanticLine,
+) -> SemanticLine:
+    existing_fallback = _uses_cell_bbox(existing)
+    candidate_fallback = _uses_cell_bbox(candidate)
+    if existing_fallback != candidate_fallback:
+        return existing if not existing_fallback else candidate
+    if len(_normalized(candidate.text)) != len(_normalized(existing.text)):
+        return (
+            candidate
+            if len(_normalized(candidate.text)) > len(_normalized(existing.text))
+            else existing
+        )
+    existing_area = (existing.bbox[2] - existing.bbox[0]) * existing.height
+    candidate_area = (candidate.bbox[2] - candidate.bbox[0]) * candidate.height
+    return candidate if candidate_area < existing_area else existing
+
+
+def _deduplicate_lines(lines: Sequence[SemanticLine]) -> list[SemanticLine]:
+    result: list[SemanticLine] = []
+    for line in sorted(lines, key=lambda item: (item.bbox[1], item.bbox[0])):
+        if not _normalized(line.text):
             continue
-        seen.add(key)
+        duplicate_index = next(
+            (
+                index
+                for index, existing in enumerate(result)
+                if (
+                    _same_visual_position(line, existing)
+                    or _same_row_adjacent_field_duplicate(line, existing)
+                    or (
+                        _same_field_label(line.text, existing.text)
+                        and abs(line.center_y - existing.center_y)
+                        <= max(line.height, existing.height) * 1.5
+                        and max(
+                            0.0,
+                            min(line.bbox[2], existing.bbox[2])
+                            - max(line.bbox[0], existing.bbox[0]),
+                        )
+                        / min(
+                            line.bbox[2] - line.bbox[0],
+                            existing.bbox[2] - existing.bbox[0],
+                        )
+                        >= 0.25
+                    )
+                )
+                and _equivalent_semantic_text(line.text, existing.text)
+            ),
+            None,
+        )
+        if duplicate_index is not None:
+            result[duplicate_index] = _preferred_duplicate_line(
+                result[duplicate_index],
+                line,
+            )
+            continue
         result.append(line)
-    return result
+    return sorted(result, key=lambda item: (item.bbox[1], item.bbox[0]))
 
 
 def _vertical_overlap(left: SemanticLine, right: SemanticLine) -> float:
@@ -455,8 +739,10 @@ def _ledger_column_for_line(
     return min(range(len(centers)), key=lambda index: abs(line.center_x - centers[index]))
 
 
-def _ledger_date_values(lines: Sequence[SemanticLine]) -> list[str]:
-    result = []
+def _ledger_date_entries(
+    lines: Sequence[SemanticLine],
+) -> list[tuple[SemanticLine, str]]:
+    result: list[tuple[SemanticLine, str]] = []
     times = [line for line in lines if TIME_VALUE_RE.fullmatch(line.text)]
     for line in sorted(lines, key=lambda item: (item.bbox[1], item.bbox[0])):
         match = DATE_TOKEN_RE.search(line.text)
@@ -471,12 +757,76 @@ def _ledger_date_values(lines: Sequence[SemanticLine]) -> list[str]:
             )
             if close_time is not None and abs(close_time.center_y - line.center_y) <= 15:
                 value += " " + close_time.text.strip()
-        if value not in result:
-            result.append(value)
+        if not any(
+            value == existing_value
+            and abs(line.center_y - existing_line.center_y) <= 2.0
+            for existing_line, existing_value in result
+        ):
+            result.append((line, value))
     return result
 
 
-def _render_ledger_tail(lines: Sequence[SemanticLine]) -> str:
+def _ledger_date_values(lines: Sequence[SemanticLine]) -> list[str]:
+    return [value for _line, value in _ledger_date_entries(lines)]
+
+
+def _ledger_labeled_date_values(
+    lines: Sequence[SemanticLine],
+) -> dict[str, str]:
+    label_patterns = {
+        "admitted": re.compile(r"Date\s+Admitted|入院日期", re.IGNORECASE),
+        "discharged": re.compile(r"Date\s+Discharged|出院日期", re.IGNORECASE),
+    }
+    label_centers = {
+        name: statistics.mean(line.center_y for line in matches)
+        for name, pattern in label_patterns.items()
+        if (matches := [line for line in lines if pattern.search(line.text)])
+    }
+    entries = _ledger_date_entries(lines)
+    pair_candidates = sorted(
+        (
+            abs(line.center_y - center_y),
+            name,
+            index,
+            value,
+        )
+        for name, center_y in label_centers.items()
+        for index, (line, value) in enumerate(entries)
+    )
+    assigned_fields: dict[str, str] = {}
+    assigned_entries: set[int] = set()
+    for distance, name, index, value in pair_candidates:
+        if distance > 60.0 or name in assigned_fields or index in assigned_entries:
+            continue
+        assigned_fields[name] = value
+        assigned_entries.add(index)
+    return assigned_fields
+
+
+def _append_unique_ledger_text(
+    parts: list[str],
+    seen: list[str] | None,
+    text: str,
+) -> None:
+    key = _output_text_key(text)
+    if not key:
+        return
+    if seen is not None:
+        duplicate = (
+            key in seen
+            if text.lstrip().startswith("- **")
+            else any(_equivalent_semantic_text(key, existing) for existing in seen)
+        )
+        if duplicate:
+            return
+        seen.append(key)
+    parts.append(text)
+
+
+def _render_ledger_tail(
+    lines: Sequence[SemanticLine],
+    seen: list[str] | None = None,
+) -> str:
     if not lines:
         return ""
     joined = " ".join(line.text for line in lines)
@@ -484,10 +834,10 @@ def _render_ledger_tail(lines: Sequence[SemanticLine]) -> str:
     has_discharged = bool(
         re.search(r"Date\s+Discharged|出院日期", joined, re.IGNORECASE)
     )
-    date_values = _ledger_date_values(lines)
+    labeled_dates = _ledger_labeled_date_values(lines)
     parts = []
     if any(re.search(r"\[DISCHARGED\]", line.text, re.IGNORECASE) for line in lines):
-        parts.append("### Discharged / 出院")
+        _append_unique_ledger_text(parts, seen, "### Discharged / 出院")
     remaining = [
         line
         for line in lines
@@ -502,24 +852,42 @@ def _render_ledger_tail(lines: Sequence[SemanticLine]) -> str:
     for group in _group_visual_rows(remaining):
         text = _join_row_lines(group)
         if text and len(_normalized(text)) >= 2 and not NOISE_TEXT_RE.fullmatch(text):
-            parts.append(text)
-    if has_admitted:
-        value = date_values[0] if date_values else ""
-        parts.append("- **Date Admitted / 入院日期**" + (f": {value}" if value else ""))
-    if has_discharged:
-        value = date_values[1] if len(date_values) >= 2 else ""
-        parts.append("- **Date Discharged / 出院日期**" + (f": {value}" if value else ""))
+            _append_unique_ledger_text(parts, seen, text)
+    if has_admitted and (value := labeled_dates.get("admitted")):
+        _append_unique_ledger_text(
+            parts,
+            seen,
+            f"- **Date Admitted / 入院日期**: {value}",
+        )
+    if has_discharged and (value := labeled_dates.get("discharged")):
+        _append_unique_ledger_text(
+            parts,
+            seen,
+            f"- **Date Discharged / 出院日期**: {value}",
+        )
     return "\n\n".join(parts)
 
 
 def _render_ledger_table(
     table: Mapping[str, Any],
     excluded_keys: set[str] | None = None,
+    seen_preheaders: set[str] | None = None,
+    seen_tail: list[str] | None = None,
 ) -> str | None:
-    lines = _table_lines(table, excluded_keys)
+    lines = _table_lines(table)
     header = _ledger_header(lines)
     if header is None:
         return None
+    if excluded_keys:
+        lines = [
+            line
+            for line in lines
+            if _normalized(line.text) not in excluded_keys
+            or _ledger_category(line.text) is not None
+        ]
+        header = _ledger_header(lines)
+        if header is None:
+            return None
     columns, header_top, header_bottom = header
     headers = [LEDGER_LABELS[category] for category, _line in columns]
     preheader_lines = [line for line in lines if line.bbox[3] < header_top - 1.0]
@@ -554,9 +922,17 @@ def _render_ledger_table(
             _join_row_lines(group)
             for group in _group_visual_rows(preheader_lines)
         ]
-        parts.extend(line for line in preheader if line and not FOOTER_RE.search(line))
+        for line in preheader:
+            key = _output_text_key(line)
+            if not line or FOOTER_RE.search(line) or not key:
+                continue
+            if seen_preheaders is not None:
+                if key in seen_preheaders:
+                    continue
+                seen_preheaders.add(key)
+            parts.append(line)
     parts.append(_markdown_table(headers, rows))
-    tail = _render_ledger_tail(tail_lines)
+    tail = _render_ledger_tail(tail_lines, seen_tail)
     if tail:
         parts.append(tail)
     return "\n\n".join(part for part in parts if part)
@@ -564,12 +940,18 @@ def _render_ledger_table(
 
 def _is_section(text: str) -> bool:
     stripped = text.strip()
-    if SECTION_RE.search(stripped):
+    section_candidate = re.sub(
+        r"^(?:\d{1,3}[.)、:]|\([A-Za-z0-9]{1,3}\))\s*",
+        "",
+        stripped,
+    )
+    if SECTION_RE.search(section_candidate):
         return True
     letters = [character for character in stripped if character.isalpha()]
     return bool(
         len(letters) >= 5
         and len(stripped) <= 100
+        and TITLE_HINT_RE.search(stripped) is not None
         and sum(character.isupper() for character in letters) / len(letters) >= 0.8
     )
 
@@ -616,12 +998,502 @@ def _merge_isolated_list_markers(
             )
         else:
             result.extend(ordered)
-    return sorted(result, key=lambda item: (item.bbox[1], item.bbox[0]))
+    return result
 
 
 def _looks_like_field_label(text: str) -> bool:
+    stripped = text.strip()
     match = FIELD_LABEL_RE.search(text)
-    return bool(match and match.start() <= 35 and len(text) <= 120)
+    if not match or match.start() > 35 or len(stripped) > 120:
+        return False
+    if stripped.startswith(("☑", "☐", "☒", "□", "✓", "✔", "■", "◫")):
+        return False
+    if OPTION_TEXT_RE.search(stripped) and not stripped.rstrip().endswith((":", "：")):
+        return False
+    words = re.findall(r"[A-Za-z0-9]+", stripped)
+    cjk_count = len(re.findall(r"[\u3400-\u9fff]", stripped))
+    if len(words) > 18:
+        return False
+    if len(stripped) > 80 and FORM_PROMPT_RE.match(stripped) is None:
+        return False
+    if (
+        cjk_count > 30
+        and FORM_PROMPT_RE.match(stripped) is None
+        and not stripped.rstrip().endswith((":", "："))
+    ):
+        return False
+    if stripped.endswith(("。", "!", "！", "?", "？")) or (
+        stripped.endswith(".")
+        and re.search(r"\b(?:No|Nº)\.$", stripped, re.IGNORECASE) is None
+    ):
+        return False
+    if INSTRUCTION_TEXT_RE.search(stripped) and (
+        len(words) > 8 or len(stripped) > 45
+    ):
+        return False
+    return True
+
+
+def _form_value_candidate(text: str) -> bool:
+    stripped = text.strip()
+    if (
+        not stripped
+        or len(stripped) > 140
+        or _looks_like_field_label(stripped)
+        or _is_section(stripped)
+        or _task_line(stripped) is not None
+        or ISOLATED_LIST_MARKER_RE.fullmatch(stripped)
+        or FORM_PROMPT_RE.match(stripped)
+        or QUESTION_PROMPT_RE.search(stripped)
+        or LABEL_QUALIFIER_RE.fullmatch(stripped)
+        or OPTION_TEXT_RE.search(stripped)
+        or FOOTER_RE.search(stripped)
+        or NOISE_TEXT_RE.fullmatch(stripped)
+    ):
+        return False
+    words = re.findall(r"[A-Za-z0-9]+", stripped)
+    return not INSTRUCTION_TEXT_RE.search(stripped) and len(words) <= 14
+
+
+def _field_value_compatible(label_text: str, value_text: str) -> bool:
+    label = label_text.casefold()
+    value = value_text.strip()
+    date_value = bool(DATE_VALUE_RE.fullmatch(value))
+    qualification_value = bool(
+        re.search(r"\b(?:MBBS|FRCS|FHKAM|qualification)\b", value, re.IGNORECASE)
+    )
+    address_value = bool(
+        re.search(
+            r"\b(?:road|street|avenue|building|tower|floor|flat|room|hong kong|h\.k\.)\b|"
+            r"\d+\s*/?F\b|地址|香港|九龍",
+            value,
+            re.IGNORECASE,
+        )
+    )
+    if re.search(r"\baddress\b|地址", label):
+        return not date_value and not qualification_value
+    if re.search(r"\bdate\b|日期", label):
+        return date_value or bool(TIME_VALUE_RE.fullmatch(value))
+    if re.search(r"\b(?:phone|telephone|mobile)\b|電話", label):
+        return any(character.isdigit() for character in value)
+    if IDENTIFIER_LABEL_RE.search(label):
+        return bool(
+            len(value) <= 50
+            and any(character.isdigit() for character in value)
+            and DATE_VALUE_RE.fullmatch(value) is None
+            and re.search(r"身份[證証]|護照", value) is None
+        )
+    if EMAIL_LABEL_RE.search(label):
+        return "@" in value and not QUESTION_PROMPT_RE.search(value)
+    if POSTAL_LABEL_RE.search(label):
+        return bool(
+            2 <= len(value) <= 16
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 -]*", value) is not None
+        )
+    if AMOUNT_LABEL_RE.search(label):
+        return MONEY_VALUE_RE.fullmatch(value) is not None
+    if re.search(r"\b(?:age|sex|gender)\b|年齡|年龄|性別|性别", label):
+        return bool(
+            PARTIAL_DATE_VALUE_RE.fullmatch(value) is None
+            and (
+                re.search(r"\b(?:M|F|MALE|FEMALE)\b", value, re.IGNORECASE)
+                or re.fullmatch(r"\s*\d{1,3}\s*", value)
+                or re.fullmatch(
+                    r"\s*(?:M|F)\s*[/ -]?\s*\d{1,3}\s*",
+                    value,
+                    re.IGNORECASE,
+                )
+                or re.fullmatch(
+                    r"\s*\d{1,3}\s*[/ -]?\s*(?:M|F)\s*",
+                    value,
+                    re.IGNORECASE,
+                )
+            )
+        )
+    if re.search(r"\b(?:name|occupation|diagnosis)\b|姓名|職業|診斷", label):
+        return bool(
+            not date_value
+            and MONEY_VALUE_RE.fullmatch(value) is None
+            and not address_value
+            and not qualification_value
+            and re.search(r"\b(?:tel|fax|phone)\b", value, re.IGNORECASE) is None
+        )
+    return True
+
+
+def _field_concepts(text: str) -> frozenset[str]:
+    patterns = {
+        "name": re.compile(r"\bname\b|姓名", re.IGNORECASE),
+        "date": re.compile(r"\bdate\b|日期", re.IGNORECASE),
+        "address": re.compile(r"\baddress\b|地址", re.IGNORECASE),
+        "phone": re.compile(
+            r"\b(?:phone|telephone|mobile)\b|電話|手机|手機",
+            re.IGNORECASE,
+        ),
+        "id": IDENTIFIER_LABEL_RE,
+        "diagnosis": re.compile(r"\bdiagnosis\b|診斷", re.IGNORECASE),
+        "result": re.compile(r"\bresult\b|結果", re.IGNORECASE),
+    }
+    return frozenset(name for name, pattern in patterns.items() if pattern.search(text))
+
+
+def _merge_stacked_field_labels(
+    lines: Sequence[SemanticLine],
+) -> list[SemanticLine]:
+    result: list[SemanticLine] = []
+    consumed: set[int] = set()
+    for index, line in enumerate(lines):
+        if index in consumed or not _looks_like_field_label(line.text):
+            if index not in consumed:
+                result.append(line)
+            continue
+        concepts = _field_concepts(line.text)
+        has_cjk = bool(re.search(r"[\u3400-\u9fff]", line.text))
+        match_index = None
+        for other_index in range(index + 1, len(lines)):
+            other = lines[other_index]
+            if (
+                other_index in consumed
+                or line.cell_row is None
+                or line.cell_row != other.cell_row
+                or line.cell_col is None
+                or line.cell_col != other.cell_col
+                or not _looks_like_field_label(other.text)
+                or not concepts
+                or _field_concepts(other.text) != concepts
+                or has_cjk
+                == bool(re.search(r"[\u3400-\u9fff]", other.text))
+            ):
+                continue
+            vertical_gap = max(
+                other.bbox[1] - line.bbox[3],
+                line.bbox[1] - other.bbox[3],
+                0.0,
+            )
+            if vertical_gap <= max(20.0, line.height * 2.0, other.height * 2.0):
+                match_index = other_index
+                break
+        if match_index is None:
+            result.append(line)
+            continue
+        other = lines[match_index]
+        consumed.add(match_index)
+        result.append(
+            SemanticLine(
+                (
+                    min(line.bbox[0], other.bbox[0]),
+                    min(line.bbox[1], other.bbox[1]),
+                    max(line.bbox[2], other.bbox[2]),
+                    max(line.bbox[3], other.bbox[3]),
+                ),
+                f"{line.text.rstrip(':：')} / {other.text.rstrip(':：')}",
+                line.cell_row,
+                line.cell_col,
+                line.cell_bbox,
+            )
+        )
+    return sorted(result, key=lambda item: (item.bbox[1], item.bbox[0]))
+
+
+def _field_assignment_score(
+    label: SemanticLine,
+    value: SemanticLine,
+) -> tuple[int, float, float] | None:
+    if not _field_value_compatible(label.text, value.text):
+        return None
+    same_cell_row = bool(
+        label.cell_row is not None
+        and value.cell_row is not None
+        and label.cell_row == value.cell_row
+    )
+    same_value_cell = bool(
+        same_cell_row
+        and label.cell_col is not None
+        and value.cell_col is not None
+        and label.cell_col == value.cell_col
+    )
+    adjacent_value_cell = bool(
+        same_cell_row
+        and label.cell_col is not None
+        and value.cell_col is not None
+        and value.cell_col == label.cell_col + 1
+        and value.center_x > label.center_x
+    )
+    if (
+        label.cell_row is not None
+        and value.cell_row is not None
+        and abs(value.cell_row - label.cell_row) > 1
+    ):
+        return None
+    if (
+        not same_cell_row
+        and value.center_y < label.center_y - max(label.height, value.height) * 0.35
+    ):
+        return None
+    horizontal_gap = value.bbox[0] - label.bbox[2]
+    overlap = _vertical_overlap(label, value)
+    center_delta = abs(value.center_x - label.center_x)
+    likely_filled = (
+        value.height >= max(label.height * 1.2, 13.0)
+        or bool(
+            DATE_TOKEN_RE.search(value.text)
+            or TIME_VALUE_RE.fullmatch(value.text.strip())
+            or MONEY_VALUE_RE.fullmatch(value.text.strip())
+            or re.search(r"\d|@", value.text)
+        )
+    )
+    if same_value_cell:
+        cell_height = max(
+            (
+                label.cell_bbox[3] - label.cell_bbox[1]
+                if label.cell_bbox is not None
+                else label.height
+            ),
+            (
+                value.cell_bbox[3] - value.cell_bbox[1]
+                if value.cell_bbox is not None
+                else value.height
+            ),
+        )
+        if abs(value.center_y - label.center_y) <= cell_height + 12.0:
+            return (-2, abs(value.center_y - label.center_y), center_delta)
+    if adjacent_value_cell:
+        row_height = max(
+            (
+                label.cell_bbox[3] - label.cell_bbox[1]
+                if label.cell_bbox is not None
+                else label.height
+            ),
+            (
+                value.cell_bbox[3] - value.cell_bbox[1]
+                if value.cell_bbox is not None
+                else value.height
+            ),
+        )
+        if abs(value.center_y - label.center_y) <= row_height + 12.0:
+            return (-1, abs(value.center_y - label.center_y), center_delta)
+    if (
+        same_cell_row
+        and likely_filled
+        and -3.0 <= horizontal_gap <= 160.0
+        and abs(value.center_y - label.center_y)
+        <= max(
+            35.0,
+            (label.cell_bbox[3] - label.cell_bbox[1])
+            if label.cell_bbox is not None
+            else 35.0,
+        )
+    ):
+        return (0, max(horizontal_gap, 0.0), center_delta)
+    if (
+        likely_filled
+        and overlap >= 0.35
+        and -3.0 <= horizontal_gap <= (160.0 if same_cell_row else 80.0)
+    ):
+        return (0, max(horizontal_gap, 0.0), center_delta)
+    vertical_gap = value.bbox[1] - label.bbox[3]
+    label_width = label.bbox[2] - label.bbox[0]
+    value_width = value.bbox[2] - value.bbox[0]
+    horizontal_overlap = max(
+        0.0,
+        min(label.bbox[2], value.bbox[2])
+        - max(label.bbox[0], value.bbox[0]),
+    )
+    minimum_width = min(label_width, value_width)
+    overlap_ratio = horizontal_overlap / minimum_width if minimum_width > 0 else 0.0
+    if (
+        -max(6.0, label.height * 0.6) <= vertical_gap <= 55.0
+        and (
+            overlap_ratio >= 0.15
+            or center_delta <= max(label_width, value_width) * 0.65 + 15.0
+        )
+    ):
+        if not likely_filled:
+            return None
+        return (1, max(vertical_gap, 0.0), center_delta)
+    return None
+
+
+def _has_assignment_boundary(
+    lines: Sequence[SemanticLine],
+    label_index: int,
+    value_index: int,
+) -> bool:
+    label = lines[label_index]
+    value = lines[value_index]
+    top = min(label.center_y, value.center_y)
+    bottom = max(label.center_y, value.center_y)
+    column_left = min(label.bbox[0], value.bbox[0]) - 4.0
+    column_right = max(label.bbox[2], value.bbox[2]) + 4.0
+    column_width = max(column_right - column_left, 1.0)
+    for index, boundary in enumerate(lines):
+        if index in {label_index, value_index} or not (
+            top < boundary.center_y < bottom
+        ):
+            continue
+        if not (
+            _looks_like_field_label(boundary.text)
+            or FORM_PROMPT_RE.match(boundary.text.strip())
+            or _is_section(boundary.text)
+        ):
+            continue
+        horizontal_overlap = max(
+            0.0,
+            min(column_right, boundary.bbox[2])
+            - max(column_left, boundary.bbox[0]),
+        )
+        boundary_width = boundary.bbox[2] - boundary.bbox[0]
+        if (
+            column_left <= boundary.center_x <= column_right
+            or horizontal_overlap / min(column_width, boundary_width) >= 0.35
+        ):
+            return True
+    return False
+
+
+def _pair_form_fields(lines: Sequence[SemanticLine]) -> list[SemanticLine]:
+    lines = _merge_stacked_field_labels(lines)
+    labels = [
+        (index, line)
+        for index, line in enumerate(lines)
+        if _looks_like_field_label(line.text) and not _is_section(line.text)
+    ]
+    label_indices = {index for index, _line in labels}
+    labels_with_own_values = {
+        label_index
+        for label_index, label in labels
+        if any(
+            value_index not in label_indices
+            and label.cell_row is not None
+            and value.cell_row == label.cell_row
+            and label.cell_col is not None
+            and value.cell_col == label.cell_col
+            and _form_value_candidate(value.text)
+            and _field_value_compatible(label.text, value.text)
+            for value_index, value in enumerate(lines)
+        )
+    }
+    assignments: dict[int, list[int]] = defaultdict(list)
+    assigned_values: set[int] = set()
+    for value_index, value in enumerate(lines):
+        if value_index in label_indices or not _form_value_candidate(value.text):
+            continue
+        candidates = []
+        for label_index, label in labels:
+            adjacent_value_cell = bool(
+                label.cell_row is not None
+                and value.cell_row is not None
+                and label.cell_row == value.cell_row
+                and label.cell_col is not None
+                and value.cell_col is not None
+                and value.cell_col == label.cell_col + 1
+            )
+            if adjacent_value_cell and label_index in labels_with_own_values:
+                continue
+            if (
+                label_index >= value_index
+                and _vertical_overlap(label, value) < 0.35
+                and not adjacent_value_cell
+            ):
+                continue
+            if _has_assignment_boundary(
+                lines,
+                label_index,
+                value_index,
+            ):
+                continue
+            score = _field_assignment_score(label, value)
+            if score is not None:
+                candidates.append((score, label_index))
+        selected = min(candidates, default=None)
+        if selected is None:
+            continue
+        assignments[selected[1]].append(value_index)
+        assigned_values.add(value_index)
+
+    result = []
+    for index, line in enumerate(lines):
+        if index in assigned_values:
+            continue
+        values = assignments.get(index, [])
+        if values:
+            related = [line, *(lines[value_index] for value_index in values)]
+            label = line.text.strip().rstrip(":：")
+            value = " / ".join(lines[value_index].text.strip() for value_index in values)
+            result.append(
+                SemanticLine(
+                    (
+                        min(item.bbox[0] for item in related),
+                        min(item.bbox[1] for item in related),
+                        max(item.bbox[2] for item in related),
+                        max(item.bbox[3] for item in related),
+                    ),
+                    f"- **{label}**: {value}",
+                )
+            )
+            continue
+        inline = re.match(r"^(.{1,100}?)[：:]\s*(\S.+)$", line.text.strip())
+        if (
+            inline is not None
+            and _looks_like_field_label(inline.group(1))
+            and _form_value_candidate(inline.group(2))
+        ):
+            result.append(
+                SemanticLine(
+                    line.bbox,
+                    f"- **{inline.group(1).strip()}**: {inline.group(2).strip()}",
+                )
+            )
+        else:
+            result.append(line)
+    return result
+
+
+def _render_form_line(text: str) -> str | None:
+    stripped = text.strip()
+    if (
+        not stripped
+        or FOOTER_RE.search(stripped)
+        or NOISE_TEXT_RE.fullmatch(stripped)
+        or LABEL_QUALIFIER_RE.fullmatch(stripped)
+    ):
+        return None
+    if stripped.startswith("- **"):
+        return stripped
+    task = _task_line(stripped)
+    if task is not None:
+        return task
+    if _is_section(stripped):
+        return f"### {stripped}"
+    if _looks_like_field_label(stripped):
+        return f"- **{stripped.rstrip(':：')}**"
+    return stripped
+
+
+def _output_text_key(text: str) -> str:
+    return _normalized(
+        re.sub(r"^(?:#+\s*|-\s*(?:\[[x ?]\]\s*)?|\*+)", "", text).replace(
+            "**",
+            "",
+        )
+    )
+
+
+def _append_unique_output(
+    parts: list[str],
+    seen: list[str],
+    text: str,
+) -> None:
+    key = _output_text_key(text)
+    if not key:
+        return
+    if not _repeatable_value(text) and any(
+        _equivalent_semantic_text(key, existing) for existing in seen
+    ):
+        return
+    if not _repeatable_value(text):
+        seen.append(key)
+    parts.append(text)
 
 
 def _render_form_cell(
@@ -671,36 +1543,17 @@ def _render_form_table(
     table: Mapping[str, Any],
     excluded_keys: set[str] | None = None,
 ) -> str:
-    rows: dict[int, list[Mapping[str, Any]]] = defaultdict(list)
-    fallback_index = 0
-    for cell in table.get("table_cells", []):
-        if not isinstance(cell, Mapping):
-            continue
-        row = cell.get("row_start")
-        if not isinstance(row, int):
-            row = 100000 + fallback_index
-            fallback_index += 1
-        rows[row].append(cell)
-    parts = []
-    seen = set()
-    for row in sorted(rows):
-        cells = sorted(
-            rows[row],
-            key=lambda cell: (
-                int(cell.get("col_start", 0))
-                if isinstance(cell.get("col_start"), int)
-                else 0,
-                (_valid_bbox(cell.get("bbox")) or (0, 0, 0, 0))[0],
-            ),
+    lines = _pair_form_fields(
+        _merge_isolated_list_markers(
+            _table_lines(table, excluded_keys)
         )
-        for cell in cells:
-            for item in _render_form_cell(cell, excluded_keys):
-                key = _normalized(re.sub(r"^#+\s*", "", item))
-                if not key or (key in seen and not _repeatable_value(item)):
-                    continue
-                if not _repeatable_value(item):
-                    seen.add(key)
-                parts.append(item)
+    )
+    parts: list[str] = []
+    seen: list[str] = []
+    for line in lines:
+        rendered = _render_form_line(line.text)
+        if rendered is not None:
+            _append_unique_output(parts, seen, rendered)
     return "\n\n".join(parts)
 
 
@@ -763,6 +1616,33 @@ def _margin_repetitions(pages: Sequence[Mapping[str, Any]]) -> set[str]:
     return {key for key, page_ids in occurrences.items() if len(page_ids) >= 2}
 
 
+def _fragment_noise_page(parts: Sequence[str]) -> bool:
+    lines = [
+        line.strip()
+        for part in parts
+        for line in part.splitlines()
+        if line.strip() and not line.lstrip().startswith("<!--")
+    ]
+    if len(lines) < 12:
+        return False
+    if any(
+        line.startswith(("#", "- **", "- ["))
+        or line.startswith("| ---")
+        or DATE_TOKEN_RE.search(line)
+        or re.search(r"https?://", line, re.IGNORECASE)
+        for line in lines
+    ):
+        return False
+    fragment_count = sum(len(_normalized(line)) <= 8 for line in lines)
+    lexical_count = sum(
+        len(_normalized(line)) >= 18
+        or len(re.findall(r"[A-Za-z]{3,}", line)) >= 3
+        or len(re.findall(r"[\u3400-\u9fff]", line)) >= 8
+        for line in lines
+    )
+    return fragment_count / len(lines) >= 0.75 and lexical_count <= 2
+
+
 def generate_semantic_markdown(middle_json: Mapping[str, Any]) -> str:
     """Build a conservative alternative Markdown view from fused geometry."""
     pages = middle_json.get("pdf_info", [])
@@ -770,6 +1650,8 @@ def generate_semantic_markdown(middle_json: Mapping[str, Any]) -> str:
         raise ValueError("middle_json must contain a pdf_info list")
     repeated_margins = _margin_repetitions(pages)
     emitted_margins = set()
+    seen_ledger_preheaders: set[str] = set()
+    seen_ledger_tail: list[str] = []
     document_parts = [f"<!-- semantic-markdown-v{SEMANTIC_MARKDOWN_VERSION} -->"]
     for page_index, page in enumerate(pages):
         if not isinstance(page, Mapping):
@@ -790,6 +1672,8 @@ def generate_semantic_markdown(middle_json: Mapping[str, Any]) -> str:
                 rendered = _render_ledger_table(
                     table,
                     repeated_margins,
+                    seen_ledger_preheaders,
+                    seen_ledger_tail,
                 ) or _render_form_table(table, repeated_margins)
                 if rendered:
                     segments.append((bbox[1], bbox[0], rendered))
@@ -833,15 +1717,14 @@ def generate_semantic_markdown(middle_json: Mapping[str, Any]) -> str:
                 segments.append((line.bbox[1], line.bbox[0], prefix + text))
         if not segments:
             continue
-        document_parts.append(f"<!-- Page {page_index + 1} -->")
-        seen = set()
+        page_parts: list[str] = []
+        seen: list[str] = []
         for _top, _left, text in sorted(segments):
-            key = _normalized(re.sub(r"^#+\s*", "", text))
-            if not key or (key in seen and not _repeatable_value(text)):
-                continue
-            if not _repeatable_value(text):
-                seen.add(key)
-            document_parts.append(text)
+            _append_unique_output(page_parts, seen, text)
+        if _fragment_noise_page(page_parts):
+            continue
+        document_parts.append(f"<!-- Page {page_index + 1} -->")
+        document_parts.extend(page_parts)
     return "\n\n".join(document_parts).strip() + "\n"
 
 

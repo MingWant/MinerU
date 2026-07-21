@@ -40,6 +40,7 @@ from projects.custom_hybrid.workflow import (
     run_extract,
     run_doctor,
     _optional_bearer_headers,
+    _generate_semantic_markdown_outputs,
     _generate_fused_visualizations,
     _index_input_documents,
     _resolve_visualization_pdf,
@@ -49,6 +50,63 @@ from projects.custom_hybrid.workflow import (
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_semantic_markdown_replaces_primary_and_preserves_native_ab(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parse_dir = Path(temp_dir)
+            middle_path = parse_dir / "sample_middle.json"
+            primary_path = parse_dir / "sample.md"
+            middle_path.write_text(
+                json.dumps(
+                    {
+                        "pdf_info": [
+                            {
+                                "page_size": [200, 300],
+                                "preproc_blocks": [
+                                    {
+                                        "type": "text",
+                                        "bbox": [10, 10, 100, 30],
+                                        "lines": [
+                                            {
+                                                "bbox": [10, 10, 100, 30],
+                                                "spans": [
+                                                    {
+                                                        "type": "text",
+                                                        "bbox": [10, 10, 100, 30],
+                                                        "content": "Hello",
+                                                    }
+                                                ],
+                                            }
+                                        ],
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            primary_path.write_text("native markdown", encoding="utf-8")
+
+            generated = _generate_semantic_markdown_outputs(
+                parse_dir,
+                "sample",
+                {
+                    "enabled": True,
+                    "replace_primary": True,
+                    "preserve_native": True,
+                },
+            )
+
+            native_path = parse_dir / "sample_native.md"
+            self.assertEqual(generated, (native_path,))
+            self.assertEqual(
+                native_path.read_text(encoding="utf-8"),
+                "native markdown",
+            )
+            semantic = primary_path.read_text(encoding="utf-8")
+            self.assertIn("semantic-markdown-v3", semantic)
+            self.assertIn("Hello", semantic)
+
     def test_bearer_header_requires_explicit_environment_setting(self):
         with mock.patch.dict(
             "os.environ",
@@ -1282,6 +1340,11 @@ class WorkflowTests(unittest.TestCase):
             fused_path.parent,
             "sample",
             input_pdf.resolve(),
+            {
+                "enabled": True,
+                "replace_primary": True,
+                "preserve_native": True,
+            },
         )
 
     def test_fuse_output_trees_wires_and_closes_enabled_bbox_recognizer(self):
