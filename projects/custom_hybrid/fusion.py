@@ -145,6 +145,7 @@ class FusionSettings:
     bbox_recovery_adjust_min_iou: float = 0.05
     bbox_recovery_orphan_max_cell_overlap: float = 0.25
     bbox_recovery_fringe_bottom_extension: float = 72.0
+    bbox_recovery_cell_bottom_overflow_extension: float = 12.0
     bbox_recovery_checkbox_min_size: float = 4.0
     bbox_recovery_checkbox_max_size: float = 20.0
     bbox_recovery_checkbox_min_aspect: float = 0.65
@@ -362,6 +363,9 @@ class FusionSettings:
             ),
             bbox_recovery_fringe_bottom_extension=float(
                 recovery.get("table_fringe_bottom_extension", 72.0)
+            ),
+            bbox_recovery_cell_bottom_overflow_extension=float(
+                recovery.get("cell_bottom_overflow_extension", 12.0)
             ),
             bbox_recovery_checkbox_min_size=float(
                 recovery.get("checkbox_apply_min_size", 4.0)
@@ -1706,6 +1710,9 @@ def apply_bbox_recovery_proposals(
         table_bbox = table[1] if table is not None else None
         spanning_requested = bool(item.get("spanning_cells"))
         terminal_field_requested = bool(item.get("terminal_field_extension"))
+        cell_bottom_overflow_requested = bool(
+            item.get("cell_bottom_overflow")
+        )
         merged_cell_ids = item.get("merged_cell_ids", [])
         spanning_cells = bool(
             spanning_requested
@@ -1734,6 +1741,23 @@ def apply_bbox_recovery_proposals(
             and item.get("terminal_field_kind")
             in {"date", "identifier", "signature"}
             else None
+        )
+        cell_bottom_overflow = bool(
+            cell_bottom_overflow_requested
+            and action == "add"
+            and item.get("recovery_source")
+            in {"local_pixel_ink", "local_uncovered_pixel_ink"}
+            and cell_bbox is not None
+            and table_bbox is not None
+            and bbox is not None
+            and bbox[0] >= cell_bbox[0] - 1.0
+            and bbox[2] <= cell_bbox[2] + 1.0
+            and bbox[1] < cell_bbox[3]
+            and 0.0 < bbox[3] - cell_bbox[3]
+            <= max(
+                settings.bbox_recovery_cell_bottom_overflow_extension,
+                0.0,
+            )
         )
         decision["table_id"] = table_id
         decision["region_kind"] = "form" if is_form_cell else "table"
@@ -1779,6 +1803,20 @@ def apply_bbox_recovery_proposals(
                 )
             elif spanning_cells or terminal_field_extension:
                 outer_bbox = table_bbox
+            elif cell_bottom_overflow:
+                outer_bbox = (
+                    cell_bbox[0],
+                    cell_bbox[1],
+                    cell_bbox[2],
+                    min(
+                        table_bbox[3],
+                        cell_bbox[3]
+                        + max(
+                            settings.bbox_recovery_cell_bottom_overflow_extension,
+                            0.0,
+                        ),
+                    ),
+                )
             else:
                 outer_bbox = (
                     table_bbox if action in table_scoped_actions else cell_bbox
@@ -1804,6 +1842,20 @@ def apply_bbox_recovery_proposals(
                 )
             elif spanning_cells or terminal_field_extension:
                 outer_bbox = table_bbox
+            elif cell_bottom_overflow:
+                outer_bbox = (
+                    cell_bbox[0],
+                    cell_bbox[1],
+                    cell_bbox[2],
+                    min(
+                        table_bbox[3],
+                        cell_bbox[3]
+                        + max(
+                            settings.bbox_recovery_cell_bottom_overflow_extension,
+                            0.0,
+                        ),
+                    ),
+                )
             else:
                 outer_bbox = (
                     table_bbox if action in table_scoped_actions else cell_bbox
@@ -2048,6 +2100,7 @@ def apply_bbox_recovery_proposals(
             "fusion_recovery_terminal_field_extension": (
                 terminal_field_extension
             ),
+            "fusion_recovery_cell_bottom_overflow": cell_bottom_overflow,
         }
         if is_form_cell:
             form_source = cell.get("_fusion_form_cell")

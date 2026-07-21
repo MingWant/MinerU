@@ -870,6 +870,43 @@ class OpenAIBBoxRecoveryReviewer:
                 self.pixel_cells_skipped += 1
                 continue
             analysis_bbox = _valid_bbox(cell.get("bbox"))
+            cell_bottom_overflow_extended = False
+            if (
+                analysis_bbox is not None
+                and table_bbox is not None
+                and not cell.get("form_region")
+                and isinstance(cell.get("row_start"), int)
+                and isinstance(cell.get("row_end"), int)
+                and int(cell["row_end"]) > int(cell["row_start"])
+                and analysis_bbox[3] - analysis_bbox[1]
+                <= float(
+                    self.config.get(
+                        "cell_bottom_overflow_max_cell_height",
+                        40.0,
+                    )
+                )
+            ):
+                bottom_extension = max(
+                    float(
+                        self.config.get(
+                            "cell_bottom_overflow_extension",
+                            12.0,
+                        )
+                    ),
+                    0.0,
+                )
+                extended_bottom = min(
+                    table_bbox[3],
+                    analysis_bbox[3] + bottom_extension,
+                )
+                if extended_bottom > analysis_bbox[3]:
+                    analysis_bbox = (
+                        analysis_bbox[0],
+                        analysis_bbox[1],
+                        analysis_bbox[2],
+                        extended_bottom,
+                    )
+                    cell_bottom_overflow_extended = True
             terminal_field_extended = False
             if (
                 analysis_bbox is not None
@@ -985,6 +1022,9 @@ class OpenAIBBoxRecoveryReviewer:
                 {
                     **dict(cell),
                     "terminal_field_extended": terminal_field_extended,
+                    "cell_bottom_overflow_extended": (
+                        cell_bottom_overflow_extended
+                    ),
                     "reasons": sorted(set(reasons)),
                     "pixel_ink_bbox": analysis["ink_bbox"],
                     "pixel_ink_bboxes": analysis.get("ink_bboxes", []),
@@ -2542,10 +2582,15 @@ class OpenAIBBoxRecoveryReviewer:
                 if fallback_bbox is not None:
                     line_candidates = [(fallback_bbox, {})]
             for bbox, line_analysis in line_candidates:
+                cell_bbox = _valid_bbox(cell.get("bbox"))
+                cell_bottom_overflow = bool(
+                    cell.get("cell_bottom_overflow_extended")
+                    and cell_bbox is not None
+                    and bbox[3] > cell_bbox[3] + 0.5
+                )
                 if is_form_region:
                     width = bbox[2] - bbox[0]
                     height = bbox[3] - bbox[1]
-                    cell_bbox = _valid_bbox(cell.get("bbox"))
                     density = line_analysis.get("ink_density")
                     maximum_density = float(
                         self.config.get("form_recovery_max_ink_density", 0.72)
@@ -2619,6 +2664,7 @@ class OpenAIBBoxRecoveryReviewer:
                         ),
                         "terminal_field_extension": terminal_field_extended,
                         "terminal_field_kind": terminal_field_kind,
+                        "cell_bottom_overflow": cell_bottom_overflow,
                     }
                 )
                 if len(proposals) >= candidate_limit:
@@ -2756,6 +2802,11 @@ class OpenAIBBoxRecoveryReviewer:
             ]
             existing["merged_cell_ids"] = sorted(merged_cells)
             existing["spanning_cells"] = True
+            # Spanning proposals already use the Table bbox as their bounded
+            # outer geometry. Do not retain a single Cell's overflow flag,
+            # which would incorrectly route the merged line through the much
+            # narrower short-Cell overflow guard.
+            existing["cell_bottom_overflow"] = False
             existing["confidence"] = min(
                 float(existing.get("confidence", 0.0)),
                 float(item.get("confidence", 0.0)),

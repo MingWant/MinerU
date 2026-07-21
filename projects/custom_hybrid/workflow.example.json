@@ -196,6 +196,8 @@
       "cell_line_min_dark_height": 3.0,
       "cell_line_min_width": 3.0,
       "terminal_field_min_bottom_extension": 8.0,
+      "cell_bottom_overflow_extension": 12.0,
+      "cell_bottom_overflow_max_cell_height": 40.0,
       "terminal_field_max_bottom_extension": 80.0,
       "merge_split_content_boxes_enabled": true,
       "split_content_min_horizontal_overlap": 0.8,

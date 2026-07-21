@@ -297,6 +297,70 @@ class BBoxRecoveryReviewerTests(unittest.TestCase):
         self.assertGreater(uncovered[0]["bbox"][1], 45)
         self.assertIn("uncovered_ink", uncovered[0]["recovery_reasons"])
 
+    def test_local_pixel_recovery_keeps_handwriting_below_short_cell_boundary(self):
+        from PIL import Image, ImageDraw
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            image = Image.new("RGB", (160, 100), "white")
+            draw = ImageDraw.Draw(image)
+            draw.rectangle([10, 10, 60, 20], fill="black")
+            draw.rectangle([80, 32, 100, 52], fill="black")
+            image.save(image_path)
+            image.close()
+            reviewer = OpenAIBBoxRecoveryReviewer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "mineru-claim-forms",
+                    "render_scale": 1.0,
+                    "local_uncovered_enabled": True,
+                    "checkbox_recovery_enabled": False,
+                    "table_orphan_recovery_enabled": False,
+                    "cell_bottom_overflow_extension": 12.0,
+                    "cell_bottom_overflow_max_cell_height": 40.0,
+                },
+            )
+            try:
+                result = reviewer(
+                    0,
+                    [160, 100],
+                    [
+                        {
+                            "id": "p0-table-0",
+                            "bbox": [0, 0, 150, 90],
+                            "cells": [
+                                {
+                                    "id": "p0-t0-c0",
+                                    "bbox": [0, 5, 140, 45],
+                                    "text": "Already boxed",
+                                    "row_start": 0,
+                                    "row_end": 2,
+                                    "existing": [
+                                        {
+                                            "id": "p0-t0-c0-b0",
+                                            "bbox": [8, 8, 62, 22],
+                                            "text": "Already boxed",
+                                        }
+                                    ],
+                                    "reasons": [],
+                                }
+                            ],
+                        }
+                    ],
+                )
+            finally:
+                reviewer.close()
+
+        recovered = [
+            item
+            for item in result["items"]
+            if item.get("recovery_source") == "local_uncovered_pixel_ink"
+        ]
+        self.assertEqual(len(recovered), 1)
+        self.assertGreater(recovered[0]["bbox"][3], 45.0)
+        self.assertTrue(recovered[0]["cell_bottom_overflow"])
+
     def test_local_pixel_recovery_merges_same_line_split_across_adjacent_cells(self):
         from PIL import Image, ImageDraw
 

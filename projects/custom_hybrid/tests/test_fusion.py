@@ -449,6 +449,57 @@ class FusionTests(unittest.TestCase):
         self.assertTrue(recovered["fusion_recovery_terminal_field_extension"])
         self.assertEqual(recovered["fusion_recovery_terminal_field_kind"], "date")
 
+    def test_bbox_recovery_accepts_short_cell_handwriting_bottom_overflow(self):
+        cells = [
+            {
+                "bbox": [10, 10, 190, 55],
+                "text": "District/Branch",
+                "row_start": 0,
+                "row_end": 0,
+                "col_start": 0,
+                "col_end": 0,
+            }
+        ]
+        page = structured_middle(
+            "table",
+            html="<table><tr><td>District/Branch</td></tr></table>",
+            table_cells=cells,
+        )["pdf_info"][0]
+
+        stats, decisions, _batches, unchanged = apply_bbox_recovery_proposals(
+            page,
+            0,
+            {
+                "items": [
+                    {
+                        "action": "add",
+                        "cell_id": "p0-t0-c0",
+                        "target_id": "",
+                        "bbox": [120, 42, 150, 63],
+                        "confidence": 0.95,
+                        "cell_bottom_overflow": True,
+                        "recovery_source": "local_uncovered_pixel_ink",
+                    }
+                ]
+            },
+            FusionSettings.from_mapping(
+                {
+                    "mode": "bbox_vlm",
+                    "recovery": {"cell_bottom_overflow_extension": 12.0},
+                }
+            ),
+            remaining_document_budget=10,
+        )
+
+        self.assertTrue(unchanged)
+        self.assertEqual(stats["added"], 1)
+        self.assertEqual(decisions[0]["result"], "accepted")
+        recovered = page["preproc_blocks"][0]["lines"][0]["spans"][0][
+            "table_cells"
+        ][0]["content_spans"][0]
+        self.assertEqual(recovered["bbox"], [120.0, 42.0, 150.0, 63.0])
+        self.assertTrue(recovered["fusion_recovery_cell_bottom_overflow"])
+
     def test_bbox_recovery_merges_local_ink_marker_into_handwriting_bbox(self):
         cells = [
             {
