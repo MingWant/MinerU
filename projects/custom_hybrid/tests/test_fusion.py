@@ -102,7 +102,7 @@ class FusionTests(unittest.TestCase):
         cells = [
             {
                 "bbox": [10, 20, 190, 100],
-                "text": narrative,
+                "text": "",
                 "content_spans": [
                     {"bbox": [12, 25, 188, 95], "text": narrative}
                 ],
@@ -113,7 +113,7 @@ class FusionTests(unittest.TestCase):
             },
             {
                 "bbox": [10, 100, 190, 180],
-                "text": narrative,
+                "text": "",
                 "content_spans": [
                     {"bbox": [12, 105, 188, 175], "text": narrative}
                 ],

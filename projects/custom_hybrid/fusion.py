@@ -593,6 +593,18 @@ def collect_table_geometry_quality(
     ]
 
 
+def _narrative_cell_text(cell: Mapping[str, Any]) -> str:
+    """Read pre-recognition OCR evidence even when aggregate cell text is empty."""
+    aggregate = str(cell.get("text", "")).strip()
+    raw_spans = cell.get("content_spans", [])
+    span_text = "\n".join(
+        _content_span_text(span)
+        for span in (raw_spans if isinstance(raw_spans, list) else [])
+        if isinstance(span, Mapping) and _content_span_text(span)
+    ).strip()
+    return span_text if len(span_text) > len(aggregate) else aggregate
+
+
 def _looks_like_narrative_false_table(
     assessment: TableGeometryAssessment,
     page_size: Sequence[float],
@@ -618,9 +630,9 @@ def _looks_like_narrative_false_table(
     )
     if not 5 <= len(cells) <= 30:
         return False
-    total_text_chars = sum(len(str(cell.get("text", "")).strip()) for cell in cells)
+    total_text_chars = sum(len(_narrative_cell_text(cell)) for cell in cells)
     wide_narrative_rows = sum(
-        len(str(cell.get("text", "")).strip()) >= 300
+        len(_narrative_cell_text(cell)) >= 300
         and (bbox[2] - bbox[0]) / table_width >= 0.75
         for cell in cells
         for bbox in [_valid_bbox(cell.get("bbox"))]
@@ -710,7 +722,7 @@ def demote_narrative_false_tables(
                 and _valid_bbox(cell.get("bbox")) is not None
                 and re.search(
                     r"\bdate\b|日期",
-                    str(cell.get("text", "")),
+                    _narrative_cell_text(cell),
                     flags=re.IGNORECASE,
                 )
                 and (
@@ -721,6 +733,9 @@ def demote_narrative_false_tables(
             ]
             recovery_bbox = _union_bbox(cell.get("bbox") for cell in date_cells)
             if recovery_bbox is not None and date_cells:
+                for cell in date_cells:
+                    if not str(cell.get("text", "")).strip():
+                        cell["text"] = _narrative_cell_text(cell)
                 demoted_recovery_regions.append(
                     {
                         "bbox": list(recovery_bbox),
