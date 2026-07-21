@@ -35,7 +35,7 @@ DIRECT_LAYOUT_BBOX_BLOCK_TYPES = TEXT_LIKE_BLOCK_TYPES_FOR_BBOX | {
 
 # span.pdf 从这些结构性 block 中收集内部 span bbox。
 SPAN_SOURCE_BLOCK_TYPES = DIRECT_LAYOUT_BBOX_BLOCK_TYPES
-BBOX_RENDERER_VERSION = 8
+BBOX_RENDERER_VERSION = 10
 
 
 def _get_layout_source_blocks(page):
@@ -106,6 +106,62 @@ def _page_bboxes(bbox_list, page_index):
 
 def _deduplicate_bboxes(bboxes):
     return deduplicate_bboxes(bboxes)
+
+
+def _valid_overlay_bbox(value):
+    if (
+        not isinstance(value, (list, tuple))
+        or len(value) != 4
+        or not all(isinstance(item, Real) and math.isfinite(item) for item in value)
+        or value[2] <= value[0]
+        or value[3] <= value[1]
+    ):
+        return None
+    return [float(item) for item in value]
+
+
+def _form_table_overlay_bboxes(page):
+    """Expose detected Forms and demoted pseudo Tables as structural overlays."""
+    regions = []
+    cells = []
+    for region in page.get("form_regions", []):
+        if not isinstance(region, dict):
+            continue
+        bbox = _valid_overlay_bbox(region.get("bbox"))
+        if bbox is not None:
+            regions.append(bbox)
+    for cell in page.get("form_cells", []):
+        if not isinstance(cell, dict):
+            continue
+        bbox = _valid_overlay_bbox(cell.get("bbox"))
+        if bbox is not None:
+            cells.append(bbox)
+    for table in page.get("demoted_narrative_tables", []):
+        if not isinstance(table, dict):
+            continue
+        bbox = _valid_overlay_bbox(table.get("bbox"))
+        if bbox is not None:
+            regions.append(bbox)
+        for cell in table.get("cells", []):
+            if not isinstance(cell, dict):
+                continue
+            cell_bbox = _valid_overlay_bbox(cell.get("bbox"))
+            if cell_bbox is not None:
+                cells.append(cell_bbox)
+    return _deduplicate_bboxes(regions), _deduplicate_bboxes(cells)
+
+
+def _bbox_center_inside_any(bbox, regions):
+    valid = _valid_overlay_bbox(bbox)
+    if valid is None:
+        return False
+    center_x = (valid[0] + valid[2]) / 2
+    center_y = (valid[1] + valid[3]) / 2
+    return any(
+        region[0] <= center_x <= region[2]
+        and region[1] <= center_y <= region[3]
+        for region in regions
+    )
 
 
 def _table_cell_render_bboxes(span):
@@ -513,12 +569,17 @@ def draw_span_bbox(pdf_info, pdf_bytes, out_path, filename):
     dropped_list = []
 
     def get_span_info(span):
+        if span.get("fusion_visualization_hidden"):
+            return
         bbox = span.get('bbox')
         span_type = span.get('type')
         if bbox is None and span_type != ContentType.TABLE:
             return
         if span_type == ContentType.TEXT:
-            page_text_list.append(bbox)
+            if _bbox_center_inside_any(bbox, page_structural_regions):
+                page_table_content_list.append(bbox)
+            else:
+                page_text_list.append(bbox)
         elif span_type == ContentType.INLINE_EQUATION:
             page_inline_equation_list.append(bbox)
         elif span_type == ContentType.INTERLINE_EQUATION:
@@ -541,6 +602,11 @@ def draw_span_bbox(pdf_info, pdf_bytes, out_path, filename):
         page_form_key_list = []
         page_form_value_list = []
         page_dropped_list = []
+        page_structural_regions, page_structural_cells = (
+            _form_table_overlay_bboxes(page)
+        )
+        page_table_list.extend(page_structural_regions)
+        page_table_content_list.extend(page_structural_cells)
 
 
         # 构造dropped_list
@@ -608,8 +674,12 @@ def draw_span_bbox(pdf_info, pdf_bytes, out_path, filename):
         draw_bbox_without_number(i, inline_equation_list, page, c, [0, 255, 0], False)
         draw_bbox_without_number(i, interline_equation_list, page, c, [0, 0, 255], False)
         draw_bbox_without_number(i, image_list, page, c, [255, 204, 0], False)
-        draw_bbox_without_number(i, table_list, page, c, [204, 0, 255], False)
         draw_bbox_without_number(i, table_content_list, page, c, [0, 180, 255], False)
+        # Draw the structural outer boundary last so coincident Cell edges do
+        # not hide the purple Table/Form classification.
+        c.setLineWidth(1.75)
+        draw_bbox_without_number(i, table_list, page, c, [204, 0, 255], False)
+        c.setLineWidth(1.0)
         draw_bbox_without_number(i, form_key_list, page, c, [0, 160, 90], False)
         draw_bbox_without_number(i, form_value_list, page, c, [30, 90, 255], False)
         draw_bbox_without_number(i, dropped_list, page, c, [158, 158, 158], False)

@@ -712,6 +712,26 @@ def demote_narrative_false_tables(
         }
         if not flagged:
             continue
+        page["demoted_narrative_tables"] = [
+            {
+                "bbox": list(assessment.bbox),
+                "cells": [
+                    {
+                        "bbox": list(cell_bbox),
+                        "text": _narrative_cell_text(cell),
+                    }
+                    for cell in (
+                        assessment.span.get("table_cells", [])
+                        if isinstance(assessment.span.get("table_cells"), list)
+                        else []
+                    )
+                    if isinstance(cell, Mapping)
+                    for cell_bbox in [_valid_bbox(cell.get("bbox"))]
+                    if cell_bbox is not None
+                ],
+            }
+            for assessment in flagged.values()
+        ]
         demoted_recovery_regions = []
         for assessment in flagged.values():
             raw_cells = assessment.span.get("table_cells", [])
@@ -1253,6 +1273,30 @@ def build_bbox_recovery_manifest(
                 ocr_text = str(cell.get("ocr_text", ""))
                 if ocr_text.strip() and not existing:
                     reasons.append("metadata_text_without_bbox")
+                folded_ocr_text = ocr_text.casefold()
+                is_date_range_row = bool(
+                    cell.get("kind") == "semantic_row"
+                    and (
+                        (
+                            re.search(r"\bfrom\s*$", folded_ocr_text)
+                            or re.search(
+                                r"\bfrom\b.{0,80}\bto\b",
+                                folded_ocr_text,
+                            )
+                        )
+                        or ("由" in ocr_text and "至" in ocr_text)
+                    )
+                )
+                is_admission_discharge_row = bool(
+                    cell.get("kind") == "semantic_row"
+                    and (
+                        (
+                            "admission" in folded_ocr_text
+                            and "discharge" in folded_ocr_text
+                        )
+                        or ("入院" in ocr_text and "出院" in ocr_text)
+                    )
+                )
                 cells.append(
                     {
                         "id": f"p{page_index}-f{region_index}-c{cell_index}",
@@ -1271,15 +1315,11 @@ def build_bbox_recovery_manifest(
                         "form_cell_index": cell_index,
                         "form_cell_kind": cell.get("kind"),
                         "form_recover_text": bool(
-                            cell.get("kind") == "semantic_row"
-                            and (
-                                (
-                                    "admission" in ocr_text.casefold()
-                                    and "discharge" in ocr_text.casefold()
-                                )
-                                or ("入院" in ocr_text and "出院" in ocr_text)
-                            )
+                            cell.get("kind") == "field_cell"
+                            or is_admission_discharge_row
+                            or is_date_range_row
                         ),
+                        "form_recover_full_cell": is_date_range_row,
                     }
                 )
             if cells:
@@ -3632,6 +3672,17 @@ def recover_table_cell_geometry(
         evidence = collect_structured_spans(ocr_page, page_index, {"table"})
         assignments = assign_structured_spans(targets, evidence, min_overlap)
         for target in targets:
+            current_cells = target.span.get("table_cells")
+            if isinstance(current_cells, list) and any(
+                isinstance(cell, Mapping)
+                and _valid_bbox(cell.get("bbox")) is not None
+                for cell in current_cells
+            ):
+                # A fused task already owns authoritative post-repair geometry
+                # and recognition metadata. Preview regeneration is allowed to
+                # restore missing Cell geometry, but must never replace these
+                # cells with the pre-repair OCR snapshot.
+                continue
             matched = _best_structured_evidence(assignments[id(target)])
             if matched is None:
                 continue

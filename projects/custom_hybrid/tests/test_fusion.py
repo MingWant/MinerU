@@ -169,6 +169,11 @@ class FusionTests(unittest.TestCase):
         self.assertEqual(len(collect_table_geometry_quality(page, 0)), 0)
         self.assertEqual(len(collect_text_lines(page, 0)), 6)
         self.assertEqual(
+            page["demoted_narrative_tables"][0]["bbox"],
+            [10.0, 10.0, 190.0, 250.0],
+        )
+        self.assertEqual(len(page["demoted_narrative_tables"][0]["cells"]), 6)
+        self.assertEqual(
             page["demoted_narrative_recovery_regions"][0]["cells"][0][
                 "text"
             ],
@@ -657,6 +662,50 @@ class FusionTests(unittest.TestCase):
             report["counts"]["bbox_recognition_recovered_candidates"],
             1,
         )
+
+    def test_form_manifest_recovers_field_cells_and_full_date_range_rows(self):
+        page = middle("Form", bbox=(10, 10, 190, 20))["pdf_info"][0]
+        page["form_regions"] = [{"bbox": [5, 5, 195, 100]}]
+        page["form_cells"] = [
+            {
+                "bbox": [5, 20, 100, 55],
+                "form_region_index": 0,
+                "row_index": 1,
+                "column_index": 0,
+                "kind": "field_cell",
+                "ocr_text": "When was it made (DD/MM/YYYY)",
+            },
+            {
+                "bbox": [5, 55, 195, 95],
+                "form_region_index": 0,
+                "row_index": 2,
+                "column_index": 0,
+                "kind": "semantic_row",
+                "ocr_text": "From 由 __/__/__ To 至 __/__/__",
+            },
+            {
+                "bbox": [5, 95, 195, 100],
+                "form_region_index": 0,
+                "row_index": 3,
+                "column_index": 0,
+                "kind": "semantic_row",
+                "ocr_text": "How long has the patient suffered from these symptoms?",
+            },
+        ]
+
+        form = next(
+            item
+            for item in build_bbox_recovery_manifest(page, 0)
+            if item["kind"] == "form_region"
+        )
+
+        field, date_range, prose = form["cells"]
+        self.assertTrue(field["form_recover_text"])
+        self.assertFalse(field["form_recover_full_cell"])
+        self.assertTrue(date_range["form_recover_text"])
+        self.assertTrue(date_range["form_recover_full_cell"])
+        self.assertFalse(prose["form_recover_text"])
+        self.assertFalse(prose["form_recover_full_cell"])
 
     def test_bbox_vlm_candidate_budget_preserves_recovered_crop(self):
         pipeline = structured_middle(
@@ -1466,6 +1515,42 @@ class FusionTests(unittest.TestCase):
         self.assertEqual(attached, 2)
         self.assertTrue(changed)
         self.assertEqual(span["table_cells"], cells)
+
+    def test_existing_recovered_cell_geometry_survives_preview_refresh(self):
+        html = "<table><tr><td>District/Branch</td></tr></table>"
+        recovered = {
+            "bbox": [10, 10, 190, 40],
+            "content_spans": [
+                {"bbox": [20, 18, 100, 30], "text": "District/Branch"},
+                {
+                    "bbox": [102, 18, 120, 34],
+                    "text": "57",
+                    "fusion_recovery_action": "add",
+                    "fusion_recognition_source": "vlm",
+                },
+            ],
+            "text": "District/Branch 57",
+            "row_start": 0,
+            "row_end": 0,
+            "col_start": 0,
+            "col_end": 0,
+        }
+        original = {
+            **recovered,
+            "content_spans": recovered["content_spans"][:1],
+            "text": "District/Branch",
+        }
+        fused = structured_middle("table", html=html, table_cells=[recovered])
+        ocr = structured_middle("table", html=html, table_cells=[original])
+
+        attached, changed = recover_table_cell_geometry(fused, ocr)
+
+        span = fused["pdf_info"][0]["preproc_blocks"][0]["lines"][0][
+            "spans"
+        ][0]
+        self.assertEqual(attached, 0)
+        self.assertFalse(changed)
+        self.assertEqual(span["table_cells"][0]["content_spans"][1]["text"], "57")
 
     def test_invalid_hybrid_table_falls_back_to_valid_pipeline_table(self):
         hybrid = structured_middle("table", html="<table><tr><td>broken")

@@ -2582,6 +2582,7 @@ class OpenAIBBoxRecoveryReviewer:
                         cell_bbox is not None
                         and cell.get("form_recover_text")
                         and not cell.get("demoted_form_cell")
+                        and not cell.get("form_recover_full_cell")
                         and (bbox[1] + bbox[3]) / 2
                         < (cell_bbox[1] + cell_bbox[3]) / 2
                     ) or height > maximum_height or looks_like_checkbox:

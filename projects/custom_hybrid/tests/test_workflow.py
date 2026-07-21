@@ -47,9 +47,33 @@ from projects.custom_hybrid.workflow import (
     _start_parameter_proxy,
     _stop_parameter_proxy,
 )
+from mineru.utils.draw_bbox import _form_table_overlay_bboxes
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_span_overlay_treats_detected_forms_and_demoted_regions_as_tables(self):
+        regions, cells = _form_table_overlay_bboxes(
+            {
+                "form_regions": [{"bbox": [10, 10, 190, 200]}],
+                "form_cells": [{"bbox": [10, 10, 190, 60]}],
+                "demoted_narrative_tables": [
+                    {
+                        "bbox": [10, 210, 190, 290],
+                        "cells": [{"bbox": [10, 210, 190, 250]}],
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(
+            regions,
+            [[10.0, 10.0, 190.0, 200.0], [10.0, 210.0, 190.0, 290.0]],
+        )
+        self.assertEqual(
+            cells,
+            [[10.0, 10.0, 190.0, 60.0], [10.0, 210.0, 190.0, 250.0]],
+        )
+
     def test_semantic_markdown_replaces_primary_and_preserves_native_ab(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             parse_dir = Path(temp_dir)
@@ -268,7 +292,7 @@ class WorkflowTests(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
-            self.assertEqual(marker["bbox_renderer_version"], 8)
+            self.assertEqual(marker["bbox_renderer_version"], 10)
             self.assertEqual(marker["form_detector_version"], 1)
             self.assertEqual(marker["form_segmenter_version"], 4)
             self.assertTrue((parse_dir / "renamed_forms.pdf").is_file())
