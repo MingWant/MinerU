@@ -524,7 +524,8 @@ class BBoxRecoveryReviewerTests(unittest.TestCase):
                     "checkbox_recovery_enabled": False,
                     "table_orphan_recovery_enabled": False,
                     "date_range_field_bottom_extension": 6.0,
-                    "form_full_cell_recovery_max_width_ratio": 0.6,
+                    # Exercise the compatibility floor for stale configs.
+                    "form_full_cell_recovery_max_width_ratio": 0.5,
                 },
             )
             try:
@@ -570,6 +571,43 @@ class BBoxRecoveryReviewerTests(unittest.TestCase):
         self.assertLessEqual(recovered[0]["bbox"][3], 56.0)
         self.assertTrue(recovered[0]["terminal_field_extension"])
         self.assertEqual(recovered[0]["terminal_field_kind"], "date")
+
+    def test_date_range_recovery_keeps_tall_legend_with_stale_limits(self):
+        reviewer = OpenAIBBoxRecoveryReviewer(
+            "http://vision.test",
+            "unused.pdf",
+            {
+                "form_full_cell_recovery_max_width_ratio": 0.5,
+                "form_recovery_max_line_height": 24.0,
+            },
+            page_provider=mock.Mock(),
+        )
+        proposals = reviewer._local_missing_proposals(
+            [
+                {
+                    "id": "p0-f0-c0",
+                    "bbox": [10, 20, 190, 50],
+                    "text": "From 由 __/__/__ To 至 __/__/__",
+                    "reasons": ["uncovered_ink"],
+                    "form_region": True,
+                    "form_recover_text": True,
+                    "form_recover_full_cell": True,
+                    "date_range_field_extended": True,
+                    "pixel_ink_components": [
+                        {
+                            "bbox": [65, 23, 170, 55],
+                            "ink_density": 0.1,
+                        }
+                    ],
+                }
+            ],
+            10,
+        )
+
+        self.assertEqual(len(proposals), 1)
+        self.assertEqual(proposals[0]["bbox"], [65.0, 23.0, 170.0, 55.0])
+        self.assertTrue(proposals[0]["terminal_field_extension"])
+        self.assertEqual(proposals[0]["terminal_field_kind"], "date")
 
     def test_table_orphan_recovery_accepts_short_amount(self):
         from PIL import Image, ImageDraw
@@ -930,6 +968,87 @@ class BBoxRecoveryReviewerTests(unittest.TestCase):
         self.assertGreaterEqual(merged[0]["bbox"][2], 140.0)
         self.assertGreaterEqual(merged[0]["bbox"][3], 52.0)
         self.assertEqual(result["checkbox_merged"], 1)
+
+    def test_checkbox_recovery_handles_sparse_tick_at_higher_render_scale(self):
+        from PIL import Image, ImageDraw
+
+        # Higher-resolution rasterization can leave the small square nearly
+        # empty while making its contour slightly irregular.
+        for scale in (3, 4):
+            with self.subTest(scale=scale):
+                image = Image.new("RGB", (240 * scale, 100 * scale), "white")
+                draw = ImageDraw.Draw(image)
+                draw.rectangle(
+                    [38 * scale, 36 * scale, 45 * scale, 43 * scale],
+                    outline="black",
+                    width=max(2, scale),
+                )
+                tick = [
+                    25 * scale,
+                    37 * scale,
+                    35 * scale,
+                    48 * scale,
+                    49 * scale,
+                    48 * scale,
+                    49 * scale,
+                    29 * scale,
+                ]
+                draw.line(
+                    tick,
+                    fill="black",
+                    width=max(4, 2 * scale),
+                    joint="curve",
+                )
+                draw.text(
+                    (53 * scale, 36 * scale),
+                    "Others option",
+                    fill="black",
+                )
+                reviewer = OpenAIBBoxRecoveryReviewer(
+                    "http://vision.test",
+                    "unused.pdf",
+                    {
+                        "render_scale": float(scale),
+                        "checkbox_min_size": 8.0,
+                        "checkbox_protruding_tick_min_size": 4.5,
+                        "checkbox_max_size": 18.0,
+                        "checkbox_left_clearance": 16.0,
+                    },
+                    page_provider=mock.Mock(),
+                )
+                try:
+                    merged = reviewer._table_checkbox_proposals(
+                        image,
+                        [240, 100],
+                        {
+                            "id": "p0-table-0",
+                            "bbox": [0, 0, 240, 100],
+                            "cells": [
+                                {
+                                    "id": "p0-t0-c0",
+                                    "bbox": [0, 0, 230, 80],
+                                    "text": "Others option",
+                                    "existing": [
+                                        {
+                                            "id": "p0-t0-c0-b0",
+                                            "bbox": [53, 34, 140, 52],
+                                            "text": "Others option",
+                                        }
+                                    ],
+                                }
+                            ],
+                        },
+                        10,
+                    )
+                finally:
+                    reviewer.close()
+                    image.close()
+
+                self.assertEqual(len(merged), 1)
+                self.assertEqual(merged[0]["action"], "merge_checkbox")
+                self.assertEqual(merged[0]["checkbox_state"], "checked")
+                self.assertLessEqual(merged[0]["bbox"][0], 25.0)
+                self.assertEqual(reviewer.checkbox_labels_merged, 1)
 
     def test_list_marker_recovery_merges_same_line_text_bbox(self):
         reviewer = OpenAIBBoxRecoveryReviewer(

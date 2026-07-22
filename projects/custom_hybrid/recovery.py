@@ -1712,7 +1712,11 @@ class OpenAIBBoxRecoveryReviewer:
                 vertices = len(
                     cv2.approxPolyDP(contour, 0.04 * perimeter, True)
                 )
-                if vertices < 3 or vertices > maximum_vertices:
+                # Rasterization can turn a hand-drawn square into a slightly
+                # irregular contour. Keep a small headroom for the bounded
+                # protruding-tick path, then reject irregular contours that do
+                # not actually have a matching outer tick below.
+                if vertices < 3 or vertices > max(maximum_vertices, 8):
                     continue
                 roi = binary[y : y + height, x : x + width] > 0
                 edge = max(1, int(min(width, height) * 0.18))
@@ -1828,9 +1832,14 @@ class OpenAIBBoxRecoveryReviewer:
                         height,
                     )
                     if left_ink_blocked
-                    and unchecked_threshold
-                    < interior_density
-                    < checked_threshold
+                    and (
+                        min(width_points, height_points) < regular_minimum_size
+                        or (
+                            unchecked_threshold
+                            < interior_density
+                            < checked_threshold
+                        )
+                    )
                     else None
                 )
                 protruding_tick = protruding_tick_bounds is not None
@@ -1844,6 +1853,8 @@ class OpenAIBBoxRecoveryReviewer:
                 if protruding_tick:
                     state = "checked"
                     text = "☑"
+                elif vertices > maximum_vertices:
+                    continue
                 elif interior_density <= unchecked_threshold:
                     state = "unchecked"
                     text = "☐"
@@ -2805,6 +2816,12 @@ class OpenAIBBoxRecoveryReviewer:
                     maximum_height = float(
                         self.config.get("form_recovery_max_line_height", 24.0)
                     )
+                    if date_range_field_overflow:
+                        # At higher raster scales the date legend and its
+                        # underline can form one taller connected band.
+                        # Preserve that band so the complete Day/Month/Year
+                        # legend remains in the recovered box.
+                        maximum_height = max(maximum_height, 36.0)
                     maximum_width_ratio = float(
                         self.config.get(
                             "demoted_form_recovery_max_width_ratio"
@@ -2819,6 +2836,12 @@ class OpenAIBBoxRecoveryReviewer:
                             else 0.5,
                         )
                     )
+                    if cell.get("form_recover_full_cell"):
+                        # Full date rows intentionally include the printed
+                        # From/To legend. Keep the new 60% floor even when a
+                        # stale deployment config still contains the former
+                        # 50% limit.
+                        maximum_width_ratio = max(maximum_width_ratio, 0.6)
                     looks_like_checkbox = (
                         4.0 <= width <= 20.0
                         and 4.0 <= height <= 20.0
