@@ -98,6 +98,11 @@
       "replace_primary": true,
       "preserve_native": true
     },
+    "page_sorting": {
+      "enabled": true,
+      "mode": "report_only",
+      "include_semantic_diagnostics": true
+    },
     "recognizer": {
       "enabled": false,
       "base_url": null,

@@ -250,6 +250,22 @@ def _validate_fusion_config(fusion_config: Any) -> None:
             "fusion.form_detection.existing_table_coverage_threshold must be "
             "between 0 and 1"
         )
+    page_sorting = fusion_config.get("page_sorting", {})
+    if not isinstance(page_sorting, dict):
+        raise WorkflowConfigError("fusion.page_sorting must be a JSON object")
+    if not isinstance(page_sorting.get("enabled", False), bool):
+        raise WorkflowConfigError("fusion.page_sorting.enabled must be a boolean")
+    if page_sorting.get("mode", "report_only") != "report_only":
+        raise WorkflowConfigError(
+            "fusion.page_sorting.mode must be report_only"
+        )
+    if not isinstance(
+        page_sorting.get("include_semantic_diagnostics", True),
+        bool,
+    ):
+        raise WorkflowConfigError(
+            "fusion.page_sorting.include_semantic_diagnostics must be a boolean"
+        )
     if not fusion_config.get("enabled", False):
         return
     bounded_values = {
@@ -1647,6 +1663,7 @@ def _regenerate_fused_outputs(
     document_stem: str,
     source_document: Path | None = None,
     semantic_markdown_config: Mapping[str, Any] | None = None,
+    page_sorting_config: Mapping[str, Any] | None = None,
 ) -> tuple[Path, ...]:
     if str(REPOSITORY_ROOT) not in sys.path:
         sys.path.insert(0, str(REPOSITORY_ROOT))
@@ -1661,6 +1678,13 @@ def _regenerate_fused_outputs(
         )
     )
     generated.extend(
+        _generate_page_sorting_outputs(
+            parse_dir,
+            document_stem,
+            page_sorting_config or {},
+        )
+    )
+    generated.extend(
         _generate_fused_visualizations(
             parse_dir,
             document_stem,
@@ -1668,6 +1692,47 @@ def _regenerate_fused_outputs(
         )
     )
     return tuple(generated)
+
+
+def _generate_page_sorting_outputs(
+    parse_dir: Path,
+    document_stem: str,
+    config: Mapping[str, Any],
+) -> tuple[Path, ...]:
+    if not config.get("enabled", False):
+        return ()
+    from projects.custom_hybrid.page_sorting import write_page_sorting_reports
+
+    middle_path = parse_dir / f"{document_stem}_middle.json"
+    semantic_report_path = parse_dir / f"{document_stem}_semantic_report.json"
+    try:
+        return write_page_sorting_reports(
+            middle_path,
+            config=config,
+            semantic_report_path=(
+                semantic_report_path if semantic_report_path.is_file() else None
+            ),
+        )
+    except Exception as exc:
+        # This optional report must not invalidate otherwise usable fused output.
+        error_path = parse_dir / f"{document_stem}_sorting_report.json"
+        error_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "mode": "report_only",
+                    "status": "error",
+                    "can_auto_sort": False,
+                    "report_only": True,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return (error_path,)
 
 
 def _generate_semantic_markdown_outputs(
@@ -2100,8 +2165,9 @@ def fuse_output_trees(
                 stem,
                 vision_document_path,
                 fusion_config.get("semantic_markdown", {}),
+                fusion_config.get("page_sorting", {}),
             )
-            summary["documents"][stem] = {
+            document_summary = {
                 "middle_json": str(fused_path),
                 "report": str(report_path),
                 "counts": report["counts"],
@@ -2109,6 +2175,30 @@ def fuse_output_trees(
                 "form_segmentation": report.get("form_segmentation"),
                 "artifacts": [str(path) for path in generated_files],
             }
+            sorting_report_path = fused_path.with_name(
+                f"{stem}_sorting_report.json"
+            )
+            sorting_manifest_path = fused_path.with_name(
+                f"{stem}_sorting_manifest.json"
+            )
+            if (
+                fusion_config.get("page_sorting", {}).get("enabled", False)
+                and sorting_report_path.is_file()
+            ):
+                sorting_summary = json.loads(
+                    sorting_report_path.read_text(encoding="utf-8")
+                )
+                document_summary["page_sorting"] = {
+                    "status": sorting_summary.get("status"),
+                    "can_auto_sort": sorting_summary.get("can_auto_sort", False),
+                    "manifest": (
+                        str(sorting_manifest_path)
+                        if sorting_manifest_path.is_file()
+                        else None
+                    ),
+                    "report": str(sorting_report_path),
+                }
+            summary["documents"][stem] = document_summary
         except Exception as exc:
             summary["failed"][stem] = f"{type(exc).__name__}: {exc}"
         finally:

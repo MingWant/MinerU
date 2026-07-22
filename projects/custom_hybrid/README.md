@@ -142,6 +142,34 @@ require PDF-specific rules. Set
 with MinerU's original Markdown. The output marker `semantic-markdown-v5`
 identifies this renderer version.
 
+When `fusion.page_sorting.enabled=true`, the workflow also performs a
+deterministic, report-only Grouping and Sorting pass over the fused middle JSON.
+It reads page-number candidates directly from `discarded_blocks`,
+`preproc_blocks`, and `para_blocks`, retaining each candidate's block type,
+bbox, physical page index, confidence, and raw OCR text. Page-one anchors,
+declared totals, repeated header/footer family tokens, and identifiers such as
+Policy/Claim/Case IDs are then used to form document groups. Conflicting IDs are
+hard exclusions, and pages with tied or incomplete evidence remain unresolved.
+
+The pass writes `<document>_sorting_manifest.json` and
+`<document>_sorting_report.json`. A report is `complete` and
+`can_auto_sort=true` only when every physical page belongs to exactly one group
+and every group has one unique logical page for the complete `1..N` range.
+Missing pages, duplicate logical pages, conflicting OCR candidates, absent
+page-one anchors, and indistinguishable same-template documents all require
+review. `page_idx` remains the physical input position and is never treated as
+the printed logical page number. Semantic Markdown coverage warnings are copied
+into the manifest as diagnostics, but they do not override page evidence.
+
+The only supported mode is currently `report_only`: the pass does not rewrite
+the PDF, fused middle JSON, or Markdown. A fused middle JSON can be replayed
+without MinerU or a text-generation LLM:
+
+```powershell
+python projects/custom_hybrid/page_sorting.py `
+  output/fused/sample/sample_middle.json
+```
+
 Replay one or more fused middle JSON files without calling MinerU or vLLM:
 
 ```powershell

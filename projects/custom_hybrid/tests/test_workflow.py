@@ -40,6 +40,7 @@ from projects.custom_hybrid.workflow import (
     run_extract,
     run_doctor,
     _optional_bearer_headers,
+    _generate_page_sorting_outputs,
     _generate_semantic_markdown_outputs,
     _generate_fused_visualizations,
     _index_input_documents,
@@ -135,6 +136,79 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(report["semantic_markdown_version"], 5)
             self.assertEqual(report["pages_emitted"], 1)
             self.assertIn("Hello", semantic)
+
+    def test_page_sorting_outputs_are_additive_report_only_artifacts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parse_dir = Path(temp_dir)
+            middle_path = parse_dir / "sample_middle.json"
+            middle_payload = {
+                "pdf_info": [
+                    {
+                        "page_idx": 0,
+                        "page_size": [200, 300],
+                        "discarded_blocks": [
+                            {
+                                "type": "footer",
+                                "bbox": [40, 275, 160, 290],
+                                "lines": [
+                                    {
+                                        "bbox": [40, 275, 160, 290],
+                                        "spans": [
+                                            {
+                                                "type": "text",
+                                                "content": "Sample Form P.1/1",
+                                            }
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            }
+            original = json.dumps(middle_payload)
+            middle_path.write_text(original, encoding="utf-8")
+
+            generated = _generate_page_sorting_outputs(
+                parse_dir,
+                "sample",
+                {
+                    "enabled": True,
+                    "mode": "report_only",
+                    "include_semantic_diagnostics": True,
+                },
+            )
+
+            self.assertEqual(
+                generated,
+                (
+                    parse_dir / "sample_sorting_manifest.json",
+                    parse_dir / "sample_sorting_report.json",
+                ),
+            )
+            self.assertEqual(middle_path.read_text(encoding="utf-8"), original)
+            report = json.loads(generated[1].read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "complete")
+            self.assertTrue(report["report_only"])
+
+    def test_page_sorting_error_does_not_replace_or_mutate_fused_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parse_dir = Path(temp_dir)
+            middle_path = parse_dir / "sample_middle.json"
+            original = json.dumps({"pdf_info": "invalid"})
+            middle_path.write_text(original, encoding="utf-8")
+
+            generated = _generate_page_sorting_outputs(
+                parse_dir,
+                "sample",
+                {"enabled": True, "mode": "report_only"},
+            )
+
+            self.assertEqual(generated, (parse_dir / "sample_sorting_report.json",))
+            self.assertEqual(middle_path.read_text(encoding="utf-8"), original)
+            report = json.loads(generated[0].read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "error")
+            self.assertFalse(report["can_auto_sort"])
 
     def test_bearer_header_requires_explicit_environment_setting(self):
         with mock.patch.dict(
@@ -639,6 +713,25 @@ class WorkflowTests(unittest.TestCase):
                 "existing_table_coverage_threshold",
             ):
                 load_config(config_path)
+
+    def test_config_validates_report_only_page_sorting(self):
+        source = Path(__file__).parents[1] / "workflow.example.json"
+        for key, value, message in (
+            ("enabled", "yes", "page_sorting.enabled"),
+            ("mode", "apply", "page_sorting.mode"),
+            (
+                "include_semantic_diagnostics",
+                "yes",
+                "include_semantic_diagnostics",
+            ),
+        ):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as temp_dir:
+                config = json.loads(source.read_text(encoding="utf-8"))
+                config["fusion"]["page_sorting"][key] = value
+                config_path = Path(temp_dir) / "invalid.json"
+                config_path.write_text(json.dumps(config), encoding="utf-8")
+                with self.assertRaisesRegex(WorkflowConfigError, message):
+                    load_config(config_path)
 
     def test_config_requires_hybrid_http_client(self):
         config = json.loads(
@@ -1409,6 +1502,11 @@ class WorkflowTests(unittest.TestCase):
                 "enabled": True,
                 "replace_primary": True,
                 "preserve_native": True,
+            },
+            {
+                "enabled": True,
+                "mode": "report_only",
+                "include_semantic_diagnostics": True,
             },
         )
 
