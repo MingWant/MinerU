@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 
-SEMANTIC_MARKDOWN_VERSION = 4
+SEMANTIC_MARKDOWN_VERSION = 5
 
 SECTION_RE = re.compile(
     r"^(?:PART\s+(?:[IVXLC]+|\d+|[A-Z])\b|POINTS? TO NOTE\b|IMPORTANT NOTES?\b|"
@@ -185,6 +185,20 @@ LEDGER_LABELS = {
     "amount": "Amount / 金額",
     "balance": "Balance / 結餘",
 }
+LEDGER_CURRENCY_UNIT_RE = re.compile(
+    r"\(?\s*(?:HKD|HKS|USD|EUR|GBP|RMB|CNY|港元)\s*\)?",
+    re.IGNORECASE,
+)
+MEDICAL_QUALIFICATION_RE = re.compile(
+    r"\b(?:MBBS|MBBCh|MD|DO|FRCS(?:Ed)?|FCSHK|FHKAM|MRCP|MRCS|FRCPath|"
+    r"FRCR|FCOphth|DCH|DFM|Dip\.?\s*Med)\b",
+    re.IGNORECASE,
+)
+SIGNATURE_VALUE_PREFIX_RE = re.compile(
+    r"^(?:(?:signature|signed)\b|[簽签](?:署|名))\s*"
+    r"(?:[:：]\s*(?:[xX✓✔✗]\s*)?|[xX✓✔✗]\s+)",
+    re.IGNORECASE,
+)
 
 MEDICAL_GRID_SCHEMAS = (
     frozenset(("date", "test", "result")),
@@ -338,6 +352,65 @@ def _table_span(block: Mapping[str, Any]) -> Mapping[str, Any] | None:
         ):
             return item
     return None
+
+
+def _table_has_cells(table: Mapping[str, Any] | None) -> bool:
+    if table is None:
+        return False
+    cells = table.get("table_cells", [])
+    return bool(
+        isinstance(cells, list)
+        and any(isinstance(cell, Mapping) for cell in cells)
+    )
+
+
+def _direct_table_spans(block: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Return structured Tables directly owned by a block, not its siblings."""
+    result: list[Mapping[str, Any]] = []
+    seen: set[int] = set()
+    if block.get("type") == "table" and isinstance(block.get("table_cells"), list):
+        result.append(block)
+        seen.add(id(block))
+    raw_lines = block.get("lines", [])
+    for line in raw_lines if isinstance(raw_lines, list) else []:
+        if not isinstance(line, Mapping):
+            continue
+        raw_spans = line.get("spans", [])
+        for span in raw_spans if isinstance(raw_spans, list) else []:
+            if (
+                isinstance(span, Mapping)
+                and span.get("type") == "table"
+                and isinstance(span.get("table_cells"), list)
+                and id(span) not in seen
+            ):
+                result.append(span)
+                seen.add(id(span))
+    return result
+
+
+def _layout_blocks(value: Any) -> list[Mapping[str, Any]]:
+    """Return layout blocks in tree order without descending into media."""
+    result: list[Mapping[str, Any]] = []
+    visited: set[int] = set()
+
+    def visit(item: Any) -> None:
+        if not isinstance(item, Mapping) or id(item) in visited:
+            return
+        visited.add(id(item))
+        result.append(item)
+        if item.get("type") in {"image", "chart", "interline_equation"}:
+            return
+        raw_blocks = item.get("blocks", [])
+        if isinstance(raw_blocks, list):
+            for child in raw_blocks:
+                visit(child)
+
+    if isinstance(value, list):
+        for item in value:
+            visit(item)
+    else:
+        visit(value)
+    return result
 
 
 def _checkbox_text(span: Mapping[str, Any], text: str) -> str:
@@ -627,10 +700,20 @@ def _preferred_duplicate_line(
     return candidate if candidate_area < existing_area else existing
 
 
+def _line_has_semantic_content(text: str) -> bool:
+    return bool(_normalized(text) or _isolated_checkbox_marker(text))
+
+
+def _equivalent_line_text(left: str, right: str) -> bool:
+    if _isolated_checkbox_marker(left) or _isolated_checkbox_marker(right):
+        return left.strip() == right.strip()
+    return _equivalent_semantic_text(left, right)
+
+
 def _deduplicate_lines(lines: Sequence[SemanticLine]) -> list[SemanticLine]:
     result: list[SemanticLine] = []
     for line in sorted(lines, key=lambda item: (item.bbox[1], item.bbox[0])):
-        if not _normalized(line.text):
+        if not _line_has_semantic_content(line.text):
             continue
         duplicate_index = next(
             (
@@ -655,7 +738,7 @@ def _deduplicate_lines(lines: Sequence[SemanticLine]) -> list[SemanticLine]:
                         >= 0.25
                     )
                 )
-                and _equivalent_semantic_text(line.text, existing.text)
+                and _equivalent_line_text(line.text, existing.text)
             ),
             None,
         )
@@ -700,6 +783,17 @@ def _group_visual_rows(lines: Sequence[SemanticLine]) -> list[list[SemanticLine]
         else:
             groups[best_index].append(line)
     return [sorted(group, key=lambda item: item.bbox[0]) for group in groups]
+
+
+def _reading_order_lines(lines: Sequence[SemanticLine]) -> list[SemanticLine]:
+    """Return scale-independent row-major order for unstructured text.
+
+    Sorting every fragment by its exact top coordinate makes tiny baseline
+    differences swap left/right text.  Group by visual rows first, then sort
+    within a row from left to right.  This is deliberately conservative: it
+    does not guess columns or rewrite the source text.
+    """
+    return [line for row in _group_visual_rows(lines) for line in row]
 
 
 def _join_row_lines(lines: Sequence[SemanticLine]) -> str:
@@ -954,7 +1048,7 @@ def _ledger_header(
         for category in [_ledger_category(line.text)]
         if category is not None and len(line.text) <= 100
     ]
-    best: tuple[int, float, list[tuple[str, SemanticLine]]] | None = None
+    best: tuple[int, float, float, float, list[tuple[str, SemanticLine]]] | None = None
     for _category, seed in candidates:
         cluster = [
             item for item in candidates if abs(item[1].center_y - seed.center_y) <= 24.0
@@ -970,12 +1064,16 @@ def _ledger_header(
         if score < 3:
             continue
         ordered = sorted(by_category.items(), key=lambda item: item[1].center_x)
-        candidate = (score, -seed.center_y, ordered)
-        if best is None or candidate[:2] > best[:2]:
+        centers = [line.center_y for _category, line in ordered]
+        spread = max(centers) - min(centers)
+        median_center = statistics.median(centers)
+        deviation = statistics.mean(abs(center - median_center) for center in centers)
+        candidate = (score, -spread, -deviation, -seed.center_y, ordered)
+        if best is None or candidate[:4] > best[:4]:
             best = candidate
     if best is None:
         return None
-    ordered = best[2]
+    ordered = best[4]
     return (
         ordered,
         min(line.bbox[1] for _category, line in ordered),
@@ -1205,7 +1303,20 @@ def _render_ledger_table(
             return None
     columns, header_top, header_bottom = header
     headers = [LEDGER_LABELS[category] for category, _line in columns]
-    preheader_lines = [line for line in lines if line.bbox[3] < header_top - 1.0]
+    header_line_ids = {id(line) for _category, line in columns}
+    header_band_extras = [
+        line
+        for line in lines
+        if id(line) not in header_line_ids
+        and line.bbox[1] <= header_bottom
+        and line.bbox[3] >= header_top
+        and _ledger_category(line.text) is None
+        and LEDGER_CURRENCY_UNIT_RE.fullmatch(line.text.strip()) is None
+    ]
+    preheader_lines = _deduplicate_lines(
+        [line for line in lines if line.bbox[3] < header_top - 1.0]
+        + header_band_extras
+    )
     data_lines = [
         line
         for line in lines
@@ -1281,6 +1392,72 @@ def _task_line(text: str) -> str | None:
     return None
 
 
+def _isolated_checkbox_marker(text: str) -> bool:
+    return text.strip() in {"☑", "☒", "✓", "✔", "■", "☐", "□", "◫"}
+
+
+def _merge_isolated_checkbox_markers(
+    lines: Sequence[SemanticLine],
+) -> list[SemanticLine]:
+    """Join each standalone control to its own nearby right-hand label."""
+    result: list[SemanticLine] = []
+    for group in _group_visual_rows(lines):
+        ordered = sorted(group, key=lambda item: item.bbox[0])
+        index = 0
+        while index < len(ordered):
+            marker = ordered[index]
+            if not _isolated_checkbox_marker(marker.text):
+                result.append(marker)
+                index += 1
+                continue
+            next_marker = next(
+                (
+                    candidate_index
+                    for candidate_index in range(index + 1, len(ordered))
+                    if _isolated_checkbox_marker(ordered[candidate_index].text)
+                ),
+                len(ordered),
+            )
+            followers = ordered[index + 1 : next_marker]
+            first_gap = (
+                followers[0].bbox[0] - marker.bbox[2]
+                if followers
+                else float("inf")
+            )
+            if (
+                not followers
+                or first_gap > max(30.0, marker.height * 4.0)
+                or _vertical_overlap(marker, followers[0]) < 0.25
+            ):
+                result.append(marker)
+                index += 1
+                continue
+            attached = [followers[0]]
+            for follower in followers[1:]:
+                previous = attached[-1]
+                gap = follower.bbox[0] - previous.bbox[2]
+                if gap > max(30.0, previous.height * 4.0):
+                    break
+                attached.append(follower)
+            merged_items = [marker, *attached]
+            result.append(
+                SemanticLine(
+                    (
+                        min(item.bbox[0] for item in merged_items),
+                        min(item.bbox[1] for item in merged_items),
+                        max(item.bbox[2] for item in merged_items),
+                        max(item.bbox[3] for item in merged_items),
+                    ),
+                    f"{marker.text.strip()} {_join_row_lines(attached)}".strip(),
+                    marker.cell_row,
+                    marker.cell_col,
+                    marker.cell_bbox,
+                )
+            )
+            index += 1 + len(attached)
+    return _reading_order_lines(result)
+
+
 def _merge_isolated_list_markers(
     lines: Sequence[SemanticLine],
 ) -> list[SemanticLine]:
@@ -1314,6 +1491,14 @@ def _merge_isolated_list_markers(
         else:
             result.extend(ordered)
     return result
+
+
+def _merge_control_markers(
+    lines: Sequence[SemanticLine],
+) -> list[SemanticLine]:
+    return _merge_isolated_list_markers(
+        _merge_isolated_checkbox_markers(lines)
+    )
 
 
 def _looks_like_field_label(text: str) -> bool:
@@ -1920,21 +2105,307 @@ def _output_text_key(text: str) -> str:
     )
 
 
+def _text_represented_in_markdown(text: str, markdown_key: str) -> bool:
+    normalized = _normalized(text)
+    if not normalized:
+        return False
+    if normalized in markdown_key:
+        return True
+    markerless = _normalized(
+        re.sub(
+            r"^(?:\d{1,3}[.)、:]|\([A-Za-z0-9]{1,3}\))\s*",
+            "",
+            text.strip(),
+        )
+    )
+    if len(markerless) >= 5 and markerless in markdown_key:
+        return True
+    signature_markerless = _normalized(
+        SIGNATURE_VALUE_PREFIX_RE.sub("", text.strip(), count=1)
+    )
+    if len(signature_markerless) >= 4 and signature_markerless in markdown_key:
+        return True
+    if "\n" in text or "\r" in text:
+        return False
+    return bool(
+        len(normalized) >= 10
+        and any(
+            len(_normalized(fragment)) >= 8
+            and _normalized(fragment) in markdown_key
+            for fragment in re.findall(r"[A-Za-z0-9]{4,}|[\u3400-\u9fff]{4,}", text)
+        )
+    )
+
+
+def _aggregate_text_represented_in_markdown(
+    text: str,
+    markdown_key: str,
+) -> bool:
+    fragments = [
+        fragment.strip()
+        for fragment in re.split(r"[\r\n]+", text)
+        if len(_normalized(fragment)) >= 4
+    ]
+    if len(fragments) < 2:
+        return False
+    unique_fragments = list(
+        dict.fromkeys(_normalized(fragment) for fragment in fragments)
+    )
+    represented = [
+        fragment
+        for fragment in fragments
+        if _text_represented_in_markdown(fragment, markdown_key)
+    ]
+    represented_keys = {_normalized(fragment) for fragment in represented}
+    represented_characters = sum(len(key) for key in represented_keys)
+    total_characters = sum(len(key) for key in unique_fragments)
+    return bool(
+        len(represented_keys) >= 2
+        and total_characters > 0
+        and represented_characters / total_characters >= 0.8
+    )
+
+
+def _structured_value_represented_in_markdown(
+    text: str,
+    markdown_key: str,
+) -> bool:
+    return any(
+        len(_normalized(match.group(0))) >= 4
+        and _normalized(match.group(0)) in markdown_key
+        for match in DATE_TOKEN_RE.finditer(text)
+    )
+
+
 def _append_unique_output(
     parts: list[str],
-    seen: list[str],
+    seen: list[Any],
     text: str,
+    *,
+    bbox: tuple[float, float, float, float] | None = None,
 ) -> None:
     key = _output_text_key(text)
     if not key:
         return
-    if not _repeatable_value(text) and any(
-        _equivalent_semantic_text(key, existing) for existing in seen
-    ):
-        return
     if not _repeatable_value(text):
-        seen.append(key)
+        duplicate = False
+        for existing in seen:
+            if isinstance(existing, tuple) and len(existing) == 2:
+                existing_key, existing_bbox = existing
+            else:
+                existing_key, existing_bbox = existing, None
+            if not _equivalent_semantic_text(key, str(existing_key)):
+                continue
+            if bbox is None or existing_bbox is None:
+                duplicate = True
+                break
+            if _same_visual_position(
+                SemanticLine(bbox, key),
+                SemanticLine(existing_bbox, str(existing_key)),
+            ):
+                duplicate = True
+                break
+        if duplicate:
+            return
+        seen.append((key, bbox) if bbox is not None else key)
     parts.append(text)
+
+
+def _active_page_objects(page: Mapping[str, Any]) -> Iterable[Mapping[str, Any]]:
+    """Yield output-owning page evidence, excluding diagnostic/discarded copies."""
+    yielded: set[int] = set()
+    for key in ("preproc_blocks",):
+        for item in _iter_objects(page.get(key, [])):
+            if id(item) not in yielded:
+                yielded.add(id(item))
+                yield item
+
+
+def _is_table_cell(item: Mapping[str, Any]) -> bool:
+    return bool(
+        "row_start" in item
+        and "col_start" in item
+        and ("text" in item or "content_spans" in item)
+    )
+
+
+def _source_text_candidate(
+    item: Mapping[str, Any],
+) -> tuple[str, tuple[float, float, float, float] | None] | None:
+    if _is_table_cell(item):
+        raw_spans = item.get("content_spans", [])
+        has_visible_span = bool(
+            isinstance(raw_spans, list)
+            and any(
+                isinstance(span, Mapping)
+                and _span_text(span)
+                and not span.get("fusion_visualization_hidden")
+                for span in raw_spans
+            )
+        )
+        # A Cell with visible child spans is represented by those span records.
+        # Use the Cell text only as a fallback when the children are absent or
+        # entirely hidden, matching the renderer's authoritative-text fallback.
+        if has_visible_span:
+            return None
+        text = _semantic_cell_text(item)
+        bbox = _valid_bbox(item.get("content_bbox")) or _valid_bbox(
+            item.get("bbox")
+        )
+        return text, bbox
+    span_type = item.get("type")
+    untyped_leaf = bool(
+        span_type is None
+        and not any(
+            key in item
+            for key in ("blocks", "lines", "spans", "content_spans", "table_cells")
+        )
+    )
+    if span_type in {"text", "hyperlink"} or untyped_leaf:
+        text = _span_text(item)
+        return text, _valid_bbox(item.get("bbox"))
+    return None
+
+
+def _page_has_source_text(page: Mapping[str, Any]) -> bool:
+    for item in _active_page_objects(page):
+        candidate = _source_text_candidate(item)
+        if candidate is not None and _normalized(candidate[0]):
+            return True
+    return False
+
+
+def _text_source_stats(middle_json: Mapping[str, Any]) -> tuple[int, int]:
+    seen: set[int] = set()
+    count = 0
+    characters = 0
+    pages = middle_json.get("pdf_info", [])
+    for page in pages if isinstance(pages, list) else []:
+        if not isinstance(page, Mapping):
+            continue
+        for item in _active_page_objects(page):
+            if id(item) in seen:
+                continue
+            seen.add(id(item))
+            candidate = _source_text_candidate(item)
+            if candidate is None:
+                continue
+            text, _bbox = candidate
+            if not _normalized(text):
+                continue
+            count += 1
+            characters += len(_normalized(text))
+    return count, characters
+
+
+def _trace_source_records(
+    middle_json: Mapping[str, Any],
+    markdown: str,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    pages = middle_json.get("pdf_info", [])
+    records: list[dict[str, Any]] = []
+    counts: dict[str, int] = defaultdict(int)
+    if not isinstance(pages, list):
+        return records, dict(counts)
+    markdown_key = _normalized(markdown)
+    repeated_margins = _margin_repetitions(pages)
+    seen: set[int] = set()
+    for page_index, page in enumerate(pages):
+        if not isinstance(page, Mapping):
+            continue
+        page_size = page.get("page_size", [])
+        page_height = (
+            float(page_size[1])
+            if isinstance(page_size, (list, tuple)) and len(page_size) >= 2
+            else 0.0
+        )
+        for item in _active_page_objects(page):
+            if id(item) in seen:
+                continue
+            seen.add(id(item))
+            candidate = _source_text_candidate(item)
+            if candidate is None:
+                continue
+            text, bbox = candidate
+            normalized = _normalized(text)
+            if not text or bbox is None:
+                continue
+            at_page_bottom = bool(page_height > 0 and bbox[3] >= page_height * 0.9)
+            if FOOTER_RE.search(text) or (
+                at_page_bottom
+                and (
+                    CONTACT_FOOTER_RE.search(text)
+                    or BOTTOM_ORGANIZATION_RE.search(text)
+                )
+            ):
+                status = "filtered_footer"
+            elif NOISE_TEXT_RE.fullmatch(text):
+                status = "filtered_noise"
+            elif _looks_like_formula_text(text):
+                status = "filtered_formula"
+            elif _implausible_recovered_text_density(item, bbox, text):
+                status = "filtered_recovery_quality"
+            elif not normalized:
+                status = "filtered_punctuation"
+            elif normalized in repeated_margins:
+                status = "deduplicated_repeated_margin"
+            elif (
+                (category := _ledger_category(text)) is not None
+                and _normalized(LEDGER_LABELS[category]) in markdown_key
+            ):
+                status = "represented_schema"
+            elif (
+                LEDGER_CURRENCY_UNIT_RE.fullmatch(text.strip())
+                and _normalized(LEDGER_LABELS["amount"]) in markdown_key
+            ):
+                status = "represented_schema"
+            elif _isolated_checkbox_marker(text) and re.search(
+                r"^- \[[x ?]\] ",
+                markdown,
+                re.MULTILINE,
+            ):
+                status = "represented_control"
+            elif item.get("fusion_visualization_hidden"):
+                status = "represented_grouped_marker"
+            elif _text_represented_in_markdown(text, markdown_key):
+                status = "represented"
+            elif _structured_value_represented_in_markdown(text, markdown_key):
+                status = "represented_value"
+            elif _aggregate_text_represented_in_markdown(text, markdown_key):
+                status = "represented_aggregate"
+            elif len(normalized) >= 6 and any(
+                _equivalent_semantic_text(text, line)
+                for line in markdown.splitlines()
+                if line.strip() and not line.lstrip().startswith("<!--")
+            ):
+                status = "represented_equivalent"
+            else:
+                status = "unmatched"
+            counts[status] += 1
+            records.append(
+                {
+                    "page": page_index + 1,
+                    "bbox": [round(value, 4) for value in bbox],
+                    "text": text,
+                    "status": status,
+                    "source": (
+                        item.get("fusion_recognition_source")
+                        or item.get("fusion_source")
+                        or item.get("fusion_recovery_source")
+                        or "ocr"
+                    ),
+                }
+            )
+    return records, dict(sorted(counts.items()))
+
+
+def _markdown_body_stats(markdown: str) -> tuple[int, int]:
+    lines = [
+        line.strip()
+        for line in markdown.splitlines()
+        if line.strip() and not line.lstrip().startswith("<!--")
+    ]
+    return len(lines), sum(len(_normalized(line)) for line in lines)
 
 
 def _signature_row_bounds(
@@ -1968,12 +2439,14 @@ def _signature_name_value(text: str) -> str:
         maxsplit=1,
         flags=re.IGNORECASE,
     )[0]
+    value = SIGNATURE_VALUE_PREFIX_RE.sub("", value, count=1).strip()
     value = re.sub(r"^[^A-Za-z\u3400-\u9fff]+", "", value).strip()
     value = re.sub(r"^[\u3400-\u9fff]\s*[)）]\s*", "", value).strip()
     if (
         len(_normalized(value)) < 4
         or any(character.isdigit() for character in value)
         or _looks_like_field_label(value)
+        or MEDICAL_QUALIFICATION_RE.search(value)
         or POLICY_OWNER_SIGNATURE_RE.search(value)
         or INSURED_SIGNATURE_RE.search(value)
         or BLOCK_NAME_LABEL_RE.search(value)
@@ -2312,6 +2785,231 @@ def _render_physician_footer_lines(
         )
     ):
         return None
+    label_patterns = re.compile(
+        r"^\s*(?:Signed|Qualifications|Date|Name of physician|Address|"
+        r"Telephone Number)\b|^(?:簽名|資歷|日期|醫生的姓名|地址|電話號碼)",
+        re.IGNORECASE,
+    )
+    all_labels = [
+        *signed,
+        *qualifications,
+        *dates,
+        *physician_labels,
+        *address_labels,
+        *telephone_labels,
+    ]
+    label_keys = {
+        (line.cell_row, line.cell_col)
+        for line in all_labels
+        if line.cell_row is not None and line.cell_col is not None
+    }
+    use_cell_layout = bool(
+        len(label_keys) >= 4
+        and len({row for row, _col in label_keys}) >= 2
+    )
+    if use_cell_layout:
+        label_ids = {id(line) for line in all_labels}
+
+        def related_values(field_labels: Sequence[SemanticLine]) -> list[SemanticLine]:
+            scored: list[tuple[int, float, SemanticLine]] = []
+            for line in lines:
+                if (
+                    id(line) in label_ids
+                    or label_patterns.search(line.text)
+                    or LABEL_QUALIFIER_RE.fullmatch(line.text.strip())
+                    or re.fullmatch(r"\(?\s*with stamp\s*\)?", line.text, re.IGNORECASE)
+                    or line.cell_row is None
+                    or line.cell_col is None
+                ):
+                    continue
+                scores: list[tuple[int, float]] = []
+                for key, label in (
+                    ((candidate.cell_row, candidate.cell_col), candidate)
+                    for candidate in field_labels
+                    if candidate.cell_row is not None
+                    and candidate.cell_col is not None
+                ):
+                    column_delta = line.cell_col - key[1]
+                    row_delta = abs(line.cell_row - key[0])
+                    right_boundaries = [
+                        other.cell_col
+                        for other in all_labels
+                        if other.cell_row == key[0]
+                        and other.cell_col is not None
+                        and other.cell_col > key[1]
+                    ]
+                    right_boundary = min(right_boundaries, default=None)
+                    relation = (
+                        0
+                        if (line.cell_row, line.cell_col) == key
+                        else 1
+                        if (
+                            row_delta == 0
+                            and 0 < column_delta <= 2
+                            and (
+                                right_boundary is None
+                                or line.cell_col < right_boundary
+                            )
+                        )
+                        else 2
+                        if (
+                            row_delta == 1
+                            and 0 < column_delta <= 2
+                            and (
+                                right_boundary is None
+                                or line.cell_col < right_boundary
+                            )
+                        )
+                        else 99
+                    )
+                    if relation < 99:
+                        scores.append(
+                            (relation, abs(line.center_y - label.center_y))
+                        )
+                score = min(scores, default=(99, float("inf")))
+                if score[0] < 99:
+                    scored.append((score[0], score[1], line))
+            if not scored:
+                return []
+            if any(relation <= 1 for relation, _distance, _line in scored):
+                scored = [
+                    item for item in scored if item[0] <= 1
+                ]
+            minimum_distance = min(distance for _relation, distance, _line in scored)
+            typical_height = statistics.median(
+                line.height for _relation, _distance, line in scored
+            )
+            maximum_distance = minimum_distance + max(12.0, typical_height)
+            return _deduplicate_lines(
+                [
+                    line
+                    for _relation, distance, line in sorted(
+                        scored,
+                        key=lambda item: (
+                            item[2].bbox[1],
+                            item[0],
+                            item[2].bbox[0],
+                        ),
+                    )
+                    if distance <= maximum_distance
+                ]
+            )
+
+        grid_top = min(
+            line.bbox[1]
+            for line in (
+                *qualifications,
+                *dates,
+                *physician_labels,
+                *address_labels,
+                *telephone_labels,
+            )
+        )
+        prefix = [
+            line
+            for line in lines
+            if line.center_y < grid_top and id(line) not in label_ids
+        ]
+        parts = _render_plain_form_lines(prefix)
+        physician_values = related_values(physician_labels)
+        qualification_values = _deduplicate_lines(
+            [
+                *related_values(qualifications),
+                *[
+                    line
+                    for line in lines
+                    if line.center_y >= grid_top
+                    and MEDICAL_QUALIFICATION_RE.search(line.text)
+                    and id(line) not in label_ids
+                ],
+            ]
+        )
+        address_values = [
+            line
+            for line in related_values(address_labels)
+            if MEDICAL_QUALIFICATION_RE.search(line.text) is None
+            and re.search(r"^\s*(?:Tel(?:ephone)?|Fax)\s*[:：]", line.text, re.IGNORECASE)
+            is None
+        ]
+        date_values = related_values(dates)
+        telephone_values = related_values(telephone_labels)
+        physician_names = [
+            value
+            for line in physician_values
+            for value in [_signature_name_value(line.text)]
+            if value
+        ]
+        signature_left = min(line.bbox[0] for line in physician_labels)
+        physician_rows = {
+            line.cell_row for line in physician_labels if line.cell_row is not None
+        }
+        physician_columns = [
+            line.cell_col for line in physician_labels if line.cell_col is not None
+        ]
+        first_physician_column = min(physician_columns, default=0)
+        signature_present = any(
+            (
+                (
+                    line.cell_row in physician_rows
+                    and line.cell_col is not None
+                    and line.cell_col < first_physician_column
+                )
+                or (
+                    line.center_x < signature_left
+                    and line.bbox[1] >= min(anchor.bbox[1] for anchor in signed)
+                    and line.bbox[3]
+                    <= max(
+                        anchor.cell_bbox[3]
+                        if anchor.cell_bbox
+                        else anchor.bbox[3]
+                        for anchor in physician_labels
+                    )
+                )
+            )
+            and id(line) not in label_ids
+            and not LABEL_QUALIFIER_RE.fullmatch(line.text.strip())
+            and len(_normalized(line.text)) <= 20
+            for line in lines
+        )
+        parts.append(
+            f"- **{min(signed, key=lambda line: line.center_y).text.strip().rstrip(':：')}**"
+            + (": [Signature]" if signature_present else "")
+        )
+        parts.append(
+            "- **Name of physician (with stamp) / 醫生的姓名(蓋印)**"
+            + (
+                f": {' / '.join(dict.fromkeys(physician_names))}"
+                if physician_names
+                else ""
+            )
+        )
+        qualification_text = _join_field_values(qualification_values)
+        parts.append(
+            "- **Qualifications / 資歷**"
+            + (f": {qualification_text}" if qualification_text else "")
+        )
+        address_text = _join_field_values(address_values)
+        parts.append(
+            "- **Address 地址**" + (f": {address_text}" if address_text else "")
+        )
+        date_text = next(
+            (
+                _clean_text(match.group(0))
+                for line in date_values
+                for match in [DATE_TOKEN_RE.search(line.text)]
+                if match is not None
+            ),
+            _join_field_values(date_values),
+        )
+        parts.append(
+            "- **Date / 日期**" + (f": {date_text}" if date_text else "")
+        )
+        telephone_text = _join_field_values(telephone_values)
+        parts.append(
+            "- **Telephone Number / 電話號碼**"
+            + (f": {telephone_text}" if telephone_text else "")
+        )
+        return parts
     anchors = [
         min(signed, key=lambda line: line.center_y),
         min(qualifications, key=lambda line: line.center_y),
@@ -2417,22 +3115,67 @@ def _render_medical_grid_table(
     header_top = min(line.bbox[1] for _category, line in header)
     header_bottom = max(line.bbox[3] for _category, line in header)
     left_anchor = min(line.bbox[0] for _category, line in header)
-    boundary_candidates = [
-        line
-        for line in lines
-        if line.bbox[1] > header_bottom + 6.0
-        and line.bbox[0] <= left_anchor + 35.0
-        and FORM_PROMPT_RE.match(line.text.strip())
-    ]
+    boundary_candidates = []
+    for line in lines:
+        stripped = line.text.strip()
+        if FORM_PROMPT_RE.match(stripped) is None:
+            continue
+        numbered_question = bool(
+            QUESTION_PROMPT_RE.search(FORM_PROMPT_RE.sub("", stripped))
+        )
+        starts_below_header = line.bbox[1] > header_bottom + 6.0
+        spanning_question = bool(
+            numbered_question
+            and line.bbox[1] <= header_bottom + 6.0
+            and line.bbox[3] > header_bottom + 30.0
+        )
+        if (
+            starts_below_header
+            and (line.bbox[0] <= left_anchor + 35.0 or numbered_question)
+        ) or spanning_question:
+            boundary_candidates.append(line)
+    boundary_positions = {
+        id(line): (
+            line.bbox[1]
+            if line.bbox[1] > header_bottom + 6.0
+            else line.bbox[3]
+        )
+        for line in boundary_candidates
+    }
     boundary_top = min(
-        (line.bbox[1] for line in boundary_candidates),
+        boundary_positions.values(),
         default=float("inf"),
     )
+    boundary_ids = {id(line) for line in boundary_candidates}
+    spanning_boundary = [
+        line
+        for line in boundary_candidates
+        if line.bbox[1] < boundary_top
+        and boundary_positions[id(line)] == boundary_top
+    ]
+    spanning_cells = {
+        (line.cell_row, line.cell_col)
+        for line in spanning_boundary
+        if line.cell_row is not None and line.cell_col is not None
+    }
+    spanning_companions = [
+        line
+        for line in lines
+        if id(line) not in boundary_ids
+        and (line.cell_row, line.cell_col) in spanning_cells
+        and _uses_cell_bbox(line)
+        and _medical_grid_category(line.text) is None
+    ]
+    spanning_ids = {
+        id(line) for line in (*spanning_boundary, *spanning_companions)
+    }
     prefix = [line for line in lines if line.center_y < header_top]
     data_lines = [
         line
         for line in lines
         if id(line) not in header_indices
+        and id(line) not in boundary_ids
+        and id(line) not in spanning_ids
         and line.center_y > header_bottom
         and line.bbox[1] < boundary_top
         and not FOOTER_RE.search(line.text)
@@ -2442,7 +3185,15 @@ def _render_medical_grid_table(
             and line.bbox[2] - line.bbox[0] <= max(20.0, line.height * 2.5)
         )
     ]
-    suffix = [line for line in lines if line.bbox[1] >= boundary_top]
+    suffix = _deduplicate_lines(
+        [*spanning_boundary, *spanning_companions]
+        + [
+            line
+            for line in lines
+            if line.bbox[1] >= boundary_top
+            and id(line) not in spanning_ids
+        ]
+    )
     if not data_lines:
         return None
 
@@ -2480,7 +3231,7 @@ def _render_form_cell(
 ) -> list[str]:
     lines = [
         line.text
-        for line in _merge_isolated_list_markers(
+        for line in _merge_control_markers(
             _visible_cell_lines(cell, excluded_keys)
         )
     ]
@@ -2527,7 +3278,7 @@ def _render_form_table(
     medical_grid = _render_medical_grid_table(table, excluded_keys)
     if medical_grid is not None:
         return medical_grid
-    lines = _merge_isolated_list_markers(_table_lines(table, excluded_keys))
+    lines = _merge_control_markers(_table_lines(table, excluded_keys))
     return "\n\n".join(_render_generic_form_lines(lines))
 
 
@@ -2540,7 +3291,8 @@ def _repeatable_value(text: str) -> bool:
     )
 
 
-def _block_lines(block: Mapping[str, Any]) -> list[SemanticLine]:
+def _direct_block_lines(block: Mapping[str, Any]) -> list[SemanticLine]:
+    """Return only the lines owned directly by one layout block."""
     result = []
     raw_lines = block.get("lines", [])
     if not isinstance(raw_lines, list):
@@ -2557,7 +3309,7 @@ def _block_lines(block: Mapping[str, Any]) -> list[SemanticLine]:
                 or span.get("type") in {"image", "table"}
             ):
                 continue
-            text = _span_text(span)
+            text = _checkbox_text(span, _span_text(span))
             if text:
                 parts.append(text)
         text = " ".join(parts).strip()
@@ -2566,8 +3318,55 @@ def _block_lines(block: Mapping[str, Any]) -> list[SemanticLine]:
     return result
 
 
-def _margin_repetitions(pages: Sequence[Mapping[str, Any]]) -> set[str]:
-    occurrences: dict[str, set[int]] = defaultdict(set)
+def _direct_semantic_lines(block: Mapping[str, Any]) -> list[SemanticLine]:
+    return _merge_control_markers(
+        _reading_order_lines(_deduplicate_lines(_direct_block_lines(block)))
+    )
+
+
+def _block_lines(block: Mapping[str, Any]) -> list[SemanticLine]:
+    """Collect visible text recursively from ordinary or demoted blocks.
+
+    A page-sized Table can be demoted after OCR and retain its evidence in
+    nested ``blocks`` instead of ``table_cells``.  Treating such a container as
+    empty silently loses the page, so nested layout blocks are a conservative
+    geometry-backed fallback.  Each mapping is visited once to avoid aggregate
+    and child traversal duplicating the same object.
+    """
+    result: list[SemanticLine] = []
+    visited: set[int] = set()
+
+    def visit(item: Any) -> None:
+        if not isinstance(item, Mapping) or id(item) in visited:
+            return
+        visited.add(id(item))
+        result.extend(_direct_block_lines(item))
+        raw_blocks = item.get("blocks", [])
+        if isinstance(raw_blocks, list):
+            for child in raw_blocks:
+                visit(child)
+
+    visit(block)
+    return _merge_control_markers(_reading_order_lines(_deduplicate_lines(result)))
+
+
+def _equivalent_margin_text(left: str, right: str) -> bool:
+    left_key = _normalized(left)
+    right_key = _normalized(right)
+    if left_key == right_key:
+        return True
+    shorter, longer = sorted((left_key, right_key), key=len)
+    if len(shorter) < 20 or len(shorter) / len(longer) < 0.75:
+        return False
+    left_numbers = re.findall(r"\d+(?:[.,:/-]\d+)*", left)
+    right_numbers = re.findall(r"\d+(?:[.,:/-]\d+)*", right)
+    if left_numbers != right_numbers:
+        return False
+    return SequenceMatcher(None, left_key, right_key).ratio() >= 0.88
+
+
+def _margin_repetitions(pages: Sequence[Mapping[str, Any]]) -> dict[str, str]:
+    occurrences: dict[tuple[str, str], tuple[str, set[int]]] = {}
     for page_index, page in enumerate(pages):
         page_size = page.get("page_size", [])
         height = (
@@ -2577,17 +3376,72 @@ def _margin_repetitions(pages: Sequence[Mapping[str, Any]]) -> set[str]:
         )
         if height <= 0:
             continue
-        for block in page.get("preproc_blocks", []):
-            if not isinstance(block, Mapping):
+        seen_tables: set[int] = set()
+        for block in _layout_blocks(page.get("preproc_blocks", [])):
+            lines = list(_direct_semantic_lines(block))
+            for table in _direct_table_spans(block):
+                if id(table) in seen_tables:
+                    continue
+                seen_tables.add(id(table))
+                lines.extend(_table_lines(table))
+            for line in _deduplicate_lines(lines):
+                side = (
+                    "top"
+                    if line.bbox[1] <= height * 0.1
+                    else "bottom"
+                    if line.bbox[3] >= height * 0.82
+                    else ""
+                )
+                key = _normalized(line.text)
+                if not side or len(key) < 5:
+                    continue
+                occurrence_key = (side, key)
+                if occurrence_key not in occurrences:
+                    occurrences[occurrence_key] = (line.text, set())
+                occurrences[occurrence_key][1].add(page_index)
+
+    nodes = list(occurrences)
+    parents = list(range(len(nodes)))
+
+    def root(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left_index: int, right_index: int) -> None:
+        left_root = root(left_index)
+        right_root = root(right_index)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    for left_index, (left_side, left_key) in enumerate(nodes):
+        left_text, left_pages = occurrences[(left_side, left_key)]
+        for right_index in range(left_index + 1, len(nodes)):
+            right_side, right_key = nodes[right_index]
+            if left_side != right_side:
                 continue
-            table = _table_span(block) if block.get("type") == "table" else None
-            lines = _table_lines(table) if table is not None else _block_lines(block)
-            for line in lines:
-                if line.bbox[1] <= height * 0.1 or line.bbox[3] >= height * 0.9:
-                    key = _normalized(line.text)
-                    if len(key) >= 5:
-                        occurrences[key].add(page_index)
-    return {key for key, page_ids in occurrences.items() if len(page_ids) >= 2}
+            right_text, right_pages = occurrences[(right_side, right_key)]
+            if len(left_pages | right_pages) < 2:
+                continue
+            if _equivalent_margin_text(left_text, right_text):
+                union(left_index, right_index)
+
+    clusters: dict[int, list[int]] = defaultdict(list)
+    for index in range(len(nodes)):
+        clusters[root(index)].append(index)
+    result: dict[str, str] = {}
+    for indices in clusters.values():
+        page_ids = set().union(
+            *(occurrences[nodes[index]][1] for index in indices)
+        )
+        if len(page_ids) < 2:
+            continue
+        keys = sorted(nodes[index][1] for index in indices)
+        canonical = keys[0]
+        for key in keys:
+            result[key] = canonical
+    return result
 
 
 def _fragment_noise_page(parts: Sequence[str]) -> bool:
@@ -2617,6 +3471,53 @@ def _fragment_noise_page(parts: Sequence[str]) -> bool:
     return fragment_count / len(lines) >= 0.75 and lexical_count <= 2
 
 
+def _page_noise_lines(parts: Sequence[str]) -> list[str]:
+    """Keep probable OCR noise auditable without discarding an entire page."""
+    return [
+        line.strip()
+        for part in parts
+        for line in part.splitlines()
+        if line.strip() and not line.lstrip().startswith("<!--")
+    ]
+
+
+def _sort_page_segments(
+    segments: Sequence[
+        tuple[float, float, str, tuple[float, float, float, float]]
+    ],
+) -> list[tuple[float, float, str, tuple[float, float, float, float]]]:
+    """Sort page segments by tolerant top rows and then left position."""
+    if not segments:
+        return []
+    heights = [
+        bbox[3] - bbox[1]
+        for _top, _left, _text, bbox in segments
+        if bbox[3] > bbox[1]
+    ]
+    typical_height = statistics.median(heights) if heights else 8.0
+    tolerance = max(2.0, min(typical_height, 24.0) * 0.45)
+    rows: list[list[tuple[float, float, str, tuple[float, float, float, float]]]] = []
+    for segment in sorted(segments, key=lambda item: (item[0], item[1])):
+        best_index = None
+        best_distance = float("inf")
+        for index, row in enumerate(rows[-4:]):
+            actual_index = len(rows) - len(rows[-4:]) + index
+            row_top = statistics.mean(item[0] for item in row)
+            distance = abs(segment[0] - row_top)
+            if distance <= tolerance and distance < best_distance:
+                best_index = actual_index
+                best_distance = distance
+        if best_index is None:
+            rows.append([segment])
+        else:
+            rows[best_index].append(segment)
+    return [
+        segment
+        for row in rows
+        for segment in sorted(row, key=lambda item: (item[1], item[0]))
+    ]
+
+
 def generate_semantic_markdown(middle_json: Mapping[str, Any]) -> str:
     """Build a conservative alternative Markdown view from fused geometry."""
     pages = middle_json.get("pdf_info", [])
@@ -2636,25 +3537,30 @@ def generate_semantic_markdown(middle_json: Mapping[str, Any]) -> str:
             if isinstance(page_size, (list, tuple)) and len(page_size) >= 2
             else 0.0
         )
-        segments: list[tuple[float, float, str]] = []
-        for block in page.get("preproc_blocks", []):
-            if not isinstance(block, Mapping):
-                continue
-            bbox = _valid_bbox(block.get("bbox")) or (0.0, 0.0, 0.0, 0.0)
-            table = _table_span(block) if block.get("type") == "table" else None
-            if table is not None:
+        segments: list[
+            tuple[float, float, str, tuple[float, float, float, float]]
+        ] = []
+        seen_tables: set[int] = set()
+        for block in _layout_blocks(page.get("preproc_blocks", [])):
+            block_bbox = _valid_bbox(block.get("bbox")) or (0.0, 0.0, 0.0, 0.0)
+            for table in _direct_table_spans(block):
+                if id(table) in seen_tables:
+                    continue
+                seen_tables.add(id(table))
+                table_bbox = _valid_bbox(table.get("bbox")) or block_bbox
                 rendered = _render_ledger_table(
                     table,
-                    repeated_margins,
+                    set(repeated_margins),
                     seen_ledger_preheaders,
                     seen_ledger_tail,
-                ) or _render_form_table(table, repeated_margins)
+                ) or _render_form_table(table, set(repeated_margins))
                 if rendered:
-                    segments.append((bbox[1], bbox[0], rendered))
-                continue
+                    segments.append(
+                        (table_bbox[1], table_bbox[0], rendered, table_bbox)
+                    )
             if block.get("type") in {"image", "chart", "interline_equation"}:
                 continue
-            for line in _block_lines(block):
+            for line in _direct_semantic_lines(block):
                 text = line.text
                 key = _normalized(text)
                 if FOOTER_RE.search(text) or NOISE_TEXT_RE.fullmatch(text):
@@ -2670,10 +3576,11 @@ def generate_semantic_markdown(middle_json: Mapping[str, Any]) -> str:
                     )
                 ):
                     continue
-                if key in repeated_margins:
-                    if key in emitted_margins:
+                margin_group = repeated_margins.get(key)
+                if margin_group is not None:
+                    if margin_group in emitted_margins:
                         continue
-                    emitted_margins.add(key)
+                    emitted_margins.add(margin_group)
                 is_short_title = (
                     len(text) <= 80
                     and len(text.split()) <= 12
@@ -2686,27 +3593,146 @@ def generate_semantic_markdown(middle_json: Mapping[str, Any]) -> str:
                 )
                 prefix = (
                     "## "
-                    if block.get("type") == "title"
+                    if block.get("type") in {"title", "table_caption"}
                     and (_is_section(text) or is_short_title)
                     else ""
                 )
-                segments.append((line.bbox[1], line.bbox[0], prefix + text))
+                task = _task_line(text)
+                if task is not None:
+                    text = task
+                    prefix = ""
+                segments.append(
+                    (line.bbox[1], line.bbox[0], prefix + text, line.bbox)
+                )
         if not segments:
             continue
         page_parts: list[str] = []
-        seen: list[str] = []
-        for _top, _left, text in sorted(segments):
-            _append_unique_output(page_parts, seen, text)
+        seen: list[Any] = []
+        for _top, _left, text, source_bbox in _sort_page_segments(segments):
+            _append_unique_output(
+                page_parts,
+                seen,
+                text,
+                bbox=source_bbox,
+            )
         if _fragment_noise_page(page_parts):
-            continue
+            # A noisy page is still source evidence.  Omitting it makes a
+            # false-positive page classifier indistinguishable from a blank
+            # page, so preserve the conservative reading-order fallback and
+            # mark it for downstream/manual review.
+            page_parts = [
+                "<!-- semantic-warning: fragment-heavy-page -->",
+                *_page_noise_lines(page_parts),
+            ]
         document_parts.append(f"<!-- Page {page_index + 1} -->")
         document_parts.extend(page_parts)
     return "\n\n".join(document_parts).strip() + "\n"
 
 
+def generate_semantic_markdown_report(
+    middle_json: Mapping[str, Any],
+    markdown: str | None = None,
+) -> dict[str, Any]:
+    """Summarize source evidence and conservative fallback decisions.
+
+    The report intentionally avoids claiming character accuracy without ground
+    truth.  It exposes coverage proxies and warning pages so regressions can be
+    compared across arbitrary documents and reviewed against source bboxes.
+    """
+    rendered = (
+        markdown
+        if markdown is not None
+        else generate_semantic_markdown(middle_json)
+    )
+    pages = middle_json.get("pdf_info", [])
+    page_count = len(pages) if isinstance(pages, list) else 0
+    emitted_page_numbers = {
+        int(value) for value in re.findall(r"<!-- Page (\d+) -->", rendered)
+    }
+    text_bearing_page_numbers = [
+        page_index + 1
+        for page_index, page in enumerate(pages if isinstance(pages, list) else [])
+        if isinstance(page, Mapping) and _page_has_source_text(page)
+    ]
+    text_bearing_page_set = set(text_bearing_page_numbers)
+    source_records, source_characters = _text_source_stats(middle_json)
+    emitted_records, emitted_characters = _markdown_body_stats(rendered)
+    trace_records, trace_counts = _trace_source_records(middle_json, rendered)
+    fragment_pages = [
+        int(match.group(1))
+        for match in re.finditer(
+            r"<!-- Page (\d+) -->\s*\n\n"
+            r"<!-- semantic-warning: fragment-heavy-page -->",
+            rendered,
+        )
+    ]
+    fallback_blocks = 0
+    fallback_pages: list[int] = []
+    if isinstance(pages, list):
+        for page_index, page in enumerate(pages):
+            if not isinstance(page, Mapping):
+                continue
+            page_fallbacks = 0
+            for block in page.get("preproc_blocks", []):
+                if not isinstance(block, Mapping):
+                    continue
+                if (
+                    block.get("type") == "table"
+                    and not _table_has_cells(_table_span(block))
+                    and _block_lines(block)
+                ):
+                    page_fallbacks += 1
+            fallback_blocks += page_fallbacks
+            if page_fallbacks:
+                fallback_pages.append(page_index + 1)
+    return {
+        "semantic_markdown_version": SEMANTIC_MARKDOWN_VERSION,
+        "pages": page_count,
+        "pages_emitted": len(emitted_page_numbers),
+        "text_bearing_pages": len(text_bearing_page_numbers),
+        "text_bearing_pages_emitted": len(
+            text_bearing_page_set & emitted_page_numbers
+        ),
+        "text_bearing_page_numbers": text_bearing_page_numbers,
+        "text_bearing_pages_not_emitted": sorted(
+            text_bearing_page_set - emitted_page_numbers
+        ),
+        "blank_or_image_only_pages": [
+            page_number
+            for page_number in range(1, page_count + 1)
+            if page_number not in text_bearing_page_set
+        ],
+        "source_text_records": source_records,
+        "source_text_characters": source_characters,
+        "markdown_records": emitted_records,
+        "markdown_characters": emitted_characters,
+        "markdown_to_source_character_ratio": (
+            round(emitted_characters / source_characters, 6)
+            if source_characters
+            else 1.0
+        ),
+        "trace_accounting_ratio": (
+            round(
+                (len(trace_records) - trace_counts.get("unmatched", 0))
+                / len(trace_records),
+                6,
+            )
+            if trace_records
+            else 1.0
+        ),
+        "fragment_heavy_pages": fragment_pages,
+        "unstructured_table_fallback_blocks": fallback_blocks,
+        "unstructured_table_fallback_pages": fallback_pages,
+        "trace_counts": trace_counts,
+        "unmatched_source_records": trace_counts.get("unmatched", 0),
+        "source_trace": trace_records,
+    }
+
+
 def write_semantic_markdown(
     middle_json_path: str | Path,
     output_path: str | Path | None = None,
+    report_path: str | Path | None = None,
 ) -> Path:
     middle_path = Path(middle_json_path)
     payload = json.loads(middle_path.read_text(encoding="utf-8"))
@@ -2719,7 +3745,20 @@ def write_semantic_markdown(
     else:
         output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(generate_semantic_markdown(payload), encoding="utf-8")
+    markdown = generate_semantic_markdown(payload)
+    output.write_text(markdown, encoding="utf-8")
+    if report_path is not None:
+        report = Path(report_path)
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(
+            json.dumps(
+                generate_semantic_markdown_report(payload, markdown),
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
     return output
 
 
@@ -2727,8 +3766,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("middle_json", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--report", type=Path)
     args = parser.parse_args(argv)
-    print(write_semantic_markdown(args.middle_json, args.output))
+    print(write_semantic_markdown(args.middle_json, args.output, args.report))
     return 0
 
 

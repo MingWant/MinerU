@@ -125,16 +125,37 @@ renderer uses OCR span geometry, Cell row/column metadata, and conservative
 field-type checks rather than document-specific names or coordinates. It pairs
 labels with values in the same Cell or an adjacent value Cell, joins split
 checkbox/list markers, rebuilds ledger tables, removes repeated page metadata,
-and normalizes common dates and amounts. Version 4 treats Cell text as the
+and normalizes common dates and amounts. Version 5 treats Cell text as the
 authority when an OCR span crosses neighboring Cells, anchors repeated
 policy-owner/insured and physician signature grids by row and column, and emits
 diagnostic, treatment, laboratory, and follow-up grids as Markdown tables instead
-of flattening their columns. The label vocabulary covers common
-claim, member, provider, contact, identifier, address, date, email, postal-code,
-and amount fields, so new form layouts do not require PDF-specific rules. Set
+of flattening their columns. It also preserves fragment-heavy pages with an
+explicit warning, recursively recovers text from demoted/unstructured Table
+blocks, requires spatial evidence for de-duplication, and emits a
+`<document>_semantic_report.json` coverage sidecar. The report distinguishes
+text-bearing pages from blank/image-only pages and records represented,
+schema-normalized, de-duplicated, filtered, and unmatched source evidence. The
+label vocabulary covers common claim, member, provider, contact, identifier,
+address, date, email, postal-code, and amount fields, so new form layouts do not
+require PDF-specific rules. Set
 `preserve_native=true` to keep `<document>_native.md` for direct A/B comparison
-with MinerU's original Markdown. The output marker `semantic-markdown-v4`
+with MinerU's original Markdown. The output marker `semantic-markdown-v5`
 identifies this renderer version.
+
+Replay one or more fused middle JSON files without calling MinerU or vLLM:
+
+```powershell
+python projects/custom_hybrid/semantic_markdown_benchmark.py `
+  output/fused `
+  --output output/semantic_markdown_benchmark.json
+```
+
+The benchmark summary reports total and emitted text-bearing pages, generation
+failures, fragment-heavy pages, unstructured Table fallbacks, and unmatched
+source records. Per-document reports also identify the page numbers containing
+unstructured Table fallbacks. Each benchmark document entry includes only the
+unmatched trace details; the per-document semantic report retains the complete
+source trace.
 
 Each fused parse directory also contains `<document>_fusion.json`, which records
 the bbox, candidates, confidence, similarity, and decision for every conflict.

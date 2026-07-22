@@ -11,6 +11,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
 
 from projects.custom_hybrid.semantic_markdown import (
     generate_semantic_markdown,
+    generate_semantic_markdown_report,
     write_semantic_markdown,
 )
 
@@ -206,6 +207,77 @@ class SemanticMarkdownTests(unittest.TestCase):
         )
         self.assertIn("| 02/07/2026 | MED | Medicine | 1.4.00 |  |", markdown)
 
+    def test_ledger_header_prefers_tight_column_row_over_preheader_dates(self):
+        cells = [
+            {
+                "row_start": 0,
+                "col_start": 0,
+                "bbox": [20, 20, 180, 40],
+                "content_spans": [
+                    content_span("Admission Date:", [25, 22, 110, 32]),
+                    content_span("17-Feb-2023 9:29", [120, 22, 175, 32]),
+                ],
+            },
+            {
+                "row_start": 0,
+                "col_start": 1,
+                "bbox": [190, 20, 360, 40],
+                "content_spans": [
+                    content_span("Discharge Date:", [195, 22, 285, 32]),
+                    content_span("19-Feb-2023", [290, 22, 350, 32]),
+                ],
+            },
+            {
+                "row_start": 1,
+                "col_start": 0,
+                "bbox": [20, 80, 100, 100],
+                "content_spans": [content_span("DATE", [25, 84, 65, 95])],
+            },
+            {
+                "row_start": 1,
+                "col_start": 1,
+                "bbox": [110, 80, 180, 100],
+                "content_spans": [content_span("CODE", [115, 84, 150, 95])],
+            },
+            {
+                "row_start": 1,
+                "col_start": 2,
+                "bbox": [190, 80, 330, 100],
+                "content_spans": [content_span("PARTICULARS", [195, 84, 290, 95])],
+            },
+            {
+                "row_start": 1,
+                "col_start": 3,
+                "bbox": [340, 80, 430, 100],
+                "content_spans": [content_span("AMOUNT", [345, 84, 400, 95])],
+            },
+            {
+                "row_start": 1,
+                "col_start": 4,
+                "bbox": [440, 80, 570, 100],
+                "content_spans": [content_span("BALANCE", [445, 84, 500, 95])],
+            },
+            {
+                "row_start": 2,
+                "col_start": 0,
+                "bbox": [20, 110, 570, 135],
+                "content_spans": [
+                    content_span("17-Feb-2023", [25, 115, 85, 126]),
+                    content_span("5001", [115, 115, 150, 126]),
+                    content_span("Room charge", [195, 115, 280, 126]),
+                    content_span("800.00", [345, 115, 400, 126]),
+                ],
+            },
+        ]
+
+        markdown = generate_semantic_markdown(middle(table_block(cells)))
+
+        self.assertIn("Admission Date: 17-Feb-2023 9:29", markdown)
+        self.assertIn(
+            "| 17-Feb-2023 | 5001 | Room charge | 800.00 |  |",
+            markdown,
+        )
+
     def test_ledger_tail_preserves_admission_and_discharge_fields(self):
         cells = [
             {
@@ -317,6 +389,49 @@ class SemanticMarkdownTests(unittest.TestCase):
         self.assertNotIn("PAID", markdown)
         self.assertNotIn("Page 1 of 2", markdown)
         self.assertNotIn("Page 2 of 2", markdown)
+
+    def test_repeated_margin_ocr_variants_share_one_representative(self):
+        variants = (
+            "Payment instructions remain unchanged for account enquiries.",
+            "Payment instructlons remain unchanged for account enquirles.",
+        )
+        pages = [
+            {
+                "page_size": [600, 800],
+                "preproc_blocks": [
+                    text_block(f"Unique body {index + 1}", [20, 200, 250, 220]),
+                    text_block(text, [20, 680, 500, 700]),
+                ],
+            }
+            for index, text in enumerate(variants)
+        ]
+        payload = middle(pages=pages)
+
+        markdown = generate_semantic_markdown(payload)
+        report = generate_semantic_markdown_report(payload, markdown)
+
+        self.assertEqual(sum(markdown.count(text) for text in variants), 1)
+        self.assertIn("Unique body 1", markdown)
+        self.assertIn("Unique body 2", markdown)
+        self.assertEqual(report["trace_counts"]["deduplicated_repeated_margin"], 2)
+
+    def test_margin_lines_with_different_numbers_are_not_deduplicated(self):
+        balances = (
+            "Invoice 12345 has an outstanding balance of 100.00.",
+            "Invoice 12346 has an outstanding balance of 200.00.",
+        )
+        pages = [
+            {
+                "page_size": [600, 800],
+                "preproc_blocks": [text_block(text, [20, 680, 500, 700])],
+            }
+            for text in balances
+        ]
+
+        markdown = generate_semantic_markdown(middle(pages=pages))
+
+        for text in balances:
+            self.assertIn(text, markdown)
 
     def test_person_name_in_title_block_is_not_promoted_to_heading(self):
         markdown = generate_semantic_markdown(
@@ -627,6 +742,58 @@ class SemanticMarkdownTests(unittest.TestCase):
         self.assertEqual(markdown.count("15/03/26"), 2)
         self.assertNotIn("CHEUNG SIU LING / Signature", markdown)
 
+    def test_signature_marker_prefix_is_not_part_of_name(self):
+        cells = [
+            {
+                "row_start": 0,
+                "col_start": 0,
+                "bbox": [20, 20, 580, 130],
+                "content_spans": [
+                    content_span(
+                        "Signature of Policy Owner 保單主權人簽署 X",
+                        [25, 30, 170, 40],
+                    ),
+                    content_span(
+                        "Name (in block letters) 姓名(大寫)",
+                        [25, 42, 150, 52],
+                    ),
+                    content_span("簽署 X WONG CHI MING", [160, 42, 280, 60]),
+                    content_span("ID / Passport No.", [330, 30, 405, 40]),
+                    content_span("K456789(2)", [395, 42, 460, 60]),
+                    content_span("Date (DD/MM/YY)", [470, 30, 560, 40]),
+                    content_span("05/06/26", [505, 42, 570, 60]),
+                    content_span(
+                        "Signature of Insured 受保人簽署 X",
+                        [25, 75, 165, 85],
+                    ),
+                    content_span(
+                        "Name (in block letters) 姓名(大寫)",
+                        [25, 87, 150, 97],
+                    ),
+                    content_span("WONG CHI MING", [160, 87, 280, 105]),
+                    content_span("ID / Passport No.", [330, 75, 405, 85]),
+                    content_span("K456789(2)", [395, 87, 460, 105]),
+                    content_span("Date (DD/MM/YY)", [470, 75, 560, 85]),
+                    content_span("05/06/26", [505, 87, 570, 105]),
+                ],
+            }
+        ]
+
+        markdown = generate_semantic_markdown(middle(table_block(cells)))
+        report = generate_semantic_markdown_report(
+            middle(table_block(cells)),
+            markdown,
+        )
+
+        self.assertEqual(markdown.count(": WONG CHI MING"), 2)
+        self.assertNotIn(": 簽署 X WONG CHI MING", markdown)
+        transformed = next(
+            record
+            for record in report["source_trace"]
+            if record["text"] == "簽署 X WONG CHI MING"
+        )
+        self.assertEqual(transformed["status"], "represented")
+
     def test_medical_grid_preserves_columns_and_stops_at_next_question(self):
         cells = [
             {
@@ -653,9 +820,9 @@ class SemanticMarkdownTests(unittest.TestCase):
                     content_span("NSAIDS and RICE", [350, 70, 500, 90]),
                     content_span(
                         "8. Was the patient admitted into hospital?",
-                        [25, 125, 330, 140],
+                        [400, 45, 555, 140],
                     ),
-                    content_span("No", [40, 145, 70, 160]),
+                    content_span("No", [410, 145, 440, 160]),
                 ],
             }
         ]
@@ -714,6 +881,92 @@ class SemanticMarkdownTests(unittest.TestCase):
         self.assertIn("- **Date / 日期**: 31/03/26", markdown)
         self.assertIn("- **Telephone Number / 電話號碼**: 27894321", markdown)
 
+    def test_physician_footer_uses_same_and_adjacent_cell_values(self):
+        cells = [
+            {
+                "row_start": 0,
+                "col_start": 0,
+                "bbox": [20, 20, 580, 55],
+                "content_spans": [
+                    content_span("Certificate body", [25, 22, 280, 34]),
+                    content_span("Signed 簽名:", [25, 38, 95, 50]),
+                ],
+            },
+            {
+                "row_start": 1,
+                "col_start": 1,
+                "bbox": [100, 55, 260, 85],
+                "content_spans": [content_span("scribble", [115, 60, 220, 78])],
+            },
+            {
+                "row_start": 1,
+                "col_start": 2,
+                "bbox": [265, 55, 580, 85],
+                "content_spans": [
+                    content_span("Name of physician", [270, 58, 365, 69]),
+                    content_span("Dr. Chan Chi Wai", [400, 58, 540, 78]),
+                ],
+            },
+            {
+                "row_start": 2,
+                "col_start": 0,
+                "bbox": [20, 85, 110, 120],
+                "content_spans": [
+                    content_span("Qualifications 資歷", [25, 88, 105, 99]),
+                    content_span("MBBS", [25, 103, 75, 115]),
+                ],
+            },
+            {
+                "row_start": 2,
+                "col_start": 1,
+                "bbox": [115, 85, 260, 120],
+                "content_spans": [content_span("FHKAM", [120, 100, 185, 115])],
+            },
+            {
+                "row_start": 2,
+                "col_start": 2,
+                "bbox": [265, 85, 580, 120],
+                "content_spans": [
+                    content_span("Address 地址", [270, 88, 345, 99]),
+                    content_span("10 Nathan Road", [390, 98, 530, 115]),
+                ],
+            },
+            {
+                "row_start": 3,
+                "col_start": 0,
+                "bbox": [20, 120, 110, 155],
+                "content_spans": [content_span("Date 日期:", [25, 125, 85, 137])],
+            },
+            {
+                "row_start": 3,
+                "col_start": 1,
+                "bbox": [115, 120, 260, 155],
+                "content_spans": [content_span("31/03/26", [120, 125, 190, 145])],
+            },
+            {
+                "row_start": 3,
+                "col_start": 2,
+                "bbox": [265, 120, 580, 155],
+                "content_spans": [
+                    content_span(
+                        "Telephone Number 電話號碼",
+                        [270, 125, 390, 137],
+                    ),
+                    content_span("27894321", [410, 125, 500, 145]),
+                ],
+            },
+        ]
+
+        markdown = generate_semantic_markdown(middle(table_block(cells)))
+
+        self.assertIn("Certificate body", markdown)
+        self.assertIn("- **Signed 簽名**: [Signature]", markdown)
+        self.assertIn("Dr. Chan Chi Wai", markdown)
+        self.assertIn("- **Qualifications / 資歷**: MBBS / FHKAM", markdown)
+        self.assertIn("- **Address 地址**: 10 Nathan Road", markdown)
+        self.assertIn("- **Date / 日期**: 31/03/26", markdown)
+        self.assertIn("- **Telephone Number / 電話號碼**: 27894321", markdown)
+
     def test_semantic_replay_suppresses_impossible_thin_recovery_sentence(self):
         hallucination = (
             "1. 2016年，公司与上海华谊（集团）股份有限公司"
@@ -763,9 +1016,52 @@ class SemanticMarkdownTests(unittest.TestCase):
             }
         ]
 
-        markdown = generate_semantic_markdown(middle(table_block(cells)))
+        payload = middle(table_block(cells))
+        markdown = generate_semantic_markdown(payload)
+        report = generate_semantic_markdown_report(payload, markdown)
 
         self.assertNotIn("证明", markdown)
+        self.assertEqual(report["trace_counts"]["filtered_recovery_quality"], 1)
+        self.assertEqual(report["unmatched_source_records"], 0)
+
+    def test_semantic_report_accounts_for_pruned_multiline_aggregate(self):
+        cells = [
+            {
+                "row_start": 0,
+                "col_start": 0,
+                "bbox": [20, 20, 560, 75],
+                "content_spans": [
+                    content_span(
+                        "Insurance Company / Organization\nPolicy Number",
+                        [25, 25, 550, 65],
+                    ),
+                    content_span(
+                        "Insurance Company / Organization",
+                        [300, 25, 540, 40],
+                    ),
+                    content_span("Policy Number", [25, 25, 180, 40]),
+                ],
+            }
+        ]
+        payload = middle(table_block(cells))
+
+        markdown = generate_semantic_markdown(payload)
+        report = generate_semantic_markdown_report(payload, markdown)
+
+        self.assertIn("Insurance Company / Organization", markdown)
+        self.assertIn("Policy Number", markdown)
+        self.assertEqual(report["trace_counts"]["represented_aggregate"], 1)
+        self.assertEqual(report["unmatched_source_records"], 0)
+
+    def test_semantic_report_matches_date_inside_noisy_label(self):
+        payload = middle(
+            text_block("（/月午）15/03/26", [20, 20, 180, 40])
+        )
+
+        report = generate_semantic_markdown_report(payload, "15/03/26\n")
+
+        self.assertEqual(report["trace_counts"]["represented_value"], 1)
+        self.assertEqual(report["unmatched_source_records"], 0)
 
     def test_question_and_partial_date_are_not_absorbed_as_name_or_age(self):
         cells = [
@@ -1081,7 +1377,7 @@ class SemanticMarkdownTests(unittest.TestCase):
         self.assertNotIn("District Research", markdown)
         self.assertNotIn("Q.1.4. Place", markdown)
 
-    def test_fragment_only_ocr_noise_page_is_suppressed(self):
+    def test_fragment_heavy_page_is_preserved_with_review_warning(self):
         noise_blocks = [
             text_block(text, [20, 20 + index * 12, 100, 30 + index * 12])
             for index, text in enumerate(
@@ -1114,9 +1410,259 @@ class SemanticMarkdownTests(unittest.TestCase):
 
         markdown = generate_semantic_markdown(middle(pages=pages))
 
-        self.assertNotIn("BTSLY", markdown)
-        self.assertNotIn("<!-- Page 1 -->", markdown)
+        self.assertIn("BTSLY", markdown)
+        self.assertIn("<!-- Page 1 -->", markdown)
+        self.assertIn("semantic-warning: fragment-heavy-page", markdown)
         self.assertIn("Useful body text", markdown)
+
+    def test_demoted_table_nested_blocks_have_reading_order_fallback(self):
+        nested = table_block([])
+        nested["blocks"] = [
+            text_block("Personal Information Collection Statement", [25, 80, 420, 96]),
+            text_block(
+                "We collect personal data to process this application.",
+                [25, 104, 520, 120],
+            ),
+            text_block("Declaration and Authorization", [25, 150, 360, 166]),
+        ]
+
+        markdown = generate_semantic_markdown(middle(nested))
+
+        self.assertIn("Personal Information Collection Statement", markdown)
+        self.assertIn(
+            "We collect personal data to process this application.",
+            markdown,
+        )
+        self.assertIn("Declaration and Authorization", markdown)
+
+    def test_container_keeps_caption_and_structured_table_siblings(self):
+        cells = [
+            {
+                "row_start": 0,
+                "col_start": 0,
+                "bbox": [30, 110, 560, 145],
+                "content_spans": [
+                    content_span("Date of accident", [40, 118, 180, 134]),
+                    content_span("01/07/2026", [250, 118, 350, 134]),
+                ],
+            }
+        ]
+        structured_table = {
+            "type": "table",
+            "bbox": [30, 105, 570, 160],
+            "table_cells": cells,
+        }
+        container = {
+            "type": "table",
+            "bbox": [20, 50, 580, 180],
+            "blocks": [
+                text_block(
+                    "2. DETAILS OF ACCIDENT",
+                    [30, 55, 250, 72],
+                    block_type="table_caption",
+                ),
+                {
+                    "type": "table_body",
+                    "bbox": [30, 105, 570, 160],
+                    "lines": [
+                        {
+                            "bbox": [30, 105, 570, 160],
+                            "spans": [structured_table],
+                        }
+                    ],
+                },
+            ],
+        }
+
+        markdown = generate_semantic_markdown(middle(container))
+
+        self.assertIn("2. DETAILS OF ACCIDENT", markdown)
+        self.assertIn("Date of accident", markdown)
+        self.assertIn("01/07/2026", markdown)
+        self.assertLess(
+            markdown.index("2. DETAILS OF ACCIDENT"),
+            markdown.index("Date of accident"),
+        )
+
+    def test_same_text_at_distinct_positions_is_not_deduplicated(self):
+        markdown = generate_semantic_markdown(
+            middle(
+                text_block("No", [25, 100, 55, 116]),
+                text_block("No", [25, 300, 55, 316]),
+            )
+        )
+
+        self.assertEqual(
+            [line for line in markdown.splitlines() if line.strip() == "No"],
+            ["No", "No"],
+        )
+
+    def test_overlapping_duplicate_text_is_emitted_once(self):
+        markdown = generate_semantic_markdown(
+            middle(
+                text_block("Declaration", [25, 100, 150, 116]),
+                text_block("Declaration", [27, 101, 152, 117]),
+            )
+        )
+
+        self.assertEqual(markdown.count("Declaration"), 1)
+
+    def test_standalone_checkbox_in_plain_block_joins_its_label(self):
+        block = {
+            "type": "text",
+            "bbox": [20, 80, 400, 120],
+            "lines": [
+                {
+                    "bbox": [25, 90, 36, 103],
+                    "spans": [content_span("☑", [25, 90, 36, 103])],
+                },
+                {
+                    "bbox": [42, 89, 260, 105],
+                    "spans": [
+                        content_span("Keep the original document", [42, 89, 260, 105])
+                    ],
+                },
+            ],
+        }
+
+        markdown = generate_semantic_markdown(middle(block))
+
+        self.assertIn("- [x] Keep the original document", markdown)
+        self.assertNotIn("\n\n☑\n\n", markdown)
+
+    def test_multiple_plain_block_checkboxes_keep_separate_labels(self):
+        block = {
+            "type": "text",
+            "bbox": [20, 80, 400, 120],
+            "lines": [
+                {
+                    "bbox": [25, 90, 36, 103],
+                    "spans": [content_span("☐", [25, 90, 36, 103])],
+                },
+                {
+                    "bbox": [42, 89, 70, 105],
+                    "spans": [content_span("No", [42, 89, 70, 105])],
+                },
+                {
+                    "bbox": [105, 90, 116, 103],
+                    "spans": [content_span("☑", [105, 90, 116, 103])],
+                },
+                {
+                    "bbox": [122, 89, 155, 105],
+                    "spans": [content_span("Yes", [122, 89, 155, 105])],
+                },
+            ],
+        }
+
+        markdown = generate_semantic_markdown(middle(block))
+
+        self.assertIn("- [ ] No", markdown)
+        self.assertIn("- [x] Yes", markdown)
+
+    def test_standalone_list_marker_in_plain_block_joins_content(self):
+        block = {
+            "type": "text",
+            "bbox": [20, 80, 400, 120],
+            "lines": [
+                {
+                    "bbox": [25, 90, 36, 103],
+                    "spans": [content_span("1.", [25, 90, 36, 103])],
+                },
+                {
+                    "bbox": [42, 89, 260, 105],
+                    "spans": [content_span("General instruction", [42, 89, 260, 105])],
+                },
+            ],
+        }
+
+        markdown = generate_semantic_markdown(middle(block))
+
+        self.assertIn("1. General instruction", markdown)
+
+    def test_geometry_rules_are_invariant_under_uniform_scaling(self):
+        def scaled_block(scale):
+            def bbox(values):
+                return [value * scale for value in values]
+
+            return {
+                "type": "text",
+                "bbox": bbox([20, 80, 400, 160]),
+                "lines": [
+                    {
+                        "bbox": bbox([25, 90, 36, 103]),
+                        "spans": [content_span("☑", bbox([25, 90, 36, 103]))],
+                    },
+                    {
+                        "bbox": bbox([42, 89, 260, 105]),
+                        "spans": [
+                            content_span(
+                                "Scale independent option",
+                                bbox([42, 89, 260, 105]),
+                            )
+                        ],
+                    },
+                    {
+                        "bbox": bbox([25, 125, 36, 138]),
+                        "spans": [content_span("1.", bbox([25, 125, 36, 138]))],
+                    },
+                    {
+                        "bbox": bbox([42, 124, 260, 140]),
+                        "spans": [
+                            content_span(
+                                "Scale independent item",
+                                bbox([42, 124, 260, 140]),
+                            )
+                        ],
+                    },
+                ],
+            }
+
+        baseline = generate_semantic_markdown(middle(scaled_block(1.0)))
+        high_resolution = generate_semantic_markdown(middle(scaled_block(4.0)))
+
+        for expected in (
+            "- [x] Scale independent option",
+            "1. Scale independent item",
+        ):
+            self.assertIn(expected, baseline)
+            self.assertIn(expected, high_resolution)
+
+    def test_plain_block_reading_order_uses_rows_not_input_order(self):
+        block = {
+            "type": "text",
+            "bbox": [20, 60, 500, 180],
+            "lines": [
+                {
+                    "bbox": [250, 120, 420, 136],
+                    "spans": [content_span("Second row right", [250, 120, 420, 136])],
+                },
+                {
+                    "bbox": [250, 80, 420, 96],
+                    "spans": [content_span("First row right", [250, 80, 420, 96])],
+                },
+                {
+                    "bbox": [25, 121, 180, 137],
+                    "spans": [content_span("Second row left", [25, 121, 180, 137])],
+                },
+                {
+                    "bbox": [25, 81, 180, 97],
+                    "spans": [content_span("First row left", [25, 81, 180, 97])],
+                },
+            ],
+        }
+
+        markdown = generate_semantic_markdown(middle(block))
+
+        positions = [
+            markdown.index(text)
+            for text in (
+                "First row left",
+                "First row right",
+                "Second row left",
+                "Second row right",
+            )
+        ]
+        self.assertEqual(positions, sorted(positions))
 
     def test_write_semantic_markdown_uses_default_name(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1130,6 +1676,101 @@ class SemanticMarkdownTests(unittest.TestCase):
 
             self.assertEqual(output.name, "sample_semantic.md")
             self.assertIn("Hello", output.read_text(encoding="utf-8"))
+
+    def test_semantic_report_exposes_fallback_and_coverage_proxies(self):
+        nested = table_block([])
+        nested["blocks"] = [
+            text_block("Fallback content", [25, 80, 260, 96]),
+        ]
+        payload = middle(nested)
+        markdown = generate_semantic_markdown(payload)
+
+        report = generate_semantic_markdown_report(payload, markdown)
+
+        self.assertEqual(report["semantic_markdown_version"], 5)
+        self.assertEqual(report["pages"], 1)
+        self.assertEqual(report["pages_emitted"], 1)
+        self.assertEqual(report["text_bearing_pages"], 1)
+        self.assertEqual(report["text_bearing_pages_emitted"], 1)
+        self.assertEqual(report["text_bearing_pages_not_emitted"], [])
+        self.assertEqual(report["unstructured_table_fallback_blocks"], 1)
+        self.assertEqual(report["unstructured_table_fallback_pages"], [1])
+        self.assertGreater(report["source_text_records"], 0)
+        self.assertGreater(report["markdown_characters"], 0)
+        self.assertEqual(report["unmatched_source_records"], 0)
+        self.assertTrue(
+            all(record["status"] == "represented" for record in report["source_trace"])
+        )
+
+    def test_write_semantic_markdown_can_write_trace_report(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            middle_path = Path(temp_dir) / "sample_middle.json"
+            output_path = Path(temp_dir) / "sample.md"
+            report_path = Path(temp_dir) / "sample_semantic_report.json"
+            middle_path.write_text(
+                json.dumps(middle(text_block("Hello", [20, 20, 100, 40]))),
+                encoding="utf-8",
+            )
+
+            write_semantic_markdown(middle_path, output_path, report_path)
+
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["pages_emitted"], 1)
+            self.assertEqual(report["fragment_heavy_pages"], [])
+
+    def test_semantic_report_distinguishes_image_only_pages(self):
+        pages = [
+            {
+                "page_size": [600, 800],
+                "preproc_blocks": [
+                    text_block("Text-bearing page", [20, 20, 220, 40])
+                ],
+            },
+            {
+                "page_size": [600, 800],
+                "preproc_blocks": [
+                    {
+                        "type": "image",
+                        "bbox": [20, 20, 580, 780],
+                        "blocks": [{"type": "image_body"}],
+                    }
+                ],
+            },
+        ]
+        payload = middle(pages=pages)
+
+        report = generate_semantic_markdown_report(payload)
+
+        self.assertEqual(report["pages"], 2)
+        self.assertEqual(report["pages_emitted"], 1)
+        self.assertEqual(report["text_bearing_pages"], 1)
+        self.assertEqual(report["text_bearing_pages_emitted"], 1)
+        self.assertEqual(report["text_bearing_page_numbers"], [1])
+        self.assertEqual(report["blank_or_image_only_pages"], [2])
+
+    def test_semantic_report_counts_untyped_table_content_spans(self):
+        cells = [
+            {
+                "row_start": 0,
+                "col_start": 0,
+                "bbox": [20, 20, 560, 65],
+                "text": "Untyped table text",
+                "content_spans": [
+                    {
+                        "bbox": [25, 30, 220, 45],
+                        "text": "Untyped table text",
+                    }
+                ],
+            }
+        ]
+        payload = middle(table_block(cells))
+
+        report = generate_semantic_markdown_report(payload)
+
+        self.assertEqual(report["source_text_records"], 1)
+        self.assertEqual(report["text_bearing_pages"], 1)
+        self.assertEqual(report["text_bearing_pages_emitted"], 1)
+        self.assertEqual(report["unmatched_source_records"], 0)
 
 
 if __name__ == "__main__":

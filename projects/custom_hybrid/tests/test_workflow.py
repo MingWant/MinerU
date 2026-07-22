@@ -122,13 +122,18 @@ class WorkflowTests(unittest.TestCase):
             )
 
             native_path = parse_dir / "sample_native.md"
-            self.assertEqual(generated, (native_path,))
+            report_path = parse_dir / "sample_semantic_report.json"
+            self.assertEqual(generated, (native_path, report_path))
             self.assertEqual(
                 native_path.read_text(encoding="utf-8"),
                 "native markdown",
             )
             semantic = primary_path.read_text(encoding="utf-8")
-            self.assertIn("semantic-markdown-v4", semantic)
+            self.assertIn("semantic-markdown-v5", semantic)
+            self.assertTrue(report_path.is_file())
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["semantic_markdown_version"], 5)
+            self.assertEqual(report["pages_emitted"], 1)
             self.assertIn("Hello", semantic)
 
     def test_bearer_header_requires_explicit_environment_setting(self):

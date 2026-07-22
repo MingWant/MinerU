@@ -1683,17 +1683,27 @@ def _generate_semantic_markdown_outputs(
     primary_path = parse_dir / f"{document_stem}.md"
     replace_primary = bool(config.get("replace_primary", True))
     preserve_native = bool(config.get("preserve_native", True))
+    report_path = parse_dir / f"{document_stem}_semantic_report.json"
     generated = []
     if replace_primary:
         if preserve_native and primary_path.is_file():
             native_path = parse_dir / f"{document_stem}_native.md"
             shutil.copy2(primary_path, native_path)
             generated.append(native_path)
-        write_semantic_markdown(middle_path, primary_path)
+        write_semantic_markdown(
+            middle_path,
+            primary_path,
+            report_path,
+        )
     else:
         semantic_path = parse_dir / f"{document_stem}_semantic.md"
-        write_semantic_markdown(middle_path, semantic_path)
+        write_semantic_markdown(
+            middle_path,
+            semantic_path,
+            report_path,
+        )
         generated.append(semantic_path)
+    generated.append(report_path)
     return tuple(generated)
 
 
