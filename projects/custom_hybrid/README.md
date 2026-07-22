@@ -299,6 +299,12 @@ extension is never enabled from a remote reviewer response. A locally recovered
 date crop may contain a small printed-label fragment; when it contains exactly
 one valid numeric date, that date is extracted before the normal empty-OCR
 capacity and safety guards are applied.
+Full-width Form rows ending in `From`, or containing a bounded From/To or 由/至
+date range, receive a separate `date_range_field_bottom_extension` scan. This
+captures low `Day / Month / Year` legends whose OCR box was clipped at the Cell
+bottom. Only locally observed ink may cross that Cell boundary, it remains
+inside the detected Form/Table region, and
+`form_full_cell_recovery_max_width_ratio` limits overly broad proposals.
 Reports and the English UI expose analyzed/skipped Cell counts, pixel-analysis
 time, cache hits/misses, request-budget skips, and native network requests.
 
@@ -336,6 +342,13 @@ enter the normal bounded native-recognition queue. When the checkbox and its
 right-hand label were split only by OCR spacing, `checkbox_merge_label_enabled`
 updates the label content bbox to cover both; a checkbox already covered by a
 label bbox does not create a redundant square-only box.
+For malformed checks whose stroke extends far outside a very small square, the
+normal `checkbox_min_size` remains unchanged. A lower
+`checkbox_protruding_tick_min_size` is used only when a bounded multi-vertex
+stroke covers most of the square and passes configured width, height, and
+coverage limits. When merged with its label, the final bbox includes that full
+stroke even if it crosses the original Cell edge, while remaining clipped to the
+immutable Table boundary.
 
 `list_marker_merge_enabled=true` applies the same post-OCR grouping principle
 to numbered list markers. A strict standalone marker such as `1.`, `2)`, or

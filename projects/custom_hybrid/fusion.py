@@ -1701,6 +1701,7 @@ def apply_bbox_recovery_proposals(
         )
         detached_actions = {"add_orphan", "add_fringe", "add_checkbox"}
         table_scoped_actions = detached_actions | {
+            "merge_checkbox",
             "merge_list_marker",
             "merge_ink_marker",
         }
@@ -1793,7 +1794,9 @@ def apply_bbox_recovery_proposals(
         elif table_counts[table_key] >= settings.bbox_recovery_max_proposals_per_table:
             reason = "table_budget"
         if reason is None:
-            if is_form_cell:
+            if is_form_cell and not (
+                terminal_field_extension or cell_bottom_overflow
+            ):
                 outer_bbox = cell_bbox
             elif action == "add_fringe" and table_bbox is not None:
                 outer_bbox = _table_fringe_outer_bbox(
@@ -1832,7 +1835,9 @@ def apply_bbox_recovery_proposals(
                     else "bbox_outside_cell"
                 )
         if reason is None:
-            if is_form_cell:
+            if is_form_cell and not (
+                terminal_field_extension or cell_bottom_overflow
+            ):
                 outer_bbox = cell_bbox
             elif action == "add_fringe":
                 outer_bbox = _table_fringe_outer_bbox(

@@ -449,6 +449,52 @@ class FusionTests(unittest.TestCase):
         self.assertTrue(recovered["fusion_recovery_terminal_field_extension"])
         self.assertEqual(recovered["fusion_recovery_terminal_field_kind"], "date")
 
+    def test_bbox_recovery_accepts_date_legend_below_form_cell_boundary(self):
+        page = middle("From", bbox=(20, 20, 60, 30))["pdf_info"][0]
+        page["page_size"] = [200, 100]
+        page["form_regions"] = [{"bbox": [5, 5, 195, 90]}]
+        page["form_cells"] = [
+            {
+                "bbox": [5, 20, 195, 50],
+                "recognition_bbox": [5, 20, 195, 50],
+                "form_region_index": 0,
+                "row_index": 0,
+                "column_index": 0,
+                "kind": "semantic_row",
+                "ocr_text": "From",
+            }
+        ]
+
+        stats, decisions, _batches, unchanged = apply_bbox_recovery_proposals(
+            page,
+            0,
+            {
+                "items": [
+                    {
+                        "action": "add",
+                        "cell_id": "p0-f0-c0",
+                        "target_id": "",
+                        "bbox": [65, 45, 165, 54],
+                        "confidence": 0.95,
+                        "terminal_field_extension": True,
+                        "terminal_field_kind": "date",
+                        "recovery_source": "local_terminal_field_ink",
+                    }
+                ]
+            },
+            FusionSettings.from_mapping({"mode": "bbox_vlm"}),
+            remaining_document_budget=10,
+        )
+
+        self.assertTrue(unchanged)
+        self.assertEqual(stats["form_added"], 1)
+        self.assertEqual(decisions[0]["result"], "accepted")
+        recovered = page["form_cells"][0]["recovered_spans"][0]
+        self.assertEqual(recovered["bbox"], [65.0, 45.0, 165.0, 54.0])
+        self.assertGreater(recovered["bbox"][3], 50.0)
+        self.assertTrue(recovered["fusion_recovery_terminal_field_extension"])
+        self.assertEqual(recovered["fusion_recovery_terminal_field_kind"], "date")
+
     def test_bbox_recovery_accepts_short_cell_handwriting_bottom_overflow(self):
         cells = [
             {
@@ -1245,6 +1291,55 @@ class FusionTests(unittest.TestCase):
         self.assertEqual(span["bbox"], [20.0, 20.0, 100.0, 32.0])
         self.assertTrue(span["fusion_checkbox_grouped"])
         self.assertEqual(span["fusion_checkbox_state"], "checked")
+        self.assertEqual(decisions[0]["result"], "accepted")
+        self.assertTrue(unchanged)
+
+    def test_bbox_recovery_keeps_checkbox_tick_outside_cell_inside_table(self):
+        page = structured_middle(
+            "table",
+            html="<table><tr><td>Option</td></tr></table>",
+            table_cells=[
+                {
+                    "bbox": [20, 20, 190, 80],
+                    "text": "Option",
+                    "content_spans": [
+                        {"bbox": [40, 20, 100, 32], "text": "Option"}
+                    ],
+                    "row_start": 0,
+                    "row_end": 0,
+                    "col_start": 0,
+                    "col_end": 0,
+                }
+            ],
+        )["pdf_info"][0]
+
+        stats, decisions, _batches, unchanged = apply_bbox_recovery_proposals(
+            page,
+            0,
+            {
+                "items": [
+                    {
+                        "action": "merge_checkbox",
+                        "table_id": "p0-table-0",
+                        "cell_id": "p0-t0-c0",
+                        "target_id": "p0-t0-c0-b0",
+                        "bbox": [12, 14, 100, 32],
+                        "confidence": 0.95,
+                        "checkbox_state": "checked",
+                        "checkbox_interior_density": 0.07,
+                        "recovery_source": "local_checkbox_detector",
+                    }
+                ]
+            },
+            FusionSettings.from_mapping({"mode": "bbox_vlm"}),
+            remaining_document_budget=10,
+        )
+
+        span = page["preproc_blocks"][0]["lines"][0]["spans"][0][
+            "table_cells"
+        ][0]["content_spans"][0]
+        self.assertEqual(stats["checkbox_merged"], 1)
+        self.assertEqual(span["bbox"], [12.0, 14.0, 100.0, 32.0])
         self.assertEqual(decisions[0]["result"], "accepted")
         self.assertTrue(unchanged)
 

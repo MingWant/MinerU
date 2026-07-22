@@ -35,6 +35,17 @@ _TERMINAL_SIGNATURE_FIELD_RE = re.compile(
 )
 
 
+def _is_date_range_field_text(text: str) -> bool:
+    """Return whether a form row contains a bounded From/To date field."""
+    raw = str(text or "")
+    folded = raw.casefold()
+    return bool(
+        re.search(r"\bfrom\s*$", folded)
+        or re.search(r"\bfrom\b.{0,80}\bto\b", folded)
+        or ("由" in raw and "至" in raw)
+    )
+
+
 def _terminal_field_kind(text: str) -> str | None:
     if _TERMINAL_DATE_FIELD_RE.search(text):
         return "date"
@@ -870,6 +881,35 @@ class OpenAIBBoxRecoveryReviewer:
                 self.pixel_cells_skipped += 1
                 continue
             analysis_bbox = _valid_bbox(cell.get("bbox"))
+            date_range_field_extended = False
+            if (
+                analysis_bbox is not None
+                and table_bbox is not None
+                and cell.get("form_region")
+                and cell.get("form_recover_full_cell")
+                and _is_date_range_field_text(str(cell.get("text", "")))
+            ):
+                bottom_extension = max(
+                    float(
+                        self.config.get(
+                            "date_range_field_bottom_extension",
+                            6.0,
+                        )
+                    ),
+                    0.0,
+                )
+                extended_bottom = min(
+                    table_bbox[3],
+                    analysis_bbox[3] + bottom_extension,
+                )
+                if extended_bottom > analysis_bbox[3]:
+                    analysis_bbox = (
+                        analysis_bbox[0],
+                        analysis_bbox[1],
+                        analysis_bbox[2],
+                        extended_bottom,
+                    )
+                    date_range_field_extended = True
             cell_bottom_overflow_extended = False
             if (
                 analysis_bbox is not None
@@ -1022,6 +1062,7 @@ class OpenAIBBoxRecoveryReviewer:
                 {
                     **dict(cell),
                     "terminal_field_extended": terminal_field_extended,
+                    "date_range_field_extended": date_range_field_extended,
                     "cell_bottom_overflow_extended": (
                         cell_bottom_overflow_extended
                     ),
@@ -1502,7 +1543,16 @@ class OpenAIBBoxRecoveryReviewer:
                 cv2.RETR_LIST,
                 cv2.CHAIN_APPROX_SIMPLE,
             )
-            minimum_size = float(self.config.get("checkbox_min_size", 5.5))
+            regular_minimum_size = float(
+                self.config.get("checkbox_min_size", 5.5)
+            )
+            protruding_tick_minimum_size = float(
+                self.config.get("checkbox_protruding_tick_min_size", 4.5)
+            )
+            minimum_size = min(
+                regular_minimum_size,
+                protruding_tick_minimum_size,
+            )
             maximum_size = float(self.config.get("checkbox_max_size", 16.0))
             minimum_aspect = float(self.config.get("checkbox_min_aspect", 0.75))
             maximum_aspect = float(self.config.get("checkbox_max_aspect", 1.25))
@@ -1547,6 +1597,104 @@ class OpenAIBBoxRecoveryReviewer:
             checked_threshold = float(
                 self.config.get("checkbox_checked_interior_ratio", 0.12)
             )
+
+            def has_bounded_protruding_tick(
+                candidate_contour: Any,
+                x: int,
+                y: int,
+                width: int,
+                height: int,
+            ) -> tuple[int, int, int, int] | None:
+                """Recognize a large hand-drawn tick around a small square."""
+                if not self.config.get(
+                    "checkbox_protruding_tick_enabled",
+                    True,
+                ):
+                    return None
+                maximum_tick_width = float(
+                    self.config.get("checkbox_tick_max_width", 28.0)
+                )
+                maximum_tick_height = float(
+                    self.config.get("checkbox_tick_max_height", 24.0)
+                )
+                minimum_coverage = min(
+                    max(
+                        float(
+                            self.config.get(
+                                "checkbox_tick_min_square_coverage",
+                                0.75,
+                            )
+                        ),
+                        0.0,
+                    ),
+                    1.0,
+                )
+                minimum_left_extension = max(2, int(math.ceil(width * 0.35)))
+                minimum_vertical_extension = max(
+                    1,
+                    int(math.ceil(height * 0.2)),
+                )
+                candidate_area = max(width * height, 1)
+                for outer_contour in contours:
+                    if outer_contour is candidate_contour:
+                        continue
+                    outer_x, outer_y, outer_width, outer_height = (
+                        cv2.boundingRect(outer_contour)
+                    )
+                    if (
+                        outer_width / scale_x > maximum_tick_width
+                        or outer_height / scale_y > maximum_tick_height
+                        or outer_width < width * 1.4
+                        or outer_height < height * 1.4
+                    ):
+                        continue
+                    overlap_width = max(
+                        0,
+                        min(x + width, outer_x + outer_width)
+                        - max(x, outer_x),
+                    )
+                    overlap_height = max(
+                        0,
+                        min(y + height, outer_y + outer_height)
+                        - max(y, outer_y),
+                    )
+                    if (
+                        overlap_width * overlap_height / candidate_area
+                        < minimum_coverage
+                    ):
+                        continue
+                    left_extension = x - outer_x
+                    top_extension = y - outer_y
+                    bottom_extension = (
+                        outer_y + outer_height - (y + height)
+                    )
+                    if (
+                        left_extension < minimum_left_extension
+                        or max(top_extension, bottom_extension)
+                        < minimum_vertical_extension
+                    ):
+                        continue
+                    perimeter = cv2.arcLength(outer_contour, True)
+                    vertices = len(
+                        cv2.approxPolyDP(
+                            outer_contour,
+                            0.04 * perimeter,
+                            True,
+                        )
+                    )
+                    fill_ratio = cv2.contourArea(outer_contour) / max(
+                        outer_width * outer_height,
+                        1,
+                    )
+                    if 5 <= vertices <= 16 and fill_ratio >= 0.08:
+                        return (
+                            outer_x,
+                            outer_y,
+                            outer_width,
+                            outer_height,
+                        )
+                return None
+
             raw_candidates = []
             for contour in contours:
                 x, y, width, height = cv2.boundingRect(contour)
@@ -1589,12 +1737,11 @@ class OpenAIBBoxRecoveryReviewer:
                     left_start:left_end,
                 ]
                 near_table_edge = page_left - table_bbox[0] <= left_edge_allowance
-                if (
+                left_ink_blocked = bool(
                     not near_table_edge
                     and left_region.size
                     and float((left_region > 0).mean()) > left_ink_limit
-                ):
-                    continue
+                )
                 right_start = min(crop.width, x + width + 1)
                 right_end = min(
                     crop.width,
@@ -1672,7 +1819,32 @@ class OpenAIBBoxRecoveryReviewer:
                 interior_density = (
                     float(interior.mean()) if interior.size else float(roi.mean())
                 )
-                if interior_density <= unchecked_threshold:
+                protruding_tick_bounds = (
+                    has_bounded_protruding_tick(
+                        contour,
+                        x,
+                        y,
+                        width,
+                        height,
+                    )
+                    if left_ink_blocked
+                    and unchecked_threshold
+                    < interior_density
+                    < checked_threshold
+                    else None
+                )
+                protruding_tick = protruding_tick_bounds is not None
+                if left_ink_blocked and not protruding_tick:
+                    continue
+                if (
+                    min(width_points, height_points) < regular_minimum_size
+                    and not protruding_tick
+                ):
+                    continue
+                if protruding_tick:
+                    state = "checked"
+                    text = "☑"
+                elif interior_density <= unchecked_threshold:
                     state = "unchecked"
                     text = "☐"
                 elif interior_density >= checked_threshold:
@@ -1695,6 +1867,31 @@ class OpenAIBBoxRecoveryReviewer:
                 raw_candidates.append(
                     {
                         "bbox": bbox,
+                        "protruding_tick_bbox": (
+                            _clip_bbox(
+                                (
+                                    (crop_box[0] + protruding_tick_bounds[0])
+                                    / scale_x,
+                                    (crop_box[1] + protruding_tick_bounds[1])
+                                    / scale_y,
+                                    (
+                                        crop_box[0]
+                                        + protruding_tick_bounds[0]
+                                        + protruding_tick_bounds[2]
+                                    )
+                                    / scale_x,
+                                    (
+                                        crop_box[1]
+                                        + protruding_tick_bounds[1]
+                                        + protruding_tick_bounds[3]
+                                    )
+                                    / scale_y,
+                                ),
+                                table_bbox,
+                            )
+                            if protruding_tick_bounds is not None
+                            else None
+                        ),
                         "state": state,
                         "text": text,
                         "interior_density": interior_density,
@@ -1854,12 +2051,17 @@ class OpenAIBBoxRecoveryReviewer:
                 label_target = min(label_targets, default=None)
                 action = "merge_checkbox" if label_target is not None else "add_checkbox"
                 target_id = label_target[2] if label_target is not None else ""
+                visual_checkbox_bbox = (
+                    _valid_bbox(candidate.get("protruding_tick_bbox"))
+                    if label_target is not None
+                    else None
+                ) or bbox
                 proposal_bbox = (
                     (
-                        min(bbox[0], label_target[3][0]),
-                        min(bbox[1], label_target[3][1]),
-                        max(bbox[2], label_target[3][2]),
-                        max(bbox[3], label_target[3][3]),
+                        min(visual_checkbox_bbox[0], label_target[3][0]),
+                        min(visual_checkbox_bbox[1], label_target[3][1]),
+                        max(visual_checkbox_bbox[2], label_target[3][2]),
+                        max(visual_checkbox_bbox[3], label_target[3][3]),
                     )
                     if label_target is not None
                     else bbox
@@ -2583,6 +2785,11 @@ class OpenAIBBoxRecoveryReviewer:
                     line_candidates = [(fallback_bbox, {})]
             for bbox, line_analysis in line_candidates:
                 cell_bbox = _valid_bbox(cell.get("bbox"))
+                date_range_field_overflow = bool(
+                    cell.get("date_range_field_extended")
+                    and cell_bbox is not None
+                    and bbox[3] > cell_bbox[3] + 0.5
+                )
                 cell_bottom_overflow = bool(
                     cell.get("cell_bottom_overflow_extended")
                     and cell_bbox is not None
@@ -2602,8 +2809,14 @@ class OpenAIBBoxRecoveryReviewer:
                         self.config.get(
                             "demoted_form_recovery_max_width_ratio"
                             if cell.get("demoted_form_cell")
+                            else "form_full_cell_recovery_max_width_ratio"
+                            if cell.get("form_recover_full_cell")
                             else "form_recovery_max_width_ratio",
-                            0.8 if cell.get("demoted_form_cell") else 0.5,
+                            0.8
+                            if cell.get("demoted_form_cell")
+                            else 0.6
+                            if cell.get("form_recover_full_cell")
+                            else 0.5,
                         )
                     )
                     looks_like_checkbox = (
@@ -2639,9 +2852,12 @@ class OpenAIBBoxRecoveryReviewer:
                     continue
                 terminal_field_extended = bool(
                     cell.get("terminal_field_extended")
+                    or date_range_field_overflow
                 )
                 terminal_field_kind = (
-                    _terminal_field_kind(str(cell.get("text", "")))
+                    "date"
+                    if date_range_field_overflow
+                    else _terminal_field_kind(str(cell.get("text", "")))
                     if terminal_field_extended
                     else None
                 )

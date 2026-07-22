@@ -293,6 +293,7 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         "checkbox_recovery_enabled",
         "checkbox_accept_existing_label_bbox",
         "checkbox_merge_label_enabled",
+        "checkbox_protruding_tick_enabled",
         "list_marker_merge_enabled",
         "table_diagonal_rule_enabled",
     ):
@@ -342,6 +343,8 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         "checkbox_unchecked_interior_ratio",
         "checkbox_checked_interior_ratio",
         "checkbox_label_min_vertical_overlap",
+        "checkbox_tick_min_square_coverage",
+        "form_full_cell_recovery_max_width_ratio",
         "list_marker_confidence",
         "list_marker_min_vertical_overlap",
     ):
@@ -478,6 +481,8 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         ("table_orphan_min_line_width", 8.0, False),
         ("table_orphan_horizontal_gap", 12.0, False),
         ("table_fringe_bottom_extension", 72.0, True),
+        ("date_range_field_bottom_extension", 6.0, True),
+        ("form_full_cell_recovery_max_width_ratio", 0.6, False),
         ("checkbox_label_max_gap", 24.0, True),
         ("list_marker_max_gap", 24.0, True),
     ):
@@ -525,6 +530,10 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         ("checkbox_right_separator_search", 6.0),
         ("checkbox_min_right_separator", 1.5),
         ("checkbox_existing_tight_scale", 2.0),
+        ("checkbox_protruding_tick_min_size", 4.5),
+        ("checkbox_tick_max_width", 28.0),
+        ("checkbox_tick_max_height", 24.0),
+        ("checkbox_tick_min_square_coverage", 0.75),
         ("checkbox_apply_min_size", 4.0),
         ("checkbox_apply_max_size", 20.0),
         ("checkbox_apply_min_aspect", 0.65),
@@ -554,6 +563,13 @@ def _validate_fusion_config(fusion_config: Any) -> None:
             raise WorkflowConfigError(
                 f"fusion.recovery {lower}/{upper} limits must be ordered"
             )
+    if float(recovery.get("checkbox_protruding_tick_min_size", 4.5)) > float(
+        recovery.get("checkbox_min_size", 5.5)
+    ):
+        raise WorkflowConfigError(
+            "fusion.recovery.checkbox_protruding_tick_min_size must not "
+            "exceed checkbox_min_size"
+        )
     recovery_structured_cap = recovery.get("structured_max_tokens_cap", 768)
     if (
         isinstance(recovery_structured_cap, bool)

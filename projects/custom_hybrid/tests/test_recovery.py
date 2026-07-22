@@ -500,6 +500,77 @@ class BBoxRecoveryReviewerTests(unittest.TestCase):
             {"date", "signature"},
         )
 
+    def test_date_range_form_row_recovers_text_below_structural_cell(self):
+        from PIL import Image, ImageDraw
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            image = Image.new("RGB", (200, 100), "white")
+            draw = ImageDraw.Draw(image)
+            draw.text((20, 25), "From", fill="black")
+            # Model a wide Day / Month / Year legend whose descenders cross
+            # the structural Cell bottom. The gaps keep its ink density close
+            # to printed text instead of a solid decorative rule.
+            for left in range(65, 166, 6):
+                draw.rectangle([left, 46, left + 2, 53], fill="black")
+            image.save(image_path)
+            image.close()
+            reviewer = OpenAIBBoxRecoveryReviewer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "mineru-claim-forms",
+                    "render_scale": 1.0,
+                    "checkbox_recovery_enabled": False,
+                    "table_orphan_recovery_enabled": False,
+                    "date_range_field_bottom_extension": 6.0,
+                    "form_full_cell_recovery_max_width_ratio": 0.6,
+                },
+            )
+            try:
+                result = reviewer(
+                    0,
+                    [200, 100],
+                    [
+                        {
+                            "id": "p0-form-0",
+                            "form_region": True,
+                            "bbox": [0, 0, 200, 90],
+                            "cells": [
+                                {
+                                    "id": "p0-f0-c0",
+                                    "bbox": [10, 20, 190, 50],
+                                    "text": "From",
+                                    "existing": [
+                                        {
+                                            "id": "p0-f0-c0-b0",
+                                            "bbox": [18, 23, 52, 36],
+                                            "text": "From",
+                                        }
+                                    ],
+                                    "reasons": [],
+                                    "form_region": True,
+                                    "form_recover_text": True,
+                                    "form_recover_full_cell": True,
+                                }
+                            ],
+                        }
+                    ],
+                )
+            finally:
+                reviewer.close()
+
+        recovered = [
+            item
+            for item in result["items"]
+            if item.get("recovery_source") == "local_terminal_field_ink"
+        ]
+        self.assertEqual(len(recovered), 1)
+        self.assertGreater(recovered[0]["bbox"][3], 50.0)
+        self.assertLessEqual(recovered[0]["bbox"][3], 56.0)
+        self.assertTrue(recovered[0]["terminal_field_extension"])
+        self.assertEqual(recovered[0]["terminal_field_kind"], "date")
+
     def test_table_orphan_recovery_accepts_short_amount(self):
         from PIL import Image, ImageDraw
 
@@ -777,6 +848,87 @@ class BBoxRecoveryReviewerTests(unittest.TestCase):
         self.assertEqual(merged[0]["target_id"], "p0-t0-c0-b0")
         self.assertLessEqual(merged[0]["bbox"][0], 20)
         self.assertGreaterEqual(merged[0]["bbox"][2], 120)
+        self.assertEqual(result["checkbox_merged"], 1)
+
+    def test_checkbox_recovery_merges_small_square_with_protruding_tick(self):
+        from PIL import Image, ImageDraw
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            image = Image.new("RGB", (480, 200), "white")
+            draw = ImageDraw.Draw(image)
+            draw.rectangle([76, 72, 90, 86], outline="black", width=2)
+            # The malformed hand-drawn tick is much larger than the square.
+            # A few interior pixels reproduce the ambiguous square density
+            # observed in the real claim form without making all small glyphs
+            # eligible for the reduced size threshold.
+            draw.line(
+                [50, 75, 70, 100, 98, 100, 98, 55],
+                fill="black",
+                width=3,
+                joint="curve",
+            )
+            draw.rectangle([82, 79, 84, 79], fill="black")
+            draw.text((106, 72), "Others option", fill="black")
+            image.save(image_path)
+            image.close()
+            reviewer = OpenAIBBoxRecoveryReviewer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "mineru-claim-forms",
+                    "render_scale": 2.0,
+                    "local_missing_enabled": False,
+                    "local_uncovered_enabled": False,
+                    "table_orphan_recovery_enabled": False,
+                    "checkbox_recovery_enabled": True,
+                    "checkbox_min_size": 8.0,
+                    "checkbox_protruding_tick_min_size": 4.5,
+                    "checkbox_max_size": 18.0,
+                    "checkbox_left_clearance": 16.0,
+                },
+            )
+            try:
+                result = reviewer(
+                    0,
+                    [240, 100],
+                    [
+                        {
+                            "id": "p0-table-0",
+                            "bbox": [0, 0, 240, 100],
+                            "cells": [
+                                {
+                                    "id": "p0-t0-c0",
+                                    "bbox": [0, 0, 230, 80],
+                                    "text": "Others option",
+                                    "existing": [
+                                        {
+                                            "id": "p0-t0-c0-b0",
+                                            "bbox": [53, 34, 140, 52],
+                                            "text": "Others option",
+                                        }
+                                    ],
+                                    "reasons": [],
+                                }
+                            ],
+                        }
+                    ],
+                )
+            finally:
+                reviewer.close()
+
+        merged = [
+            item
+            for item in result["items"]
+            if item.get("action") == "merge_checkbox"
+        ]
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["target_id"], "p0-t0-c0-b0")
+        self.assertEqual(merged[0]["checkbox_state"], "checked")
+        self.assertLessEqual(merged[0]["bbox"][0], 25.0)
+        self.assertLessEqual(merged[0]["bbox"][1], 28.0)
+        self.assertGreaterEqual(merged[0]["bbox"][2], 140.0)
+        self.assertGreaterEqual(merged[0]["bbox"][3], 52.0)
         self.assertEqual(result["checkbox_merged"], 1)
 
     def test_list_marker_recovery_merges_same_line_text_bbox(self):

@@ -795,6 +795,20 @@ class WorkflowTests(unittest.TestCase):
                 0,
                 "table_orphan_min_ink_density",
             ),
+            (
+                ("fusion", "recovery", "checkbox_tick_min_square_coverage"),
+                1.1,
+                "checkbox_tick_min_square_coverage",
+            ),
+            (
+                (
+                    "fusion",
+                    "recovery",
+                    "form_full_cell_recovery_max_width_ratio",
+                ),
+                1.1,
+                "form_full_cell_recovery_max_width_ratio",
+            ),
         )
         for path_parts, value, message in cases:
             with self.subTest(path_parts=path_parts), tempfile.TemporaryDirectory() as temp_dir:
@@ -815,6 +829,22 @@ class WorkflowTests(unittest.TestCase):
             path = Path(temp_dir) / "disabled.json"
             path.write_text(json.dumps(config), encoding="utf-8")
             with self.assertRaisesRegex(WorkflowConfigError, "enabled"):
+                load_config(path)
+
+    def test_config_rejects_protruding_checkbox_size_above_regular_minimum(self):
+        source = Path(__file__).parents[1] / "workflow.example.json"
+        config = json.loads(source.read_text(encoding="utf-8"))
+        config["fusion"]["recovery"][
+            "checkbox_protruding_tick_min_size"
+        ] = 6.0
+        config["fusion"]["recovery"]["checkbox_min_size"] = 5.5
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "invalid-checkbox-tick-size.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(
+                WorkflowConfigError,
+                "checkbox_protruding_tick_min_size must not exceed",
+            ):
                 load_config(path)
 
     def test_mineru_command_uses_proxy_and_hybrid_settings(self):
