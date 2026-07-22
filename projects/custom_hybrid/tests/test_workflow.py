@@ -130,10 +130,10 @@ class WorkflowTests(unittest.TestCase):
                 "native markdown",
             )
             semantic = primary_path.read_text(encoding="utf-8")
-            self.assertIn("semantic-markdown-v5", semantic)
+            self.assertIn("semantic-markdown-v6", semantic)
             self.assertTrue(report_path.is_file())
             report = json.loads(report_path.read_text(encoding="utf-8"))
-            self.assertEqual(report["semantic_markdown_version"], 5)
+            self.assertEqual(report["semantic_markdown_version"], 6)
             self.assertEqual(report["pages_emitted"], 1)
             self.assertIn("Hello", semantic)
 

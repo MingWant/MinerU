@@ -68,6 +68,33 @@ class CustomHybridUiTests(unittest.TestCase):
                     200,
                     json={"documents": {"invoice": {"counts": {"targets": 1}}}},
                 )
+            if path == "/tasks/abc123/sorting":
+                return httpx.Response(
+                    200,
+                    json={
+                        "documents": [
+                            {
+                                "id": "document/document_sorting_report.json",
+                                "name": "document",
+                                "report": {
+                                    "status": "complete",
+                                    "page_count": 2,
+                                    "group_count": 1,
+                                    "can_auto_sort": True,
+                                    "groups": [
+                                        {
+                                            "group_id": "doc-001",
+                                            "resolved_order": ["p0001", "p0000"],
+                                        }
+                                    ],
+                                    "unresolved": [],
+                                    "unresolved_count": 0,
+                                    "report_only": True,
+                                },
+                            }
+                        ]
+                    },
+                )
             if path == "/tasks/abc123/markdown":
                 self.assertEqual(request.url.params.get("document"), "document/document.md")
                 return httpx.Response(
@@ -148,6 +175,11 @@ class CustomHybridUiTests(unittest.TestCase):
             self.assertIn("Markdown Rendering", page.text)
             self.assertIn("Markdown Text", page.text)
             self.assertIn("Content List JSON", page.text)
+            self.assertIn("Grouping &amp; Order", page.text)
+            self.assertIn("Validated Order", page.text)
+            self.assertIn("Document Groups", page.text)
+            self.assertIn("Unresolved Pages", page.text)
+            self.assertIn("Raw Sorting report", page.text)
             self.assertIn("Convert Again", page.text)
             self.assertIn('id="costProfileInput"', page.text)
             self.assertIn('id="extractionModeInput"', page.text)
@@ -181,6 +213,12 @@ class CustomHybridUiTests(unittest.TestCase):
             )
             report = client.get("/api/tasks/abc123/report")
             self.assertEqual(report.json()["documents"]["invoice"]["counts"], {"targets": 1})
+            sorting = client.get("/api/tasks/abc123/sorting")
+            self.assertTrue(sorting.json()["documents"][0]["report"]["can_auto_sort"])
+            self.assertEqual(
+                sorting.json()["documents"][0]["report"]["groups"][0]["resolved_order"],
+                ["p0001", "p0000"],
+            )
             markdown = client.get(
                 "/api/tasks/abc123/markdown",
                 params={"document": "document/document.md"},

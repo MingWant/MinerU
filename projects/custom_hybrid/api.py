@@ -57,6 +57,7 @@ MARKDOWN_ASSET_SUFFIXES = {
     ".gif",
     ".bmp",
 }
+SORTING_REPORT_SUFFIX = "_sorting_report.json"
 TERMINAL_STATUSES = {"completed", "failed"}
 Runner = Callable[[Mapping[str, Any], str | Path, str | Path], int]
 GENERATION_PARAMETER_LIMITS = {
@@ -629,6 +630,41 @@ def _task_markdown_documents(record: TaskRecord) -> dict[str, Path]:
     }
 
 
+def _task_sorting_documents(record: TaskRecord) -> list[dict[str, Any]]:
+    fused_root = record.output_root / "fused"
+    if not fused_root.is_dir():
+        return []
+    resolved_fused_root = fused_root.resolve()
+    documents = []
+    for path in sorted(fused_root.rglob(f"*{SORTING_REPORT_SUFFIX}")):
+        if not path.is_file():
+            continue
+        resolved_path = path.resolve()
+        try:
+            relative_path = resolved_path.relative_to(resolved_fused_root).as_posix()
+        except ValueError:
+            continue
+        try:
+            report = json.loads(resolved_path.read_text(encoding="utf-8"))
+            if not isinstance(report, Mapping):
+                raise ValueError("report root must be an object")
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            report = {
+                "status": "error",
+                "can_auto_sort": False,
+                "report_only": True,
+                "error": f"Unable to read Sorting report: {type(exc).__name__}",
+            }
+        documents.append(
+            {
+                "id": relative_path,
+                "name": path.name[: -len(SORTING_REPORT_SUFFIX)],
+                "report": report,
+            }
+        )
+    return documents
+
+
 def _select_task_markdown(record: TaskRecord, document: str | None) -> tuple[str, Path]:
     documents = _task_markdown_documents(record)
     if not documents:
@@ -938,6 +974,16 @@ def create_app(
             raise HTTPException(status_code=409, detail=f"Task is {record.status}")
         return JSONResponse(
             content=json.loads(report_path.read_text(encoding="utf-8"))
+        )
+
+    @app.get(
+        "/tasks/{task_id}/sorting",
+        name="get_task_sorting",
+    )
+    async def get_task_sorting(task_id: str) -> JSONResponse:
+        record = require_completed_task(task_id)
+        return JSONResponse(
+            content={"documents": _task_sorting_documents(record)}
         )
 
     @app.post("/file_parse")

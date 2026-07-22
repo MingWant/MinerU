@@ -58,6 +58,13 @@ class SemanticMarkdownBenchmarkTests(unittest.TestCase):
             self.assertEqual(report["summary"]["text_bearing_pages"], 2)
             self.assertEqual(report["summary"]["text_bearing_pages_emitted"], 2)
             self.assertEqual(report["summary"]["unmatched_source_records"], 0)
+            self.assertEqual(report["summary"]["region_ordered_pages"], 0)
+            self.assertEqual(report["summary"]["ownership_suppressions"], 0)
+            self.assertEqual(
+                report["summary"]["output_duplicate_suppressions"],
+                0,
+            )
+            self.assertEqual(report["summary"]["potential_duplicate_groups"], 0)
             self.assertEqual(report["failures"], [])
             self.assertTrue(
                 all(

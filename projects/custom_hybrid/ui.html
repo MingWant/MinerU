@@ -266,6 +266,79 @@
     .coverage-metric strong { display: block; font-size: 16px; }
     .coverage-metric span { display: block; margin-top: 3px; color: var(--muted); font-size: 9px; line-height: 1.25; text-transform: uppercase; }
     .fusion-section-title { margin: 14px 0 7px; font-size: 11px; color: #475467; text-transform: uppercase; }
+    .sorting-content { min-width: 0; }
+    .sorting-toolbar {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .sorting-toolbar h3 { margin: 0; font-size: 14px; letter-spacing: 0; }
+    .sorting-document-name { display: block; margin-top: 3px; color: var(--muted); font-size: 10px; }
+    .sorting-document-field { min-width: 150px; }
+    .sorting-document-field label { display: block; margin-bottom: 4px; color: var(--muted); font-size: 9px; font-weight: 700; text-transform: uppercase; }
+    .sorting-document-select {
+      width: 100%;
+      height: 30px;
+      border: 1px solid #ccd4df;
+      border-radius: 6px;
+      padding: 4px 7px;
+      color: #344054;
+      background: white;
+      font-size: 10px;
+    }
+    .sorting-summary {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      overflow: hidden;
+      margin-bottom: 16px;
+      border: 1px solid #dde3eb;
+      border-radius: 6px;
+      background: #f8fafc;
+    }
+    .sorting-metric { min-width: 0; padding: 9px 10px; border-right: 1px solid #e3e7ed; border-bottom: 1px solid #e3e7ed; }
+    .sorting-metric:nth-child(3n) { border-right: 0; }
+    .sorting-metric:nth-last-child(-n + 3) { border-bottom: 0; }
+    .sorting-metric strong { display: block; overflow-wrap: anywhere; font-size: 14px; line-height: 1.25; }
+    .sorting-metric span { display: block; margin-top: 3px; color: var(--muted); font-size: 9px; text-transform: uppercase; }
+    .sorting-value-success { color: var(--success); }
+    .sorting-value-warning { color: var(--warning); }
+    .sorting-value-danger { color: var(--danger); }
+    .sorting-section { margin-top: 16px; }
+    .sorting-section-header { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 7px; }
+    .sorting-section-title { margin: 0; color: #344054; font-size: 11px; text-transform: uppercase; }
+    .sorting-section-count { color: var(--muted); font-size: 10px; }
+    .sorting-table-wrap { max-width: 100%; overflow-x: auto; border: 1px solid #dce2ea; border-radius: 6px; }
+    .sorting-table { width: 100%; min-width: 780px; border-collapse: collapse; color: #344054; font-size: 10px; }
+    .sorting-table.unresolved-table { min-width: 560px; }
+    .sorting-table th, .sorting-table td { padding: 8px 9px; border-bottom: 1px solid #e5e9ef; text-align: left; vertical-align: top; }
+    .sorting-table th { color: #596579; background: #f5f7fa; font-size: 9px; text-transform: uppercase; white-space: nowrap; }
+    .sorting-table tr:last-child td { border-bottom: 0; }
+    .sorting-table td { overflow-wrap: anywhere; line-height: 1.45; }
+    .sorting-table td:nth-child(1), .sorting-table td:nth-child(2) { white-space: nowrap; }
+    .sorting-badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 20px;
+      border-radius: 5px;
+      padding: 3px 6px;
+      font-size: 9px;
+      font-weight: 750;
+      text-transform: uppercase;
+    }
+    .sorting-badge.success { color: var(--success); background: #e0f4ec; }
+    .sorting-badge.warning { color: var(--warning); background: #fff2d7; }
+    .sorting-badge.danger { color: var(--danger); background: #fde6e6; }
+    .sorting-token { display: inline-block; margin: 0 3px 3px 0; padding: 2px 4px; border-radius: 4px; color: #344054; background: #edf1f5; font-family: "SFMono-Regular", Consolas, monospace; font-size: 9px; }
+    .sorting-arrow { margin-right: 3px; color: #98a2b3; }
+    .sorting-cell-stack { display: grid; gap: 3px; }
+    .sorting-cell-stack strong { color: #475467; }
+    .sorting-muted { color: var(--muted); }
+    .sorting-raw { margin-top: 16px; border-top: 1px solid #e3e7ed; padding-top: 11px; }
+    .sorting-raw summary { cursor: pointer; color: #475467; font-size: 11px; font-weight: 700; }
+    .sorting-raw[open] summary { margin-bottom: 8px; }
+    .sorting-raw .source-output { min-height: 240px; max-height: 520px; }
     .hidden { display: none !important; }
     @media (max-width: 1180px) {
       .workspace { grid-template-columns: 270px minmax(400px, 1fr); }
@@ -286,6 +359,13 @@
       .preview-frame, .preview-image { min-height: 480px; }
       .result-panel { min-height: 500px; }
       .output-actions { flex-wrap: wrap; justify-content: flex-end; }
+      .sorting-toolbar { align-items: stretch; flex-direction: column; }
+      .sorting-document-field { width: 100%; }
+      .sorting-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .sorting-metric:nth-child(3n) { border-right: 1px solid #e3e7ed; }
+      .sorting-metric:nth-child(2n) { border-right: 0; }
+      .sorting-metric:nth-last-child(-n + 3) { border-bottom: 1px solid #e3e7ed; }
+      .sorting-metric:nth-last-child(-n + 2) { border-bottom: 0; }
     }
   </style>
 </head>
@@ -452,6 +532,7 @@
         <button class="result-tab active" data-result-tab="rendered" role="tab" aria-selected="true">Markdown Rendering</button>
         <button class="result-tab" data-result-tab="markdown" role="tab" aria-selected="false">Markdown Text</button>
         <button class="result-tab" data-result-tab="content" role="tab" aria-selected="false">Content List JSON</button>
+        <button class="result-tab" data-result-tab="sorting" role="tab" aria-selected="false">Grouping &amp; Order</button>
         <button class="result-tab" data-result-tab="fusion" role="tab" aria-selected="false">Fusion Report</button>
       </nav>
 
@@ -464,6 +545,76 @@
       </div>
       <div id="contentPanel" class="result-panel" role="tabpanel">
         <pre id="contentListOutput" class="source-output">Content list JSON will appear here.</pre>
+      </div>
+      <div id="sortingPanel" class="result-panel" role="tabpanel">
+        <div id="sortingEmpty" class="result-empty">Grouping and order results will appear here.</div>
+        <div id="sortingContent" class="sorting-content hidden">
+          <div class="sorting-toolbar">
+            <div>
+              <h3>Grouping &amp; Order</h3>
+              <span id="sortingDocumentName" class="sorting-document-name"></span>
+            </div>
+            <div id="sortingDocumentField" class="sorting-document-field hidden">
+              <label for="sortingDocumentSelect">Document</label>
+              <select id="sortingDocumentSelect" class="sorting-document-select"></select>
+            </div>
+          </div>
+          <div class="sorting-summary" aria-label="Grouping and order summary">
+            <div class="sorting-metric"><strong id="sortingStatusValue">-</strong><span>Report Status</span></div>
+            <div class="sorting-metric"><strong id="sortingPagesValue">-</strong><span>Pages</span></div>
+            <div class="sorting-metric"><strong id="sortingGroupsValue">-</strong><span>Groups</span></div>
+            <div class="sorting-metric"><strong id="sortingUnresolvedValue">-</strong><span>Unresolved</span></div>
+            <div class="sorting-metric"><strong id="sortingOrderValue">-</strong><span>Validated Order</span></div>
+            <div class="sorting-metric"><strong id="sortingModeValue">-</strong><span>Mode</span></div>
+          </div>
+
+          <section class="sorting-section" aria-labelledby="sortingGroupsTitle">
+            <div class="sorting-section-header">
+              <h4 id="sortingGroupsTitle" class="sorting-section-title">Document Groups</h4>
+              <span id="sortingGroupCount" class="sorting-section-count"></span>
+            </div>
+            <div class="sorting-table-wrap">
+              <table class="sorting-table">
+                <thead>
+                  <tr>
+                    <th>Group</th>
+                    <th>State</th>
+                    <th>Pages</th>
+                    <th>Physical Members</th>
+                    <th>Proposed Order</th>
+                    <th>Evidence / Issues</th>
+                  </tr>
+                </thead>
+                <tbody id="sortingGroupBody"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section id="sortingUnresolvedSection" class="sorting-section hidden" aria-labelledby="sortingUnresolvedTitle">
+            <div class="sorting-section-header">
+              <h4 id="sortingUnresolvedTitle" class="sorting-section-title">Unresolved Pages</h4>
+              <span id="sortingUnresolvedCount" class="sorting-section-count"></span>
+            </div>
+            <div class="sorting-table-wrap">
+              <table class="sorting-table unresolved-table">
+                <thead>
+                  <tr>
+                    <th>Page</th>
+                    <th>Input Position</th>
+                    <th>Reason</th>
+                    <th>Candidate Groups</th>
+                  </tr>
+                </thead>
+                <tbody id="sortingUnresolvedBody"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <details class="sorting-raw">
+            <summary>Raw Sorting report</summary>
+            <pre id="sortingRawOutput" class="source-output"></pre>
+          </details>
+        </div>
       </div>
       <div id="fusionPanel" class="result-panel" role="tabpanel">
         <div id="coverageSummary" class="coverage-summary" aria-label="Coverage summary">
@@ -563,6 +714,23 @@
   const reportOutput = document.querySelector('#reportOutput');
   const taskDetailsTitle = document.querySelector('#taskDetailsTitle');
   const taskOutput = document.querySelector('#taskOutput');
+  const sortingEmpty = document.querySelector('#sortingEmpty');
+  const sortingContent = document.querySelector('#sortingContent');
+  const sortingDocumentName = document.querySelector('#sortingDocumentName');
+  const sortingDocumentField = document.querySelector('#sortingDocumentField');
+  const sortingDocumentSelect = document.querySelector('#sortingDocumentSelect');
+  const sortingStatusValue = document.querySelector('#sortingStatusValue');
+  const sortingPagesValue = document.querySelector('#sortingPagesValue');
+  const sortingGroupsValue = document.querySelector('#sortingGroupsValue');
+  const sortingUnresolvedValue = document.querySelector('#sortingUnresolvedValue');
+  const sortingOrderValue = document.querySelector('#sortingOrderValue');
+  const sortingModeValue = document.querySelector('#sortingModeValue');
+  const sortingGroupCount = document.querySelector('#sortingGroupCount');
+  const sortingGroupBody = document.querySelector('#sortingGroupBody');
+  const sortingUnresolvedSection = document.querySelector('#sortingUnresolvedSection');
+  const sortingUnresolvedCount = document.querySelector('#sortingUnresolvedCount');
+  const sortingUnresolvedBody = document.querySelector('#sortingUnresolvedBody');
+  const sortingRawOutput = document.querySelector('#sortingRawOutput');
 
   let selectedFiles = [];
   let previewUrl = null;
@@ -570,6 +738,7 @@
   let serviceOnline = false;
   let taskBusy = false;
   let activeTaskId = null;
+  let sortingDocuments = [];
 
   const parameterInputs = [
     extractionModeInput, costProfileInput, effortInput, methodInput, langInput, temperatureInput,
@@ -708,6 +877,11 @@
     document.querySelectorAll('.result-panel').forEach(panel => {
       panel.classList.toggle('active', panel.id === `${name}Panel`);
     });
+    const markdownTab = ['rendered', 'markdown', 'content'].includes(name);
+    documentSelect.classList.toggle(
+      'hidden',
+      !markdownTab || documentSelect.options.length <= 1,
+    );
   }
 
   document.querySelectorAll('.result-tab').forEach(button => {
@@ -732,6 +906,17 @@
     taskDetailsTitle.classList.add('hidden');
     taskOutput.classList.add('hidden');
     taskOutput.textContent = '';
+    sortingDocuments = [];
+    sortingEmpty.textContent = 'Grouping and order results will appear here.';
+    sortingEmpty.classList.remove('hidden');
+    sortingContent.classList.add('hidden');
+    sortingDocumentName.textContent = '';
+    sortingDocumentField.classList.add('hidden');
+    sortingDocumentSelect.replaceChildren();
+    sortingGroupBody.replaceChildren();
+    sortingUnresolvedSection.classList.add('hidden');
+    sortingUnresolvedBody.replaceChildren();
+    sortingRawOutput.textContent = '';
     documentSelect.classList.add('hidden');
     documentSelect.replaceChildren();
     downloadButton.classList.remove('visible');
@@ -927,6 +1112,195 @@
     catch { return raw; }
   }
 
+  function humanizeSortingStatus(value) {
+    const normalized = String(value ?? 'unknown').trim().replace(/[_-]+/g, ' ');
+    return normalized
+      ? normalized.charAt(0).toUpperCase() + normalized.slice(1)
+      : 'Unknown';
+  }
+
+  function sortingStatusTone(value) {
+    const status = String(value ?? '').toLowerCase();
+    if (status === 'complete' || status === 'ready') return 'success';
+    if (status === 'error') return 'danger';
+    return 'warning';
+  }
+
+  function sortingBadge(value) {
+    return `<span class="sorting-badge ${sortingStatusTone(value)}">${escapeHtml(humanizeSortingStatus(value))}</span>`;
+  }
+
+  function formatSortingTokens(values, ordered = false) {
+    if (!Array.isArray(values) || !values.length) {
+      return '<span class="sorting-muted">-</span>';
+    }
+    const separator = ordered
+      ? '<span class="sorting-arrow" aria-hidden="true">&rarr;</span>'
+      : '';
+    return values
+      .map(value => `<span class="sorting-token">${escapeHtml(value)}</span>`)
+      .join(separator);
+  }
+
+  function formatSortingEvidence(group) {
+    const groupInfo = group && typeof group === 'object' ? group : {};
+    const lines = [];
+    const identifiers = groupInfo.identifiers && typeof groupInfo.identifiers === 'object'
+      ? Object.entries(groupInfo.identifiers)
+      : [];
+    identifiers.forEach(([kind, values]) => {
+      if (!Array.isArray(values) || !values.length) return;
+      lines.push(`<div><strong>${escapeHtml(humanizeSortingStatus(kind))}:</strong> ${escapeHtml(values.join(', '))}</div>`);
+    });
+    if (Array.isArray(groupInfo.missing_numbers) && groupInfo.missing_numbers.length) {
+      lines.push(`<div><strong>Missing:</strong> ${escapeHtml(groupInfo.missing_numbers.join(', '))}</div>`);
+    }
+    const duplicates = groupInfo.duplicates && typeof groupInfo.duplicates === 'object'
+      ? Object.entries(groupInfo.duplicates)
+      : [];
+    duplicates.forEach(([number, pageIds]) => {
+      const members = Array.isArray(pageIds) ? pageIds.join(', ') : String(pageIds);
+      lines.push(`<div><strong>Duplicate ${escapeHtml(number)}:</strong> ${escapeHtml(members)}</div>`);
+    });
+    if (Array.isArray(groupInfo.unexpected_numbers) && groupInfo.unexpected_numbers.length) {
+      lines.push(`<div><strong>Out of range:</strong> ${escapeHtml(groupInfo.unexpected_numbers.join(', '))}</div>`);
+    }
+    const ambiguous = groupInfo.ambiguous_pages && typeof groupInfo.ambiguous_pages === 'object'
+      ? Object.entries(groupInfo.ambiguous_pages)
+      : [];
+    ambiguous.forEach(([pageId, reason]) => {
+      lines.push(`<div><strong>Ambiguous ${escapeHtml(pageId)}:</strong> ${escapeHtml(humanizeSortingStatus(reason))}</div>`);
+    });
+    const decisions = Array.isArray(groupInfo.decisions) ? groupInfo.decisions : [];
+    const signals = [...new Set(decisions.flatMap(decision => (
+      Array.isArray(decision.reasons) ? decision.reasons : []
+    )))];
+    if (decisions.length) {
+      lines.push(`<div><strong>Assignments:</strong> ${decisions.length}</div>`);
+    }
+    if (signals.length) {
+      lines.push(`<div><strong>Signals:</strong> ${escapeHtml(signals.map(humanizeSortingStatus).join(', '))}</div>`);
+    }
+    if (!lines.length) {
+      lines.push('<div class="sorting-muted">No conflicts</div>');
+    }
+    return `<div class="sorting-cell-stack">${lines.join('')}</div>`;
+  }
+
+  function formatSortingCandidates(item) {
+    const candidates = Array.isArray(item.candidates) ? item.candidates : [];
+    if (!candidates.length) return '<span class="sorting-muted">-</span>';
+    return `<div class="sorting-cell-stack">${candidates.map(candidate => {
+      const score = candidate.score === null || candidate.score === undefined
+        ? ''
+        : ` (${escapeHtml(candidate.score)})`;
+      const reasons = Array.isArray(candidate.reasons)
+        ? candidate.reasons.map(humanizeSortingStatus).join(', ')
+        : '';
+      return `<div><strong>${escapeHtml(candidate.group_id || 'Unknown')}${score}:</strong> ${escapeHtml(reasons || 'No score detail')}</div>`;
+    }).join('')}</div>`;
+  }
+
+  function renderSortingDocument(documentInfo) {
+    const report = documentInfo && documentInfo.report && typeof documentInfo.report === 'object'
+      ? documentInfo.report
+      : {};
+    const groups = Array.isArray(report.groups) ? report.groups : [];
+    const unresolved = Array.isArray(report.unresolved) ? report.unresolved : [];
+    const status = report.status || 'unknown';
+    sortingDocumentSelect.value = documentInfo.id;
+    sortingDocumentName.textContent = documentInfo.name || documentInfo.id;
+    sortingStatusValue.textContent = humanizeSortingStatus(status);
+    sortingStatusValue.className = `sorting-value-${sortingStatusTone(status)}`;
+    sortingPagesValue.textContent = String(report.page_count ?? '-');
+    sortingGroupsValue.textContent = String(report.group_count ?? groups.length);
+    sortingUnresolvedValue.textContent = String(report.unresolved_count ?? unresolved.length);
+    sortingOrderValue.textContent = report.can_auto_sort ? 'Ready' : 'Blocked';
+    sortingOrderValue.className = report.can_auto_sort
+      ? 'sorting-value-success'
+      : 'sorting-value-warning';
+    sortingModeValue.textContent = report.report_only
+      ? 'Report only'
+      : humanizeSortingStatus(report.mode || 'unknown');
+    sortingGroupCount.textContent = `${groups.length} group${groups.length === 1 ? '' : 's'}`;
+    sortingGroupBody.innerHTML = groups.length
+      ? groups.map(group => {
+        const groupInfo = group && typeof group === 'object' ? group : {};
+        const members = Array.isArray(groupInfo.member_page_ids) ? groupInfo.member_page_ids : [];
+        const expected = groupInfo.expected_total ?? '-';
+        const order = Array.isArray(groupInfo.resolved_order)
+          ? formatSortingTokens(groupInfo.resolved_order, true)
+          : '<span class="sorting-muted">Not validated</span>';
+        return `
+          <tr>
+            <td><strong>${escapeHtml(groupInfo.group_id || '-')}</strong></td>
+            <td>${sortingBadge(groupInfo.status || 'unknown')}</td>
+            <td>${escapeHtml(members.length)} found<br><span class="sorting-muted">${escapeHtml(expected)} expected</span></td>
+            <td>${formatSortingTokens(members)}</td>
+            <td>${order}</td>
+            <td>${formatSortingEvidence(groupInfo)}</td>
+          </tr>
+        `;
+      }).join('')
+      : '<tr><td colspan="6" class="sorting-muted">No document groups detected.</td></tr>';
+    sortingUnresolvedSection.classList.toggle('hidden', unresolved.length === 0);
+    sortingUnresolvedCount.textContent = `${unresolved.length} page${unresolved.length === 1 ? '' : 's'}`;
+    sortingUnresolvedBody.innerHTML = unresolved.map(item => {
+      const itemInfo = item && typeof item === 'object' ? item : {};
+      const position = Number.isInteger(itemInfo.physical_page_idx)
+        ? `#${itemInfo.physical_page_idx + 1}`
+        : '-';
+      return `
+        <tr>
+          <td>${formatSortingTokens([itemInfo.page_id || 'Unknown'])}</td>
+          <td>${escapeHtml(position)}</td>
+          <td>${sortingBadge(itemInfo.reason || 'unresolved')}</td>
+          <td>${formatSortingCandidates(itemInfo)}</td>
+        </tr>
+      `;
+    }).join('');
+    sortingRawOutput.textContent = JSON.stringify(report, null, 2);
+    sortingEmpty.classList.add('hidden');
+    sortingContent.classList.remove('hidden');
+  }
+
+  async function loadSorting(taskId) {
+    const result = await jsonResponse(
+      await fetch(`/api/tasks/${encodeURIComponent(taskId)}/sorting`)
+    );
+    sortingDocuments = Array.isArray(result.documents) ? result.documents : [];
+    sortingDocumentSelect.replaceChildren();
+    const nameCounts = sortingDocuments.reduce((counts, documentInfo) => {
+      const name = documentInfo.name || documentInfo.id;
+      counts[name] = (counts[name] || 0) + 1;
+      return counts;
+    }, {});
+    sortingDocuments.forEach(documentInfo => {
+      const option = document.createElement('option');
+      option.value = documentInfo.id;
+      const name = documentInfo.name || documentInfo.id;
+      option.textContent = nameCounts[name] > 1
+        ? `${name} - ${documentInfo.id}`
+        : name;
+      sortingDocumentSelect.appendChild(option);
+    });
+    sortingDocumentField.classList.toggle('hidden', sortingDocuments.length <= 1);
+    if (!sortingDocuments.length) {
+      sortingContent.classList.add('hidden');
+      sortingEmpty.textContent = 'No Grouping & Order report is available for this task.';
+      sortingEmpty.classList.remove('hidden');
+      return;
+    }
+    renderSortingDocument(sortingDocuments[0]);
+  }
+
+  sortingDocumentSelect.addEventListener('change', () => {
+    const selected = sortingDocuments.find(documentInfo => (
+      documentInfo.id === sortingDocumentSelect.value
+    ));
+    if (selected) renderSortingDocument(selected);
+  });
+
   function populateDocumentSelect(documents, selected) {
     documentSelect.replaceChildren();
     documents.forEach(documentInfo => {
@@ -936,7 +1310,9 @@
       option.selected = documentInfo.id === selected;
       documentSelect.appendChild(option);
     });
-    documentSelect.classList.toggle('hidden', documents.length <= 1);
+    const activeTab = document.querySelector('.result-tab.active')?.dataset.resultTab;
+    const markdownTab = ['rendered', 'markdown', 'content'].includes(activeTab);
+    documentSelect.classList.toggle('hidden', documents.length <= 1 || !markdownTab);
   }
 
   async function loadMarkdown(taskId, selectedDocument = null) {
@@ -1084,9 +1460,10 @@
 
   async function loadCompletedOutputs(taskId) {
     setStage('build', ['prepare', 'service', 'upload', 'queue', 'parse']);
-    const [reportResult, markdownResult] = await Promise.allSettled([
+    const [reportResult, markdownResult, sortingResult] = await Promise.allSettled([
       fetch(`/api/tasks/${encodeURIComponent(taskId)}/report`).then(jsonResponse),
       loadMarkdown(taskId),
+      loadSorting(taskId),
     ]);
     if (reportResult.status === 'fulfilled') {
       renderCoverageSummary(reportResult.value);
@@ -1097,6 +1474,11 @@
     }
     if (markdownResult.status === 'rejected') {
       markdownEmpty.textContent = markdownResult.reason.message || 'Markdown output is unavailable.';
+    }
+    if (sortingResult.status === 'rejected') {
+      sortingContent.classList.add('hidden');
+      sortingEmpty.textContent = sortingResult.reason.message || 'Grouping & Order report is unavailable.';
+      sortingEmpty.classList.remove('hidden');
     }
     downloadButton.href = `/api/tasks/${encodeURIComponent(taskId)}/result`;
     downloadButton.classList.add('visible');

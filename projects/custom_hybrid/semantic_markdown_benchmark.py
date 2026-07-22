@@ -1,4 +1,4 @@
-"""Batch replay fused middle JSON files through semantic Markdown v5."""
+"""Batch replay fused middle JSON files through semantic Markdown v6."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from projects.custom_hybrid.semantic_markdown import (
-    generate_semantic_markdown,
+    _generate_semantic_markdown_with_diagnostics,
     generate_semantic_markdown_report,
 )
 
@@ -36,8 +36,14 @@ def benchmark_semantic_markdown(inputs: Sequence[Path]) -> dict[str, Any]:
             payload = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("middle JSON root must be an object")
-            markdown = generate_semantic_markdown(payload)
-            report = generate_semantic_markdown_report(payload, markdown)
+            markdown, page_diagnostics = (
+                _generate_semantic_markdown_with_diagnostics(payload)
+            )
+            report = generate_semantic_markdown_report(
+                payload,
+                markdown,
+                page_layout_diagnostics=page_diagnostics,
+            )
             documents.append(
                 {
                     "path": str(path),
@@ -73,6 +79,18 @@ def benchmark_semantic_markdown(inputs: Sequence[Path]) -> dict[str, Any]:
             ),
             "unstructured_table_fallback_blocks": sum(
                 item["unstructured_table_fallback_blocks"] for item in documents
+            ),
+            "region_ordered_pages": sum(
+                len(item["region_ordered_pages"]) for item in documents
+            ),
+            "ownership_suppressions": sum(
+                item["ownership_suppressions"] for item in documents
+            ),
+            "output_duplicate_suppressions": sum(
+                item["output_duplicate_suppressions"] for item in documents
+            ),
+            "potential_duplicate_groups": sum(
+                item["potential_duplicate_groups"] for item in documents
             ),
         },
     }

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 
-SEMANTIC_MARKDOWN_VERSION = 5
+SEMANTIC_MARKDOWN_VERSION = 6
 
 SECTION_RE = re.compile(
     r"^(?:PART\s+(?:[IVXLC]+|\d+|[A-Z])\b|POINTS? TO NOTE\b|IMPORTANT NOTES?\b|"
@@ -226,6 +226,37 @@ class SemanticLine:
     @property
     def height(self) -> float:
         return self.bbox[3] - self.bbox[1]
+
+
+@dataclass(frozen=True)
+class PageSegment:
+    bbox: tuple[float, float, float, float]
+    text: str
+    kind: str = "line"
+
+    @property
+    def top(self) -> float:
+        return self.bbox[1]
+
+    @property
+    def left(self) -> float:
+        return self.bbox[0]
+
+    @property
+    def width(self) -> float:
+        return self.bbox[2] - self.bbox[0]
+
+    @property
+    def height(self) -> float:
+        return self.bbox[3] - self.bbox[1]
+
+    @property
+    def center_x(self) -> float:
+        return (self.bbox[0] + self.bbox[2]) / 2
+
+    @property
+    def center_y(self) -> float:
+        return (self.bbox[1] + self.bbox[3]) / 2
 
 
 def _valid_bbox(value: Any) -> tuple[float, float, float, float] | None:
@@ -1269,13 +1300,13 @@ def _render_ledger_tail(
     if has_admitted and (value := labeled_dates.get("admitted")):
         _append_unique_ledger_text(
             parts,
-            seen,
+            None,
             f"- **Date Admitted / 入院日期**: {value}",
         )
     if has_discharged and (value := labeled_dates.get("discharged")):
         _append_unique_ledger_text(
             parts,
-            seen,
+            None,
             f"- **Date Discharged / 出院日期**: {value}",
         )
     return "\n\n".join(parts)
@@ -2183,32 +2214,48 @@ def _append_unique_output(
     text: str,
     *,
     bbox: tuple[float, float, float, float] | None = None,
-) -> None:
+) -> dict[str, Any] | None:
     key = _output_text_key(text)
     if not key:
-        return
-    if not _repeatable_value(text):
-        duplicate = False
-        for existing in seen:
-            if isinstance(existing, tuple) and len(existing) == 2:
-                existing_key, existing_bbox = existing
-            else:
-                existing_key, existing_bbox = existing, None
-            if not _equivalent_semantic_text(key, str(existing_key)):
-                continue
-            if bbox is None or existing_bbox is None:
-                duplicate = True
-                break
+        return None
+    repeatable = _repeatable_value(text)
+    for existing in seen:
+        if isinstance(existing, tuple) and len(existing) >= 2:
+            existing_key = existing[0]
+            existing_bbox = existing[1]
+            existing_text = existing[2] if len(existing) >= 3 else existing_key
+        else:
+            existing_key, existing_bbox, existing_text = existing, None, existing
+        if not _equivalent_semantic_text(key, str(existing_key)):
+            continue
+        reason = None
+        if bbox is not None and existing_bbox is not None:
             if _same_visual_position(
                 SemanticLine(bbox, key),
                 SemanticLine(existing_bbox, str(existing_key)),
             ):
-                duplicate = True
-                break
-        if duplicate:
-            return
-        seen.append((key, bbox) if bbox is not None else key)
+                reason = "overlapping_equivalent"
+        elif not repeatable:
+            reason = "unpositioned_equivalent"
+        if reason is not None:
+            return {
+                "reason": reason,
+                "kept_text": _diagnostic_text(str(existing_text)),
+                "kept_bbox": (
+                    [round(value, 4) for value in existing_bbox]
+                    if existing_bbox is not None
+                    else None
+                ),
+                "suppressed_text": _diagnostic_text(text),
+                "suppressed_bbox": (
+                    [round(value, 4) for value in bbox]
+                    if bbox is not None
+                    else None
+                ),
+            }
+    seen.append((key, bbox, text))
     parts.append(text)
+    return None
 
 
 def _active_page_objects(page: Mapping[str, Any]) -> Iterable[Mapping[str, Any]]:
@@ -2298,6 +2345,21 @@ def _text_source_stats(middle_json: Mapping[str, Any]) -> tuple[int, int]:
     return count, characters
 
 
+def _markdown_page_bodies(markdown: str) -> dict[int, str]:
+    """Split rendered Markdown by page markers for page-local source tracing."""
+    matches = list(
+        re.finditer(r"(?m)^<!-- Page (\d+) -->\s*$", markdown)
+    )
+    if not matches:
+        return {1: markdown}
+    pages: dict[int, str] = {}
+    for index, match in enumerate(matches):
+        page_number = int(match.group(1))
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(markdown)
+        pages[page_number] = markdown[match.end() : end]
+    return pages
+
+
 def _trace_source_records(
     middle_json: Mapping[str, Any],
     markdown: str,
@@ -2307,7 +2369,7 @@ def _trace_source_records(
     counts: dict[str, int] = defaultdict(int)
     if not isinstance(pages, list):
         return records, dict(counts)
-    markdown_key = _normalized(markdown)
+    markdown_pages = _markdown_page_bodies(markdown)
     repeated_margins = _margin_repetitions(pages)
     seen: set[int] = set()
     for page_index, page in enumerate(pages):
@@ -2319,6 +2381,8 @@ def _trace_source_records(
             if isinstance(page_size, (list, tuple)) and len(page_size) >= 2
             else 0.0
         )
+        page_markdown = markdown_pages.get(page_index + 1, "")
+        markdown_key = _normalized(page_markdown)
         for item in _active_page_objects(page):
             if id(item) in seen:
                 continue
@@ -2361,7 +2425,7 @@ def _trace_source_records(
                 status = "represented_schema"
             elif _isolated_checkbox_marker(text) and re.search(
                 r"^- \[[x ?]\] ",
-                markdown,
+                page_markdown,
                 re.MULTILINE,
             ):
                 status = "represented_control"
@@ -2375,7 +2439,7 @@ def _trace_source_records(
                 status = "represented_aggregate"
             elif len(normalized) >= 6 and any(
                 _equivalent_semantic_text(text, line)
-                for line in markdown.splitlines()
+                for line in page_markdown.splitlines()
                 if line.strip() and not line.lstrip().startswith("<!--")
             ):
                 status = "represented_equivalent"
@@ -3481,29 +3545,195 @@ def _page_noise_lines(parts: Sequence[str]) -> list[str]:
     ]
 
 
-def _sort_page_segments(
-    segments: Sequence[
-        tuple[float, float, str, tuple[float, float, float, float]]
-    ],
-) -> list[tuple[float, float, str, tuple[float, float, float, float]]]:
-    """Sort page segments by tolerant top rows and then left position."""
+def _bbox_area(bbox: tuple[float, float, float, float]) -> float:
+    return max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
+
+
+def _bbox_union(
+    bboxes: Sequence[tuple[float, float, float, float]],
+) -> tuple[float, float, float, float]:
+    return (
+        min(bbox[0] for bbox in bboxes),
+        min(bbox[1] for bbox in bboxes),
+        max(bbox[2] for bbox in bboxes),
+        max(bbox[3] for bbox in bboxes),
+    )
+
+
+def _bbox_contains_center(
+    outer: tuple[float, float, float, float],
+    inner: tuple[float, float, float, float],
+) -> bool:
+    center_x = (inner[0] + inner[2]) / 2
+    center_y = (inner[1] + inner[3]) / 2
+    tolerance = max(1.0, min(outer[2] - outer[0], outer[3] - outer[1]) * 0.02)
+    return bool(
+        outer[0] - tolerance <= center_x <= outer[2] + tolerance
+        and outer[1] - tolerance <= center_y <= outer[3] + tolerance
+    )
+
+
+def _aggregate_character_coverage(text: str, fragments: Sequence[str]) -> float:
+    normalized = _output_text_key(text)
+    if not normalized:
+        return 0.0
+    intervals = []
+    for fragment in dict.fromkeys(_output_text_key(item) for item in fragments):
+        if len(fragment) < 3:
+            continue
+        start = normalized.find(fragment)
+        if start >= 0:
+            intervals.append((start, start + len(fragment)))
+    covered = 0
+    right = 0
+    for left, interval_right in sorted(intervals):
+        if interval_right <= right:
+            continue
+        covered += interval_right - max(left, right)
+        right = interval_right
+    return covered / len(normalized)
+
+
+def _diagnostic_text(text: str, limit: int = 180) -> str:
+    compact = re.sub(r"\s+", " ", text).strip()
+    return compact if len(compact) <= limit else compact[: limit - 1] + "…"
+
+
+def _resolve_page_segment_ownership(
+    segments: Sequence[PageSegment],
+) -> tuple[list[PageSegment], list[dict[str, Any]]]:
+    """Give structured/tight evidence one output owner per visual region."""
+    suppressed: set[int] = set()
+    decisions: list[dict[str, Any]] = []
+
+    def suppress(index: int, owner_indices: Sequence[int], reason: str) -> None:
+        if index in suppressed:
+            return
+        suppressed.add(index)
+        decisions.append(
+            {
+                "reason": reason,
+                "suppressed_text": _diagnostic_text(segments[index].text),
+                "suppressed_bbox": [
+                    round(value, 4) for value in segments[index].bbox
+                ],
+                "owner_texts": [
+                    _diagnostic_text(segments[owner_index].text)
+                    for owner_index in owner_indices[:8]
+                ],
+                "owner_bboxes": [
+                    [round(value, 4) for value in segments[owner_index].bbox]
+                    for owner_index in owner_indices[:8]
+                ],
+            }
+        )
+
+    table_indices = [
+        index for index, segment in enumerate(segments) if segment.kind == "table"
+    ]
+    for index, segment in enumerate(segments):
+        if segment.kind != "line":
+            continue
+        key = _output_text_key(segment.text)
+        if not key:
+            continue
+        owners = [
+            table_index
+            for table_index in table_indices
+            if _bbox_contains_center(segments[table_index].bbox, segment.bbox)
+            and key in _normalized(segments[table_index].text)
+        ]
+        if owners:
+            owner = min(owners, key=lambda item: _bbox_area(segments[item].bbox))
+            suppress(index, [owner], "structured_table_owner")
+
+    line_indices = [
+        index
+        for index, segment in enumerate(segments)
+        if segment.kind == "line" and index not in suppressed
+    ]
+    for index in sorted(
+        line_indices,
+        key=lambda item: _bbox_area(segments[item].bbox),
+        reverse=True,
+    ):
+        if index in suppressed:
+            continue
+        segment = segments[index]
+        area = _bbox_area(segment.bbox)
+        if area <= 0:
+            continue
+        tighter_equivalents = [
+            other_index
+            for other_index in line_indices
+            if other_index != index
+            and other_index not in suppressed
+            and _bbox_area(segments[other_index].bbox) * 1.35 <= area
+            and _bbox_contains_center(segment.bbox, segments[other_index].bbox)
+            and _equivalent_semantic_text(
+                segment.text,
+                segments[other_index].text,
+            )
+        ]
+        if tighter_equivalents:
+            owner = min(
+                tighter_equivalents,
+                key=lambda item: _bbox_area(segments[item].bbox),
+            )
+            suppress(index, [owner], "tighter_equivalent_owner")
+            continue
+
+        aggregate_key = _output_text_key(segment.text)
+        if len(aggregate_key) < 12:
+            continue
+        children = [
+            other_index
+            for other_index in line_indices
+            if other_index != index
+            and other_index not in suppressed
+            and _bbox_area(segments[other_index].bbox) < area * 0.85
+            and _bbox_contains_center(segment.bbox, segments[other_index].bbox)
+            and len(_output_text_key(segments[other_index].text)) >= 3
+            and _output_text_key(segments[other_index].text) in aggregate_key
+        ]
+        child_keys = {
+            _output_text_key(segments[child_index].text)
+            for child_index in children
+        }
+        if len(child_keys) < 2:
+            continue
+        coverage = _aggregate_character_coverage(
+            segment.text,
+            [segments[child_index].text for child_index in children],
+        )
+        if coverage >= 0.8:
+            suppress(index, children, "aggregate_represented_by_children")
+
+    return (
+        [segment for index, segment in enumerate(segments) if index not in suppressed],
+        decisions,
+    )
+
+
+def _row_major_page_segments(segments: Sequence[PageSegment]) -> list[PageSegment]:
     if not segments:
         return []
-    heights = [
-        bbox[3] - bbox[1]
-        for _top, _left, _text, bbox in segments
-        if bbox[3] > bbox[1]
+    line_heights = [
+        segment.height
+        for segment in segments
+        if segment.kind == "line" and segment.height > 0
     ]
+    heights = line_heights or [segment.height for segment in segments if segment.height > 0]
     typical_height = statistics.median(heights) if heights else 8.0
     tolerance = max(2.0, min(typical_height, 24.0) * 0.45)
-    rows: list[list[tuple[float, float, str, tuple[float, float, float, float]]]] = []
-    for segment in sorted(segments, key=lambda item: (item[0], item[1])):
+    rows: list[list[PageSegment]] = []
+    for segment in sorted(segments, key=lambda item: (item.top, item.left)):
         best_index = None
         best_distance = float("inf")
         for index, row in enumerate(rows[-4:]):
             actual_index = len(rows) - len(rows[-4:]) + index
-            row_top = statistics.mean(item[0] for item in row)
-            distance = abs(segment[0] - row_top)
+            row_top = statistics.mean(item.top for item in row)
+            distance = abs(segment.top - row_top)
             if distance <= tolerance and distance < best_distance:
                 best_index = actual_index
                 best_distance = distance
@@ -3514,12 +3744,255 @@ def _sort_page_segments(
     return [
         segment
         for row in rows
-        for segment in sorted(row, key=lambda item: (item[1], item[0]))
+        for segment in sorted(row, key=lambda item: (item.left, item.top))
     ]
 
 
-def generate_semantic_markdown(middle_json: Mapping[str, Any]) -> str:
-    """Build a conservative alternative Markdown view from fused geometry."""
+def _page_geometry(
+    page_size: Any,
+    segments: Sequence[PageSegment],
+) -> tuple[float, float, float, float]:
+    if isinstance(page_size, (list, tuple)) and len(page_size) >= 2:
+        try:
+            width = float(page_size[0])
+            height = float(page_size[1])
+        except (TypeError, ValueError):
+            width = height = 0.0
+        if math.isfinite(width) and math.isfinite(height) and width > 0 and height > 0:
+            return 0.0, 0.0, width, height
+    return _bbox_union([segment.bbox for segment in segments])
+
+
+def _vertical_segment_clusters(
+    indices: Sequence[int],
+    segments: Sequence[PageSegment],
+    maximum_gap: float,
+) -> list[list[int]]:
+    clusters: list[list[int]] = []
+    cluster_bottom = float("-inf")
+    for index in sorted(indices, key=lambda item: segments[item].top):
+        segment = segments[index]
+        if clusters and segment.top - cluster_bottom <= maximum_gap:
+            clusters[-1].append(index)
+            cluster_bottom = max(cluster_bottom, segment.bbox[3])
+        else:
+            clusters.append([index])
+            cluster_bottom = segment.bbox[3]
+    return clusters
+
+
+def _side_rail_regions(
+    segments: Sequence[PageSegment],
+    page_size: Any,
+) -> list[dict[str, Any]]:
+    """Detect only strongly separated narrow edge rails, not ordinary form columns."""
+    if len(segments) < 7:
+        return []
+    page_left, page_top, page_right, page_bottom = _page_geometry(
+        page_size,
+        segments,
+    )
+    page_width = page_right - page_left
+    page_height = page_bottom - page_top
+    if page_width <= 0 or page_height <= 0:
+        return []
+    line_heights = [
+        segment.height
+        for segment in segments
+        if segment.kind == "line" and segment.height > 0
+    ]
+    typical_height = statistics.median(line_heights) if line_heights else page_height / 80
+    maximum_gap = max(typical_height * 2.75, page_height * 0.03)
+    minimum_gutter = max(page_width * 0.025, typical_height)
+    edge_inset = page_width * 0.08
+    maximum_rail_width = page_width * 0.24
+    minimum_rail_span = max(typical_height * 3.0, page_height * 0.08)
+    regions = []
+
+    for side in ("left", "right"):
+        candidate_indices = []
+        for index, segment in enumerate(segments):
+            if (
+                segment.kind != "line"
+                or segment.width > maximum_rail_width
+                or _isolated_checkbox_marker(segment.text)
+                or ISOLATED_LIST_MARKER_RE.fullmatch(segment.text.strip())
+            ):
+                continue
+            at_edge = (
+                segment.bbox[0] <= page_left + edge_inset
+                if side == "left"
+                else segment.bbox[2] >= page_right - edge_inset
+            )
+            if at_edge:
+                candidate_indices.append(index)
+
+        for cluster in _vertical_segment_clusters(
+            candidate_indices,
+            segments,
+            maximum_gap,
+        ):
+            if len(cluster) < 4:
+                continue
+            rail_bbox = _bbox_union([segments[index].bbox for index in cluster])
+            if rail_bbox[3] - rail_bbox[1] < minimum_rail_span:
+                continue
+            rail_characters = sum(
+                len(_output_text_key(segments[index].text)) for index in cluster
+            )
+            if rail_characters < 20:
+                continue
+            vertically_overlapping = [
+                index
+                for index, segment in enumerate(segments)
+                if index not in cluster
+                and segment.bbox[3] >= rail_bbox[1]
+                and segment.bbox[1] <= rail_bbox[3]
+            ]
+            wide_main = [
+                index
+                for index in vertically_overlapping
+                if (
+                    segments[index].width >= page_width * 0.32
+                    or (
+                        segments[index].kind == "table"
+                        and segments[index].width >= page_width * 0.45
+                    )
+                )
+                and (
+                    segments[index].bbox[0] >= rail_bbox[2] + minimum_gutter
+                    if side == "left"
+                    else segments[index].bbox[2]
+                    <= rail_bbox[0] - minimum_gutter
+                )
+            ]
+            table_support = any(segments[index].kind == "table" for index in wide_main)
+            if len(wide_main) < 3 and not table_support:
+                continue
+            main_characters = sum(
+                len(_output_text_key(segments[index].text)) for index in wide_main
+            )
+            if main_characters < max(24, int(rail_characters * 1.35)):
+                continue
+            aligned = sum(
+                any(
+                    abs(segments[rail_index].center_y - segments[main_index].center_y)
+                    <= max(segments[rail_index].height, segments[main_index].height) * 0.55
+                    for main_index in wide_main
+                )
+                for rail_index in cluster
+            )
+            alignment_ratio = aligned / len(cluster)
+            if (
+                alignment_ratio >= 0.8
+                and len(wide_main) >= len(cluster) * 0.6
+                and not table_support
+            ):
+                continue
+            regions.append(
+                {
+                    "type": f"{side}_rail",
+                    "indices": tuple(cluster),
+                    "bbox": rail_bbox,
+                    "segment_count": len(cluster),
+                    "supporting_main_segments": len(wide_main),
+                    "main_to_rail_character_ratio": round(
+                        main_characters / rail_characters,
+                        6,
+                    ),
+                    "row_alignment_ratio": round(alignment_ratio, 6),
+                }
+            )
+    return regions
+
+
+def _sort_page_segments(
+    segments: Sequence[PageSegment],
+    page_size: Any = None,
+    diagnostics: dict[str, Any] | None = None,
+) -> list[PageSegment]:
+    """Keep confidently detected side rails atomic instead of interleaving them."""
+    if not segments:
+        if diagnostics is not None:
+            diagnostics.update({"ordering_mode": "empty", "regions": []})
+        return []
+    regions = _side_rail_regions(segments, page_size)
+    region_indices = {
+        index for region in regions for index in region["indices"]
+    }
+    main = _row_major_page_segments(
+        [segment for index, segment in enumerate(segments) if index not in region_indices]
+    )
+    ordered = list(main)
+    for region in sorted(
+        regions,
+        key=lambda item: (
+            0 if item["type"] == "left_rail" else 1,
+            item["bbox"][1],
+        ),
+    ):
+        ordered.extend(
+            _row_major_page_segments(
+                [segments[index] for index in region["indices"]]
+            )
+        )
+    if diagnostics is not None:
+        diagnostics.update(
+            {
+                "ordering_mode": (
+                    "main_then_side_rails" if regions else "row_major"
+                ),
+                "regions": [
+                    {
+                        key: (
+                            [round(value, 4) for value in value]
+                            if key == "bbox"
+                            else value
+                        )
+                        for key, value in region.items()
+                        if key != "indices"
+                    }
+                    for region in regions
+                ],
+            }
+        )
+    return ordered
+
+
+def _duplicate_review_candidates(
+    segments: Sequence[PageSegment],
+) -> tuple[int, list[dict[str, Any]]]:
+    groups: dict[str, list[PageSegment]] = defaultdict(list)
+    for segment in segments:
+        key = _output_text_key(segment.text)
+        if key:
+            groups[key].append(segment)
+    candidates = []
+    total = 0
+    for occurrences in groups.values():
+        if len(occurrences) < 2:
+            continue
+        total += 1
+        if len(candidates) >= 50:
+            continue
+        candidates.append(
+            {
+                "text": _diagnostic_text(occurrences[0].text),
+                "occurrences": len(occurrences),
+                "repeatable_value": _repeatable_value(occurrences[0].text),
+                "bboxes": [
+                    [round(value, 4) for value in segment.bbox]
+                    for segment in occurrences[:25]
+                ],
+            }
+        )
+    return total, candidates
+
+
+def _generate_semantic_markdown_with_diagnostics(
+    middle_json: Mapping[str, Any],
+) -> tuple[str, list[dict[str, Any]]]:
+    """Render Markdown and retain page-local ordering/ownership diagnostics."""
     pages = middle_json.get("pdf_info", [])
     if not isinstance(pages, list):
         raise ValueError("middle_json must contain a pdf_info list")
@@ -3528,8 +4001,22 @@ def generate_semantic_markdown(middle_json: Mapping[str, Any]) -> str:
     seen_ledger_preheaders: set[str] = set()
     seen_ledger_tail: list[str] = []
     document_parts = [f"<!-- semantic-markdown-v{SEMANTIC_MARKDOWN_VERSION} -->"]
+    page_diagnostics: list[dict[str, Any]] = []
     for page_index, page in enumerate(pages):
         if not isinstance(page, Mapping):
+            page_diagnostics.append(
+                {
+                    "page": page_index + 1,
+                    "ordering_mode": "invalid_page",
+                    "regions": [],
+                    "segments_before_ownership": 0,
+                    "segments_after_ownership": 0,
+                    "ownership_suppressions": 0,
+                    "output_duplicate_suppressions": 0,
+                    "potential_duplicate_groups": 0,
+                    "potential_duplicate_candidates": [],
+                }
+            )
             continue
         page_size = page.get("page_size", [])
         page_height = (
@@ -3537,9 +4024,7 @@ def generate_semantic_markdown(middle_json: Mapping[str, Any]) -> str:
             if isinstance(page_size, (list, tuple)) and len(page_size) >= 2
             else 0.0
         )
-        segments: list[
-            tuple[float, float, str, tuple[float, float, float, float]]
-        ] = []
+        segments: list[PageSegment] = []
         seen_tables: set[int] = set()
         for block in _layout_blocks(page.get("preproc_blocks", [])):
             block_bbox = _valid_bbox(block.get("bbox")) or (0.0, 0.0, 0.0, 0.0)
@@ -3555,9 +4040,7 @@ def generate_semantic_markdown(middle_json: Mapping[str, Any]) -> str:
                     seen_ledger_tail,
                 ) or _render_form_table(table, set(repeated_margins))
                 if rendered:
-                    segments.append(
-                        (table_bbox[1], table_bbox[0], rendered, table_bbox)
-                    )
+                    segments.append(PageSegment(table_bbox, rendered, "table"))
             if block.get("type") in {"image", "chart", "interline_equation"}:
                 continue
             for line in _direct_semantic_lines(block):
@@ -3602,20 +4085,50 @@ def generate_semantic_markdown(middle_json: Mapping[str, Any]) -> str:
                     text = task
                     prefix = ""
                 segments.append(
-                    (line.bbox[1], line.bbox[0], prefix + text, line.bbox)
+                    PageSegment(line.bbox, prefix + text, "line")
                 )
         if not segments:
+            page_diagnostics.append(
+                {
+                    "page": page_index + 1,
+                    "ordering_mode": "empty",
+                    "regions": [],
+                    "segments_before_ownership": 0,
+                    "segments_after_ownership": 0,
+                    "ownership_suppressions": 0,
+                    "output_duplicate_suppressions": 0,
+                    "potential_duplicate_groups": 0,
+                    "potential_duplicate_candidates": [],
+                }
+            )
             continue
+        owned_segments, ownership_decisions = _resolve_page_segment_ownership(segments)
+        ordering_diagnostics: dict[str, Any] = {}
+        ordered_segments = _sort_page_segments(
+            owned_segments,
+            page_size,
+            ordering_diagnostics,
+        )
         page_parts: list[str] = []
         seen: list[Any] = []
-        for _top, _left, text, source_bbox in _sort_page_segments(segments):
-            _append_unique_output(
+        emitted_segments: list[PageSegment] = []
+        output_duplicate_suppressions = []
+        for segment in ordered_segments:
+            duplicate = _append_unique_output(
                 page_parts,
                 seen,
-                text,
-                bbox=source_bbox,
+                segment.text,
+                bbox=segment.bbox,
             )
-        if _fragment_noise_page(page_parts):
+            if duplicate is not None:
+                output_duplicate_suppressions.append(duplicate)
+            elif _output_text_key(segment.text):
+                emitted_segments.append(segment)
+        potential_duplicate_groups, potential_duplicate_candidates = (
+            _duplicate_review_candidates(emitted_segments)
+        )
+        fragment_warning = _fragment_noise_page(page_parts)
+        if fragment_warning:
             # A noisy page is still source evidence.  Omitting it makes a
             # false-positive page classifier indistinguishable from a blank
             # page, so preserve the conservative reading-order fallback and
@@ -3624,14 +4137,37 @@ def generate_semantic_markdown(middle_json: Mapping[str, Any]) -> str:
                 "<!-- semantic-warning: fragment-heavy-page -->",
                 *_page_noise_lines(page_parts),
             ]
+        page_diagnostics.append(
+            {
+                "page": page_index + 1,
+                **ordering_diagnostics,
+                "segments_before_ownership": len(segments),
+                "segments_after_ownership": len(owned_segments),
+                "ownership_suppressions": len(ownership_decisions),
+                "ownership_suppression_details": ownership_decisions[:50],
+                "output_duplicate_suppressions": len(output_duplicate_suppressions),
+                "output_duplicate_suppression_details": output_duplicate_suppressions[:50],
+                "potential_duplicate_groups": potential_duplicate_groups,
+                "potential_duplicate_candidates": potential_duplicate_candidates,
+                "fragment_warning": fragment_warning,
+            }
+        )
         document_parts.append(f"<!-- Page {page_index + 1} -->")
         document_parts.extend(page_parts)
-    return "\n\n".join(document_parts).strip() + "\n"
+    return "\n\n".join(document_parts).strip() + "\n", page_diagnostics
+
+
+def generate_semantic_markdown(middle_json: Mapping[str, Any]) -> str:
+    """Build a conservative alternative Markdown view from fused geometry."""
+    markdown, _diagnostics = _generate_semantic_markdown_with_diagnostics(middle_json)
+    return markdown
 
 
 def generate_semantic_markdown_report(
     middle_json: Mapping[str, Any],
     markdown: str | None = None,
+    *,
+    page_layout_diagnostics: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Summarize source evidence and conservative fallback decisions.
 
@@ -3639,11 +4175,16 @@ def generate_semantic_markdown_report(
     truth.  It exposes coverage proxies and warning pages so regressions can be
     compared across arbitrary documents and reviewed against source bboxes.
     """
-    rendered = (
-        markdown
-        if markdown is not None
-        else generate_semantic_markdown(middle_json)
-    )
+    if page_layout_diagnostics is None:
+        generated, page_diagnostics = _generate_semantic_markdown_with_diagnostics(
+            middle_json
+        )
+    else:
+        generated = markdown if markdown is not None else generate_semantic_markdown(
+            middle_json
+        )
+        page_diagnostics = [dict(item) for item in page_layout_diagnostics]
+    rendered = markdown if markdown is not None else generated
     pages = middle_json.get("pdf_info", [])
     page_count = len(pages) if isinstance(pages, list) else 0
     emitted_page_numbers = {
@@ -3685,6 +4226,22 @@ def generate_semantic_markdown_report(
             fallback_blocks += page_fallbacks
             if page_fallbacks:
                 fallback_pages.append(page_index + 1)
+    region_ordered_pages = [
+        item["page"]
+        for item in page_diagnostics
+        if item.get("ordering_mode") == "main_then_side_rails"
+    ]
+    ownership_suppressions = sum(
+        int(item.get("ownership_suppressions", 0)) for item in page_diagnostics
+    )
+    output_duplicate_suppressions = sum(
+        int(item.get("output_duplicate_suppressions", 0))
+        for item in page_diagnostics
+    )
+    potential_duplicate_groups = sum(
+        int(item.get("potential_duplicate_groups", 0))
+        for item in page_diagnostics
+    )
     return {
         "semantic_markdown_version": SEMANTIC_MARKDOWN_VERSION,
         "pages": page_count,
@@ -3723,6 +4280,11 @@ def generate_semantic_markdown_report(
         "fragment_heavy_pages": fragment_pages,
         "unstructured_table_fallback_blocks": fallback_blocks,
         "unstructured_table_fallback_pages": fallback_pages,
+        "page_layout_diagnostics": page_diagnostics,
+        "region_ordered_pages": region_ordered_pages,
+        "ownership_suppressions": ownership_suppressions,
+        "output_duplicate_suppressions": output_duplicate_suppressions,
+        "potential_duplicate_groups": potential_duplicate_groups,
         "trace_counts": trace_counts,
         "unmatched_source_records": trace_counts.get("unmatched", 0),
         "source_trace": trace_records,
@@ -3745,14 +4307,18 @@ def write_semantic_markdown(
     else:
         output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    markdown = generate_semantic_markdown(payload)
+    markdown, page_diagnostics = _generate_semantic_markdown_with_diagnostics(payload)
     output.write_text(markdown, encoding="utf-8")
     if report_path is not None:
         report = Path(report_path)
         report.parent.mkdir(parents=True, exist_ok=True)
         report.write_text(
             json.dumps(
-                generate_semantic_markdown_report(payload, markdown),
+                generate_semantic_markdown_report(
+                    payload,
+                    markdown,
+                    page_layout_diagnostics=page_diagnostics,
+                ),
                 ensure_ascii=False,
                 indent=2,
             )

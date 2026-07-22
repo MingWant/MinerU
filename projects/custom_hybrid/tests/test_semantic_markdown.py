@@ -334,7 +334,7 @@ class SemanticMarkdownTests(unittest.TestCase):
         self.assertNotIn("Date Admitted / 入院日期", markdown)
         self.assertIn("- **Date Discharged / 出院日期**: 02/07/2026 11:45", markdown)
 
-    def test_repeated_ledger_tail_metadata_is_emitted_once_per_document(self):
+    def test_ledger_boilerplate_is_deduplicated_but_dates_stay_page_local(self):
         def ledger_page():
             cells = [
                 {
@@ -364,7 +364,7 @@ class SemanticMarkdownTests(unittest.TestCase):
         )
 
         self.assertEqual(markdown.count("Payment is due on receipt."), 1)
-        self.assertEqual(markdown.count("Date Admitted / 入院日期"), 1)
+        self.assertEqual(markdown.count("Date Admitted / 入院日期"), 2)
 
     def test_repeated_margin_page_number_and_stamp_noise_are_removed(self):
         pages = []
@@ -1497,6 +1497,17 @@ class SemanticMarkdownTests(unittest.TestCase):
             ["No", "No"],
         )
 
+    def test_same_numeric_value_at_distinct_positions_is_preserved(self):
+        payload = middle(
+            text_block("01/07/2026", [25, 100, 105, 116]),
+            text_block("01/07/2026", [25, 300, 105, 316]),
+        )
+        markdown = generate_semantic_markdown(payload)
+        report = generate_semantic_markdown_report(payload, markdown)
+
+        self.assertEqual(markdown.count("01/07/2026"), 2)
+        self.assertEqual(report["potential_duplicate_groups"], 1)
+
     def test_overlapping_duplicate_text_is_emitted_once(self):
         markdown = generate_semantic_markdown(
             middle(
@@ -1506,6 +1517,40 @@ class SemanticMarkdownTests(unittest.TestCase):
         )
 
         self.assertEqual(markdown.count("Declaration"), 1)
+
+    def test_overlapping_duplicate_numeric_value_is_emitted_once(self):
+        payload = middle(
+            text_block("50.00", [25, 100, 85, 116]),
+            text_block("50.00", [27, 101, 87, 117]),
+        )
+        markdown = generate_semantic_markdown(payload)
+        report = generate_semantic_markdown_report(payload, markdown)
+
+        self.assertEqual(markdown.count("50.00"), 1)
+        self.assertEqual(report["output_duplicate_suppressions"], 1)
+
+    def test_parent_aggregate_is_suppressed_when_tight_children_cover_it(self):
+        aggregate = text_block(
+            "Alpha Beta Gamma Delta",
+            [20, 100, 400, 145],
+        )
+        aggregate["blocks"] = [
+            text_block("Alpha Beta", [30, 108, 145, 124]),
+            text_block("Gamma Delta", [170, 108, 300, 124]),
+        ]
+        payload = middle(aggregate)
+
+        markdown = generate_semantic_markdown(payload)
+        report = generate_semantic_markdown_report(payload, markdown)
+
+        self.assertNotIn("Alpha Beta Gamma Delta", markdown)
+        self.assertEqual(markdown.count("Alpha Beta"), 1)
+        self.assertEqual(markdown.count("Gamma Delta"), 1)
+        self.assertEqual(report["ownership_suppressions"], 1)
+        details = report["page_layout_diagnostics"][0][
+            "ownership_suppression_details"
+        ]
+        self.assertEqual(details[0]["reason"], "aggregate_represented_by_children")
 
     def test_standalone_checkbox_in_plain_block_joins_its_label(self):
         block = {
@@ -1664,6 +1709,168 @@ class SemanticMarkdownTests(unittest.TestCase):
         ]
         self.assertEqual(positions, sorted(positions))
 
+    def test_left_sidebar_is_emitted_after_contiguous_main_text(self):
+        main = [
+            text_block(
+                f"Main paragraph line {index} with enough body text",
+                [180, 260 + index * 26, 570, 276 + index * 26],
+            )
+            for index in range(6)
+        ]
+        rail = [
+            text_block(
+                f"Left rail {index}",
+                [15, 270 + index * 10, 95, 281 + index * 10],
+            )
+            for index in range(15)
+        ]
+        payload = middle(*reversed([*main, *rail]))
+
+        markdown = generate_semantic_markdown(payload)
+        report = generate_semantic_markdown_report(payload, markdown)
+
+        main_positions = [
+            markdown.index(f"Main paragraph line {index}") for index in range(6)
+        ]
+        self.assertEqual(main_positions, sorted(main_positions))
+        self.assertLess(main_positions[-1], markdown.index("Left rail 0"))
+        self.assertEqual(report["region_ordered_pages"], [1])
+        page_audit = report["page_layout_diagnostics"][0]
+        self.assertEqual(page_audit["ordering_mode"], "main_then_side_rails")
+        self.assertEqual(page_audit["regions"][0]["type"], "left_rail")
+
+    def test_right_sidebar_is_emitted_after_contiguous_main_text(self):
+        main = [
+            text_block(
+                f"Primary body line {index} with enough narrative text",
+                [25, 260 + index * 26, 440, 276 + index * 26],
+            )
+            for index in range(6)
+        ]
+        rail = [
+            text_block(
+                f"Right rail {index}",
+                [515, 270 + index * 10, 590, 281 + index * 10],
+            )
+            for index in range(15)
+        ]
+
+        markdown = generate_semantic_markdown(middle(*reversed([*main, *rail])))
+
+        main_positions = [
+            markdown.index(f"Primary body line {index}") for index in range(6)
+        ]
+        self.assertEqual(main_positions, sorted(main_positions))
+        self.assertLess(main_positions[-1], markdown.index("Right rail 0"))
+
+    def test_row_aligned_form_columns_remain_row_major(self):
+        blocks = []
+        for index in range(6):
+            top = 180 + index * 30
+            blocks.extend(
+                [
+                    text_block(
+                        f"Prompt alpha {index}",
+                        [20, top, 160, top + 16],
+                    ),
+                    text_block(
+                        f"Response alpha {index} with a sufficiently wide value",
+                        [235, top, 555, top + 16],
+                    ),
+                ]
+            )
+        payload = middle(*reversed(blocks))
+
+        markdown = generate_semantic_markdown(payload)
+        report = generate_semantic_markdown_report(payload, markdown)
+
+        expected = [
+            text
+            for index in range(6)
+            for text in (f"Prompt alpha {index}", f"Response alpha {index}")
+        ]
+        positions = [markdown.index(text) for text in expected]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(report["region_ordered_pages"], [])
+
+    def test_sidebar_detection_is_invariant_under_uniform_scaling(self):
+        def payload(scale):
+            def scaled(values):
+                return [value * scale for value in values]
+
+            main = [
+                text_block(
+                    f"Scaled body {index} with substantially more narrative text",
+                    scaled([180, 260 + index * 26, 570, 276 + index * 26]),
+                )
+                for index in range(6)
+            ]
+            rail = [
+                text_block(
+                    f"Scaled rail {index}",
+                    scaled([15, 270 + index * 10, 95, 281 + index * 10]),
+                )
+                for index in range(15)
+            ]
+            return middle(
+                pages=[
+                    {
+                        "page_size": scaled([600, 800]),
+                        "preproc_blocks": list(reversed([*main, *rail])),
+                    }
+                ]
+            )
+
+        baseline_payload = payload(1.0)
+        high_resolution_payload = payload(4.0)
+        baseline = generate_semantic_markdown(baseline_payload)
+        high_resolution = generate_semantic_markdown(high_resolution_payload)
+
+        self.assertEqual(baseline, high_resolution)
+        self.assertEqual(
+            generate_semantic_markdown_report(
+                baseline_payload,
+                baseline,
+            )["region_ordered_pages"],
+            [1],
+        )
+        self.assertEqual(
+            generate_semantic_markdown_report(
+                high_resolution_payload,
+                high_resolution,
+            )["region_ordered_pages"],
+            [1],
+        )
+
+    def test_source_trace_does_not_match_text_from_another_page(self):
+        payload = middle(
+            pages=[
+                {
+                    "page_size": [600, 800],
+                    "preproc_blocks": [
+                        text_block("QuasarAlphaToken", [20, 20, 220, 40])
+                    ],
+                },
+                {
+                    "page_size": [600, 800],
+                    "preproc_blocks": [
+                        text_block("NebulaBetaMarker", [20, 20, 230, 40])
+                    ],
+                },
+            ]
+        )
+        swapped = (
+            "<!-- Page 1 -->\n\nNebulaBetaMarker\n\n"
+            "<!-- Page 2 -->\n\nQuasarAlphaToken\n"
+        )
+
+        report = generate_semantic_markdown_report(payload, swapped)
+
+        self.assertEqual(report["unmatched_source_records"], 2)
+        self.assertTrue(
+            all(record["status"] == "unmatched" for record in report["source_trace"])
+        )
+
     def test_write_semantic_markdown_uses_default_name(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             middle_path = Path(temp_dir) / "sample_middle.json"
@@ -1687,7 +1894,7 @@ class SemanticMarkdownTests(unittest.TestCase):
 
         report = generate_semantic_markdown_report(payload, markdown)
 
-        self.assertEqual(report["semantic_markdown_version"], 5)
+        self.assertEqual(report["semantic_markdown_version"], 6)
         self.assertEqual(report["pages"], 1)
         self.assertEqual(report["pages_emitted"], 1)
         self.assertEqual(report["text_bearing_pages"], 1)

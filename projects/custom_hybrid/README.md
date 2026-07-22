@@ -139,7 +139,7 @@ label vocabulary covers common claim, member, provider, contact, identifier,
 address, date, email, postal-code, and amount fields, so new form layouts do not
 require PDF-specific rules. Set
 `preserve_native=true` to keep `<document>_native.md` for direct A/B comparison
-with MinerU's original Markdown. The output marker `semantic-markdown-v5`
+with MinerU's original Markdown. The output marker `semantic-markdown-v6`
 identifies this renderer version.
 
 When `fusion.page_sorting.enabled=true`, the workflow also performs a
@@ -179,11 +179,12 @@ python projects/custom_hybrid/semantic_markdown_benchmark.py `
 ```
 
 The benchmark summary reports total and emitted text-bearing pages, generation
-failures, fragment-heavy pages, unstructured Table fallbacks, and unmatched
-source records. Per-document reports also identify the page numbers containing
-unstructured Table fallbacks. Each benchmark document entry includes only the
-unmatched trace details; the per-document semantic report retains the complete
-source trace.
+failures, fragment-heavy pages, unstructured Table fallbacks, unmatched source
+records, region-ordered pages, and duplicate suppressions. Per-document reports
+also identify side-rail ordering decisions, structural output ownership, and
+same-text groups at distinct positions that remain for review. Each benchmark
+document entry includes only the unmatched trace details; the per-document
+semantic report retains the complete page-local source trace and layout audit.
 
 Each fused parse directory also contains `<document>_fusion.json`, which records
 the bbox, candidates, confidence, similarity, and decision for every conflict.
@@ -709,6 +710,7 @@ Endpoints:
 - `GET /tasks/{task_id}/markdown`: read Markdown and content-list output;
 - `GET /tasks/{task_id}/asset`: read a validated Markdown image asset;
 - `GET /tasks/{task_id}/report`: read `fusion_summary.json`;
+- `GET /tasks/{task_id}/sorting`: read all detailed page Grouping and Sorting reports;
 - `DELETE /tasks/{task_id}`: remove a completed/failed task and its files;
 - `POST /file_parse`: wait synchronously and return the fused ZIP.
 
@@ -775,8 +777,11 @@ python projects/custom_hybrid/ui.py \
 Open `http://127.0.0.1:7860`. The UI follows the official MinerU workspace shape:
 task controls on the left, document preview in the center, and extraction output
 on the right. Result tabs provide Markdown Rendering, Markdown Text, Content List
-JSON, and the Custom Hybrid Fusion Report. Relative Markdown images are served
-through a task-scoped, image-only endpoint with path traversal protection.
+JSON, Grouping & Order, and the Custom Hybrid Fusion Report. Grouping & Order
+shows the report-only validation state, proposed order for each detected document,
+unresolved pages, and the raw Sorting report. It never applies the proposed order
+to source or generated files. Relative Markdown images are served through a
+task-scoped, image-only endpoint with path traversal protection.
 
 Extraction and vLLM Generation controls are task-scoped; the Fusion Report tab
 includes the accepted task parameter snapshot. The English `Extraction Mode`

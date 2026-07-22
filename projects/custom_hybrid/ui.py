@@ -220,6 +220,10 @@ def create_ui_app(
     async def get_report(task_id: str) -> Response:
         return await buffered_request("GET", task_url(task_id, "/report"))
 
+    @app.get("/api/tasks/{task_id}/sorting")
+    async def get_sorting(task_id: str) -> Response:
+        return await buffered_request("GET", task_url(task_id, "/sorting"))
+
     @app.get("/api/tasks/{task_id}/markdown")
     async def get_markdown(task_id: str, document: str | None = None) -> Response:
         extra = {"document": document} if document else None

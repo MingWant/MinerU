@@ -50,6 +50,54 @@ class CustomHybridApiTests(unittest.TestCase):
         (fused / "images" / "page.png").write_bytes(b"image-data")
         (fused / "document_span.pdf").write_bytes(b"bbox-pdf")
         (fused / "document_form_cells.pdf").write_bytes(b"form-cell-pdf")
+        (fused / "document_sorting_report.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "mode": "report_only",
+                    "status": "complete",
+                    "page_count": 4,
+                    "anchor_count": 2,
+                    "group_count": 2,
+                    "can_auto_sort": True,
+                    "physical_order": ["p0002", "p0003", "p0000", "p0001"],
+                    "proposed_document_order": [],
+                    "unresolved": [],
+                    "groups": [
+                        {
+                            "group_id": "doc-001",
+                            "expected_total": 2,
+                            "member_page_ids": ["p0002", "p0000"],
+                            "identifiers": {"case": ["casea111"]},
+                            "status": "complete",
+                            "resolved_order": ["p0000", "p0002"],
+                            "duplicates": {},
+                            "missing_numbers": [],
+                            "unexpected_numbers": [],
+                            "ambiguous_pages": {},
+                            "decisions": [],
+                        },
+                        {
+                            "group_id": "doc-002",
+                            "expected_total": 2,
+                            "member_page_ids": ["p0003", "p0001"],
+                            "identifiers": {"case": ["caseb222"]},
+                            "status": "complete",
+                            "resolved_order": ["p0001", "p0003"],
+                            "duplicates": {},
+                            "missing_numbers": [],
+                            "unexpected_numbers": [],
+                            "ambiguous_pages": {},
+                            "decisions": [],
+                        },
+                    ],
+                    "assignment_count": 2,
+                    "unresolved_count": 0,
+                    "report_only": True,
+                }
+            ),
+            encoding="utf-8",
+        )
         (output_root / "fusion_summary.json").write_text(
             json.dumps({"documents": input_names, "failed": {}}),
             encoding="utf-8",
@@ -119,6 +167,10 @@ class CustomHybridApiTests(unittest.TestCase):
                 archive_path.write_bytes(result.content)
                 with zipfile.ZipFile(archive_path) as archive:
                     self.assertIn("fused/document/document.md", archive.namelist())
+                    self.assertIn(
+                        "fused/document/document_sorting_report.json",
+                        archive.namelist(),
+                    )
                     self.assertIn("fusion_summary.json", archive.namelist())
                     self.assertIn("task_parameters.json", archive.namelist())
                     task_parameters = json.loads(
@@ -129,6 +181,20 @@ class CustomHybridApiTests(unittest.TestCase):
                     self.assertEqual(task_parameters["mineru"]["effort"], "medium")
                 report = client.get(f"/tasks/{task_id}/report")
                 self.assertEqual(report.json()["documents"], ["invoice.pdf"])
+                sorting = client.get(f"/tasks/{task_id}/sorting")
+                self.assertEqual(sorting.status_code, 200)
+                sorting_documents = sorting.json()["documents"]
+                self.assertEqual(len(sorting_documents), 1)
+                self.assertEqual(
+                    sorting_documents[0]["id"],
+                    "document/document_sorting_report.json",
+                )
+                self.assertEqual(sorting_documents[0]["name"], "document")
+                self.assertTrue(sorting_documents[0]["report"]["can_auto_sort"])
+                self.assertEqual(
+                    sorting_documents[0]["report"]["groups"][0]["resolved_order"],
+                    ["p0000", "p0002"],
+                )
                 preview = client.get(f"/tasks/{task_id}/preview")
                 self.assertEqual(preview.status_code, 200)
                 self.assertEqual(preview.content, b"bbox-pdf")
