@@ -464,6 +464,74 @@ class CustomHybridApiTests(unittest.TestCase):
                 12,
             )
 
+    def test_api_forces_semantic_outputs_when_server_config_is_stale(self):
+        captured_configs = []
+
+        def capturing_runner(config, input_path, output_path):
+            captured_configs.append(copy.deepcopy(config))
+            return self._successful_runner(config, input_path, output_path)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = self._write_config(root)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["fusion"].pop("semantic_markdown")
+            config["fusion"].pop("page_sorting")
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            app = create_app(config_path, root / "tasks", runner=capturing_runner)
+            with TestClient(app) as client:
+                defaults = client.get("/health").json()["task_parameter_defaults"]
+                self.assertTrue(defaults["semantic_markdown"]["enabled"])
+                self.assertTrue(defaults["page_sorting"]["enabled"])
+                response = client.post(
+                    "/tasks",
+                    files={"files": ("invoice.pdf", b"pdf")},
+                    data={
+                        "cost_profile": "balanced",
+                        "extraction_mode": "hybrid_fusion",
+                    },
+                )
+                self.assertEqual(response.status_code, 202)
+                task = response.json()
+                self.assertTrue(
+                    task["parameters"]["fusion"]["semantic_markdown"]["enabled"]
+                )
+                for _attempt in range(100):
+                    status = client.get(f"/tasks/{task['task_id']}").json()
+                    if status["status"] in {"completed", "failed"}:
+                        break
+                    time.sleep(0.01)
+
+            self.assertEqual(status["status"], "completed")
+            fusion = captured_configs[0]["fusion"]
+            self.assertEqual(
+                fusion["semantic_markdown"],
+                {
+                    "enabled": True,
+                    "replace_primary": True,
+                    "preserve_native": True,
+                },
+            )
+            self.assertEqual(
+                fusion["page_sorting"],
+                {
+                    "enabled": True,
+                    "mode": "report_only",
+                    "include_semantic_diagnostics": True,
+                },
+            )
+            snapshot = json.loads(
+                (
+                    root
+                    / "tasks"
+                    / task["task_id"]
+                    / "output"
+                    / "task_parameters.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertTrue(snapshot["semantic_markdown"]["enabled"])
+            self.assertTrue(snapshot["page_sorting"]["enabled"])
+
     def test_bbox_vlm_mode_overrides_balanced_profile_after_cost_settings(self):
         captured_configs = []
 

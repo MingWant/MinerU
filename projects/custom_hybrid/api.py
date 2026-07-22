@@ -69,6 +69,21 @@ COST_PROFILES = {"balanced", "quality"}
 EXTRACTION_MODES = {"hybrid_fusion", "bbox_vlm"}
 LEGACY_EXTRACTION_MODE_ALIASES = {"bbox_vlm_recovery": "bbox_vlm"}
 DEFAULT_COST_PROFILE = "balanced"
+API_OUTPUT_FUSION_OVERRIDES = {
+    # API/UI conversions always expose the deterministic Markdown view. Keep
+    # this task-scoped so an older workflow.local.json cannot silently fall
+    # back to native MinerU Markdown after the code is updated.
+    "semantic_markdown": {
+        "enabled": True,
+        "replace_primary": True,
+        "preserve_native": True,
+    },
+    "page_sorting": {
+        "enabled": True,
+        "mode": "report_only",
+        "include_semantic_diagnostics": True,
+    },
+}
 BALANCED_FUSION_OVERRIDES = {
     "max_verifications_per_document": 0,
     "formula_fallback_enabled": False,
@@ -84,14 +99,6 @@ BALANCED_FUSION_OVERRIDES = {
 BBOX_VLM_FUSION_OVERRIDES = {
     "enabled": True,
     "mode": "bbox_vlm",
-    # BBox VLM is the OCR post-processing path used by the UI/API. Keep the
-    # semantic view enabled at task scope so a stale server config cannot
-    # silently return native Markdown after a successful repair run.
-    "semantic_markdown": {
-        "enabled": True,
-        "replace_primary": True,
-        "preserve_native": True,
-    },
     "max_verifications_per_document": 0,
     "table_fallback_enabled": False,
     "formula_fallback_enabled": False,
@@ -330,7 +337,7 @@ def _normalize_task_parameters(
     mineru: dict[str, Any] = {}
     generation: dict[str, Any] = {}
     recognizer_generation: dict[str, Any] = {}
-    fusion: dict[str, Any] = {}
+    fusion: dict[str, Any] = copy.deepcopy(API_OUTPUT_FUSION_OVERRIDES)
     if cost_profile is not None:
         if cost_profile not in COST_PROFILES:
             raise HTTPException(
@@ -563,6 +570,9 @@ def _task_parameter_defaults(
         configured_mode,
         configured_mode,
     )
+    fusion_config = effective_config.get("fusion", {})
+    semantic_markdown = fusion_config.get("semantic_markdown", {})
+    page_sorting = fusion_config.get("page_sorting", {})
     return {
         "cost_profile": cost_profile,
         "extraction_mode": extraction_mode,
@@ -582,15 +592,31 @@ def _task_parameter_defaults(
             )
         },
         "recovery": {
-            "max_tables_per_document": effective_config.get("fusion", {})
-            .get("recovery", {})
-            .get("max_tables_per_document", 10),
-            "max_proposals_per_document": effective_config.get("fusion", {})
-            .get("recovery", {})
-            .get("max_proposals_per_document", 100),
-            "min_confidence": effective_config.get("fusion", {})
-            .get("recovery", {})
-            .get("min_confidence", 0.85),
+            "max_tables_per_document": fusion_config.get("recovery", {}).get(
+                "max_tables_per_document", 10
+            ),
+            "max_proposals_per_document": fusion_config.get("recovery", {}).get(
+                "max_proposals_per_document", 100
+            ),
+            "min_confidence": fusion_config.get("recovery", {}).get(
+                "min_confidence", 0.85
+            ),
+        },
+        "semantic_markdown": {
+            "enabled": bool(semantic_markdown.get("enabled", False)),
+            "replace_primary": bool(
+                semantic_markdown.get("replace_primary", True)
+            ),
+            "preserve_native": bool(
+                semantic_markdown.get("preserve_native", True)
+            ),
+        },
+        "page_sorting": {
+            "enabled": bool(page_sorting.get("enabled", False)),
+            "mode": page_sorting.get("mode", "report_only"),
+            "include_semantic_diagnostics": bool(
+                page_sorting.get("include_semantic_diagnostics", True)
+            ),
         },
     }
 

@@ -699,7 +699,10 @@ fusion thresholds, and arbitrary vLLM arguments remain server-controlled. Tasks
 run serially because each extraction owns a local parameter-proxy port and local
 OCR resources. Completed ZIP files include `task_parameters.json` with the
 effective task-scoped settings and `vllm_requests.jsonl` with per-request
-generation audit data.
+generation audit data. API/UI tasks always enable Semantic Markdown as the
+primary output, preserve MinerU's original output as `<document>_native.md`, and
+emit report-only page-order diagnostics. These task-level output settings also
+protect deployments whose `workflow.local.json` predates those features.
 
 Endpoints:
 
