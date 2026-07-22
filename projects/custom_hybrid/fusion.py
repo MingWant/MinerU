@@ -2236,6 +2236,8 @@ def apply_bbox_recovery_proposals(
                 ] = "merged_list_marker"
             elif action == "merge_ink_marker":
                 raw_target["fusion_force_recognition"] = True
+            elif action == "merge_checkbox":
+                raw_target["fusion_force_recognition"] = True
             stats["adjusted"] += 1
             if action == "merge_checkbox":
                 stats["checkbox_merged"] += 1

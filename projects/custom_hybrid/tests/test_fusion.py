@@ -28,6 +28,7 @@ from projects.custom_hybrid.fusion import (
     select_bbox_recognition_candidate,
     synchronize_recognized_table_html,
 )
+from projects.custom_hybrid.recognition import OpenAIBBoxRecognizer
 from projects.custom_hybrid.table_fusion import (
     TableCellContext,
     align_table_cells,
@@ -1291,6 +1292,27 @@ class FusionTests(unittest.TestCase):
         self.assertEqual(span["bbox"], [20.0, 20.0, 100.0, 32.0])
         self.assertTrue(span["fusion_checkbox_grouped"])
         self.assertEqual(span["fusion_checkbox_state"], "checked")
+        self.assertTrue(span["fusion_force_recognition"])
+        lines = collect_table_ocr_lines(page, 0)
+        manifest, _by_id = build_bbox_recognition_manifest(0, lines)
+        self.assertEqual(len(manifest), 1)
+        self.assertTrue(manifest[0]["force_recognition"])
+        self.assertTrue(manifest[0]["recovered"])
+        recognizer = OpenAIBBoxRecognizer(
+            "http://vision.test",
+            "unused.pdf",
+            {"native_min_bbox_height": 20.0},
+        )
+        try:
+            self.assertLess(
+                manifest[0]["bbox"][3] - manifest[0]["bbox"][1],
+                20.0,
+            )
+            self.assertTrue(
+                recognizer._native_candidate_selected(manifest[0])
+            )
+        finally:
+            recognizer.close()
         self.assertEqual(decisions[0]["result"], "accepted")
         self.assertTrue(unchanged)
 
