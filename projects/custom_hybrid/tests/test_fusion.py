@@ -24,6 +24,7 @@ from projects.custom_hybrid.fusion import (
     collect_unreliable_table_ocr_lines,
     demote_narrative_false_tables,
     fuse_middle_json,
+    group_page_control_markers,
     recover_table_cell_geometry,
     select_bbox_recognition_candidate,
     synchronize_recognized_table_html,
@@ -180,6 +181,19 @@ class FusionTests(unittest.TestCase):
             ],
             "Date (DD/MM/YYYY)",
         )
+        recovery_region = page["demoted_narrative_recovery_regions"][0]
+        self.assertTrue(recovery_region["full_region_recovery"])
+        self.assertEqual(
+            sorted(
+                cell["demoted_form_cell_index"]
+                for cell in recovery_region["cells"]
+            ),
+            list(range(len(recovery_region["cells"]))),
+        )
+        self.assertTrue(
+            all(cell["demoted_form_cell"] for cell in recovery_region["cells"])
+        )
+        self.assertTrue(recovery_region["cells"][0]["form_recover_full_cell"])
 
     def test_bbox_vlm_settings_enable_repair_and_table_recognizer(self):
         settings = FusionSettings.from_mapping(
@@ -686,6 +700,36 @@ class FusionTests(unittest.TestCase):
         self.assertEqual(report["counts"]["bbox_recognition_native_cache_hits"], 1)
         self.assertTrue(
             report["recovery_invariants"]["table_and_cell_geometry_unchanged"]
+        )
+
+    def test_recovery_manifest_masks_table_cell_spans_as_page_existing(self):
+        page = structured_middle(
+            "table",
+            html="<table><tr><td>Nested</td></tr></table>",
+            table_cells=[
+                {
+                    "bbox": [10, 10, 190, 50],
+                    "text": "Nested",
+                    "content_spans": [
+                        {"bbox": [20, 20, 80, 32], "text": "Nested"}
+                    ],
+                    "row_start": 0,
+                    "row_end": 0,
+                    "col_start": 0,
+                    "col_end": 0,
+                }
+            ],
+        )["pdf_info"][0]
+
+        manifest = build_bbox_recovery_manifest(page, 0)
+        table = next(item for item in manifest if item["kind"] == "table")
+
+        self.assertTrue(
+            any(
+                item["bbox"] == [20.0, 20.0, 80.0, 32.0]
+                and item["source"] == "content_span"
+                for item in table["page_existing"]
+            )
         )
 
     def test_bbox_vlm_form_repair_runs_before_recognition_when_normal_ocr_disabled(self):
@@ -1243,6 +1287,318 @@ class FusionTests(unittest.TestCase):
         self.assertTrue(
             report["recovery_invariants"]["table_and_cell_geometry_unchanged"]
         )
+
+    def test_page_recovery_adds_unstructured_orphan_as_normal_text_block(self):
+        page = middle("Known OCR", bbox=(20, 20, 100, 32))["pdf_info"][0]
+        settings = FusionSettings.from_mapping(
+            {
+                "mode": "bbox_vlm",
+                "recovery": {"page_recovery_enabled": True},
+            }
+        )
+
+        manifest = build_bbox_recovery_manifest(page, 0, settings)
+
+        page_region = next(
+            item for item in manifest if item["kind"] == "page_region"
+        )
+        self.assertEqual(page_region["bbox"], [0.0, 0.0, 200.0, 300.0])
+        self.assertEqual(page_region["cells"][0]["id"], "p0-page-c0")
+        stats, decisions, _batches, unchanged = apply_bbox_recovery_proposals(
+            page,
+            0,
+            {
+                "items": [
+                    {
+                        "action": "add_orphan",
+                        "table_id": "p0-page-recovery",
+                        "cell_id": "p0-page-c0",
+                        "target_id": "",
+                        "bbox": [25, 60, 150, 75],
+                        "confidence": 0.95,
+                        "recovery_source": "local_table_orphan_ink",
+                    }
+                ]
+            },
+            settings,
+            remaining_document_budget=10,
+        )
+
+        recovered = [
+            line
+            for line in collect_text_lines(page, 0)
+            if line.spans[0].get("fusion_recovery_page")
+        ]
+        self.assertEqual(stats["page_added"], 1)
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0].bbox, (25.0, 60.0, 150.0, 75.0))
+        self.assertEqual(decisions[0]["region_kind"], "page")
+        self.assertTrue(unchanged)
+
+    def test_page_recovery_scans_residual_area_alongside_table_and_form(self):
+        page = structured_middle(
+            "table",
+            html="<table><tr><td>Nested</td></tr></table>",
+            table_cells=[
+                {
+                    "bbox": [10, 10, 190, 80],
+                    "text": "Nested",
+                    "content_spans": [
+                        {"bbox": [20, 20, 80, 32], "text": "Nested"}
+                    ],
+                    "row_start": 0,
+                    "row_end": 0,
+                    "col_start": 0,
+                    "col_end": 0,
+                }
+            ],
+        )["pdf_info"][0]
+        page["form_regions"] = [{"bbox": [10, 180, 190, 240]}]
+        page["form_cells"] = [
+            {
+                "bbox": [10, 180, 190, 240],
+                "form_region_index": 0,
+                "row_index": 0,
+                "column_index": 0,
+                "kind": "field_cell",
+                "ocr_text": "Form field",
+            }
+        ]
+        settings = FusionSettings.from_mapping(
+            {
+                "mode": "bbox_vlm",
+                "recovery": {
+                    "page_recovery_enabled": True,
+                    "table_fringe_bottom_extension": 10.0,
+                },
+            }
+        )
+
+        manifest = build_bbox_recovery_manifest(page, 0, settings)
+
+        self.assertEqual(
+            [item["kind"] for item in manifest],
+            ["table", "form_region", "page_region"],
+        )
+        page_region = manifest[-1]
+        self.assertIn([10.0, 10.0, 190.0, 90.0], page_region["page_exclusions"])
+        self.assertIn([10.0, 180.0, 190.0, 240.0], page_region["page_exclusions"])
+        self.assertIn(
+            [10.0, 10.0, 190.0, 90.0],
+            page_region["page_checkbox_exclusions"],
+        )
+        self.assertTrue(
+            any(
+                item["bbox"] == [20.0, 20.0, 80.0, 32.0]
+                and item["source"] == "content_span"
+                for item in page_region["cells"][0]["existing"]
+            )
+        )
+
+    def test_page_recovery_opens_checkbox_table_without_cell_geometry(self):
+        page = structured_middle(
+            "table",
+            html="<table><tr><td>□ First option □ Second option</td></tr></table>",
+        )["pdf_info"][0]
+        settings = FusionSettings.from_mapping(
+            {
+                "mode": "bbox_vlm",
+                "recovery": {"page_recovery_enabled": True},
+            }
+        )
+
+        manifest = build_bbox_recovery_manifest(page, 0, settings)
+
+        self.assertEqual([item["kind"] for item in manifest], ["page_region"])
+        page_region = manifest[0]
+        self.assertTrue(page_region["residual_page_region"])
+        self.assertIn(
+            [10.0, 10.0, 190.0, 152.0],
+            page_region["page_orphan_exclusions"],
+        )
+        self.assertNotIn(
+            [10.0, 10.0, 190.0, 152.0],
+            page_region["page_checkbox_exclusions"],
+        )
+        self.assertEqual(
+            page_region["page_checkbox_fallback_regions"],
+            [[10.0, 10.0, 190.0, 80.0]],
+        )
+
+    def test_control_grouping_joins_checkbox_and_multiline_label_once(self):
+        marker = {
+            "type": "text",
+            "content": "☑",
+            "bbox": [10, 20, 20, 32],
+            "fusion_recovery_checkbox": True,
+            "fusion_checkbox_state": "checked",
+        }
+        duplicate_marker = {
+            "type": "text",
+            "content": "☑",
+            "bbox": [10, 20, 20, 32],
+            "fusion_recovery_checkbox": True,
+            "fusion_checkbox_state": "checked",
+        }
+        label = {
+            "type": "text",
+            "content": "First line",
+            "bbox": [26, 20, 130, 32],
+        }
+        continuation = {
+            "type": "text",
+            "content": "second line",
+            "bbox": [26, 33, 160, 45],
+        }
+        page = {
+            "page_size": [200, 300],
+            "preproc_blocks": [
+                {
+                    "type": "text",
+                    "bbox": [10, 20, 160, 45],
+                    "lines": [
+                        {
+                            "bbox": [10, 20, 130, 32],
+                            "spans": [marker, duplicate_marker, label],
+                        },
+                        {
+                            "bbox": [26, 33, 160, 45],
+                            "spans": [continuation],
+                        },
+                    ],
+                }
+            ],
+        }
+
+        stats, decisions = group_page_control_markers(
+            page,
+            0,
+            FusionSettings.from_mapping({"mode": "bbox_vlm"}),
+        )
+
+        self.assertEqual(stats["groups"], 1)
+        self.assertEqual(stats["checkbox_groups"], 1)
+        self.assertEqual(label["bbox"], [10.0, 20.0, 160.0, 45.0])
+        self.assertEqual(label["content"], "First line\nsecond line")
+        self.assertTrue(marker["fusion_visualization_hidden"])
+        self.assertTrue(duplicate_marker["fusion_visualization_hidden"])
+        self.assertTrue(continuation["fusion_visualization_hidden"])
+        self.assertEqual(decisions[0]["member_count"], 2)
+        visible = collect_text_lines(page, 0)
+        self.assertEqual(len(visible), 1)
+        self.assertEqual(visible[0].text, "First line\nsecond line")
+
+    def test_control_grouping_handles_marker_already_inside_ocr_bbox(self):
+        marker = {
+            "type": "text",
+            "content": "☐",
+            "bbox": [40, 20, 48, 30],
+            "fusion_recovery_checkbox": True,
+        }
+        label = {
+            "type": "text",
+            "content": "□ P.M. 下午",
+            "bbox": [38, 18, 125, 32],
+        }
+        page = {
+            "page_size": [200, 300],
+            "preproc_blocks": [
+                {
+                    "type": "text",
+                    "bbox": [38, 18, 125, 32],
+                    "lines": [
+                        {
+                            "bbox": [38, 18, 125, 32],
+                            "spans": [label, marker],
+                        }
+                    ],
+                }
+            ],
+        }
+
+        stats, decisions = group_page_control_markers(
+            page,
+            0,
+            FusionSettings.from_mapping({"mode": "bbox_vlm"}),
+        )
+
+        self.assertEqual(stats["groups"], 1)
+        self.assertTrue(marker["fusion_visualization_hidden"])
+        self.assertTrue(label["fusion_checkbox_grouped"])
+        self.assertEqual(decisions[0]["reason"], "control_marker_inside_text_bbox")
+        self.assertEqual(collect_text_lines(page, 0)[0].text, "□ P.M. 下午")
+
+    def test_control_grouping_does_not_absorb_next_list_item(self):
+        markers = [
+            {"type": "text", "content": "1.", "bbox": [10, 20, 20, 30]},
+            {"type": "text", "content": "2.", "bbox": [10, 47, 20, 57]},
+        ]
+        labels = [
+            {"type": "text", "content": "first", "bbox": [25, 20, 70, 30]},
+            {"type": "text", "content": "first continuation", "bbox": [25, 32, 110, 42]},
+            {"type": "text", "content": "second", "bbox": [25, 47, 80, 57]},
+        ]
+        page = {
+            "page_size": [200, 300],
+            "preproc_blocks": [
+                {
+                    "type": "text",
+                    "lines": [
+                        {"bbox": item["bbox"], "spans": [item]}
+                        for item in [*markers, *labels]
+                    ],
+                }
+            ],
+        }
+
+        stats, _decisions = group_page_control_markers(
+            page,
+            0,
+            FusionSettings.from_mapping({"mode": "bbox_vlm"}),
+        )
+
+        self.assertEqual(stats["groups"], 2)
+        self.assertEqual(labels[0]["content"], "1. first\nfirst continuation")
+        self.assertEqual(labels[2]["content"], "2. second")
+        self.assertTrue(labels[1].get("fusion_visualization_hidden"))
+
+    def test_control_grouping_never_crosses_table_cell_boundary(self):
+        marker = {"bbox": [20, 20, 30, 32], "text": "1."}
+        label = {"bbox": [34, 20, 120, 32], "text": "Other cell"}
+        page = structured_middle(
+            "table",
+            html="<table><tr><td>1.</td><td>Other cell</td></tr></table>",
+            table_cells=[
+                {
+                    "bbox": [10, 10, 32, 50],
+                    "text": "1.",
+                    "content_spans": [marker],
+                    "row_start": 0,
+                    "row_end": 0,
+                    "col_start": 0,
+                    "col_end": 0,
+                },
+                {
+                    "bbox": [32, 10, 190, 50],
+                    "text": "Other cell",
+                    "content_spans": [label],
+                    "row_start": 0,
+                    "row_end": 0,
+                    "col_start": 1,
+                    "col_end": 1,
+                },
+            ],
+        )["pdf_info"][0]
+
+        stats, _decisions = group_page_control_markers(
+            page,
+            0,
+            FusionSettings.from_mapping({"mode": "bbox_vlm"}),
+        )
+
+        self.assertEqual(stats["groups"], 0)
+        self.assertFalse(marker.get("fusion_visualization_hidden", False))
+        self.assertEqual(label["bbox"], [34, 20, 120, 32])
 
     def test_bbox_recovery_merges_checkbox_with_right_label_bbox(self):
         page = structured_middle(

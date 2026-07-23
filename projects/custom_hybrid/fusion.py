@@ -151,8 +151,16 @@ class FusionSettings:
     bbox_recovery_checkbox_min_aspect: float = 0.65
     bbox_recovery_checkbox_max_aspect: float = 1.4
     bbox_recovery_max_tables_per_document: int = 10
-    bbox_recovery_max_proposals_per_document: int = 100
+    bbox_recovery_max_proposals_per_document: int = 300
     bbox_recovery_max_proposals_per_table: int = 30
+    # Pages without a usable Table/Form structure still need a bounded OCR
+    # post-processing pass. The API/workflow profiles enable this explicitly;
+    # direct callers can keep the legacy table-only behavior by leaving it off.
+    bbox_recovery_page_enabled: bool = False
+    bbox_control_grouping_enabled: bool = True
+    bbox_control_grouping_max_gap: float = 30.0
+    bbox_control_grouping_min_vertical_overlap: float = 0.25
+    bbox_control_grouping_max_target_height_ratio: float = 3.0
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "FusionSettings":
@@ -383,10 +391,25 @@ class FusionSettings:
                 recovery.get("max_tables_per_document", 10)
             ),
             bbox_recovery_max_proposals_per_document=int(
-                recovery.get("max_proposals_per_document", 100)
+                recovery.get("max_proposals_per_document", 300)
             ),
             bbox_recovery_max_proposals_per_table=int(
                 recovery.get("max_proposals_per_table", 30)
+            ),
+            bbox_recovery_page_enabled=bool(
+                recovery.get("page_recovery_enabled", False)
+            ),
+            bbox_control_grouping_enabled=bool(
+                recovery.get("control_grouping_enabled", True)
+            ),
+            bbox_control_grouping_max_gap=float(
+                recovery.get("control_grouping_max_gap", 30.0)
+            ),
+            bbox_control_grouping_min_vertical_overlap=float(
+                recovery.get("control_grouping_min_vertical_overlap", 0.25)
+            ),
+            bbox_control_grouping_max_target_height_ratio=float(
+                recovery.get("control_grouping_max_target_height_ratio", 3.0)
             ),
         )
 
@@ -527,16 +550,26 @@ def collect_text_lines(page: Mapping[str, Any], page_index: int) -> list[TextLin
             all_spans = line.get("spans")
             if not isinstance(all_spans, list) or not all_spans:
                 continue
-            spans = [
+            visible_spans = [
                 span
                 for span in all_spans
-                if isinstance(span, dict) and span.get("type") in TEXT_SPAN_TYPES
+                if isinstance(span, dict)
+                and not span.get("fusion_visualization_hidden")
+            ]
+            spans = [
+                span
+                for span in visible_spans
+                if span.get("type") in TEXT_SPAN_TYPES
             ]
             # Inline equations must stay attached to their original VLM line.
-            if not spans or len(spans) != len(all_spans):
+            if not spans or len(spans) != len(visible_spans):
                 continue
-            bbox = _valid_bbox(line.get("bbox")) or _union_bbox(
-                span.get("bbox") for span in spans
+            span_bbox = _union_bbox(span.get("bbox") for span in spans)
+            bbox = (
+                span_bbox
+                if span_bbox is not None
+                and any(span.get("fusion_bbox_grouped") for span in spans)
+                else _valid_bbox(line.get("bbox")) or span_bbox
             )
             if bbox is None:
                 continue
@@ -736,35 +769,48 @@ def demote_narrative_false_tables(
             }
             for assessment in flagged.values()
         ]
+        # Keep one complete recovery scope for every demoted narrative Table.
+        # The OCR cells often stop before the final printed/handwritten rows;
+        # limiting recovery to date cells made those rows impossible to recall.
+        # Cell metadata is retained so date fields still receive their narrower
+        # overflow rules in the pixel analyser.
         demoted_recovery_regions = []
-        for assessment in flagged.values():
+        for region_index, assessment in enumerate(flagged.values()):
             raw_cells = assessment.span.get("table_cells", [])
-            date_cells = [
-                copy.deepcopy(dict(cell))
-                for cell in (raw_cells if isinstance(raw_cells, list) else [])
-                if isinstance(cell, Mapping)
-                and _valid_bbox(cell.get("bbox")) is not None
-                and re.search(
-                    r"\bdate\b|日期",
-                    _narrative_cell_text(cell),
-                    flags=re.IGNORECASE,
+            recovery_cells = []
+            for cell_index, raw_cell in enumerate(
+                raw_cells if isinstance(raw_cells, list) else []
+            ):
+                if not isinstance(raw_cell, Mapping):
+                    continue
+                cell_bbox = _valid_bbox(raw_cell.get("bbox"))
+                if cell_bbox is None:
+                    continue
+                cell = copy.deepcopy(dict(raw_cell))
+                cell_text = _narrative_cell_text(cell)
+                if cell_text and not str(cell.get("text", "")).strip():
+                    cell["text"] = cell_text
+                cell["form_region_index"] = region_index
+                cell["demoted_form_cell"] = True
+                cell["form_recover_text"] = True
+                cell["demoted_form_cell_index"] = cell_index
+                cell["form_recover_full_cell"] = bool(
+                    re.search(r"\bdate\b|日期", cell_text, flags=re.IGNORECASE)
                 )
-                and (
-                    _valid_bbox(cell.get("bbox"))[2]
-                    - _valid_bbox(cell.get("bbox"))[0]
+                recovery_cells.append(cell)
+            if recovery_cells:
+                recovery_cells.sort(
+                    key=lambda cell: (
+                        not bool(cell.get("form_recover_full_cell")),
+                        int(cell.get("demoted_form_cell_index", 0)),
+                    )
                 )
-                <= (assessment.bbox[2] - assessment.bbox[0]) * 0.35
-            ]
-            recovery_bbox = _union_bbox(cell.get("bbox") for cell in date_cells)
-            if recovery_bbox is not None and date_cells:
-                for cell in date_cells:
-                    if not str(cell.get("text", "")).strip():
-                        cell["text"] = _narrative_cell_text(cell)
                 demoted_recovery_regions.append(
                     {
-                        "bbox": list(recovery_bbox),
+                        "bbox": list(assessment.bbox),
                         "source_bbox": list(assessment.bbox),
-                        "cells": date_cells,
+                        "cells": recovery_cells,
+                        "full_region_recovery": True,
                     }
                 )
         if demoted_recovery_regions:
@@ -968,6 +1014,7 @@ def collect_table_ocr_lines(
                     for item in raw_content_spans
                     if isinstance(item, Mapping)
                     and not item.get("fusion_grouped_list_marker")
+                    and not item.get("fusion_visualization_hidden")
                 ]
                 if isinstance(raw_content_spans, list)
                 else []
@@ -1066,6 +1113,516 @@ def collect_unreliable_table_ocr_lines(
     return result
 
 
+_STANDALONE_CHECKBOX_MARKERS = {
+    "☑",
+    "☒",
+    "✓",
+    "✔",
+    "■",
+    "☐",
+    "□",
+    "◫",
+}
+_GENERIC_LIST_MARKER_RE = re.compile(
+    r"^(?:\(\s*\d{1,3}\s*\)|\d{1,3}\s*[.)、:：]|"
+    r"[A-Za-z]\s*[.)、:：]|[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳])$"
+)
+
+
+def _control_marker_kind(span: Mapping[str, Any], text: str) -> str | None:
+    stripped = text.strip()
+    if span.get("fusion_recovery_checkbox") or (
+        stripped in _STANDALONE_CHECKBOX_MARKERS
+    ):
+        return "checkbox"
+    if _GENERIC_LIST_MARKER_RE.fullmatch(stripped):
+        return "list"
+    return None
+
+
+def _control_scope(span: Mapping[str, Any], fallback: tuple[Any, ...]) -> tuple[Any, ...]:
+    table_index = span.get("fusion_table_index")
+    cell_index = span.get("fusion_cell_index")
+    if isinstance(table_index, int) and isinstance(cell_index, int):
+        return ("table", table_index, cell_index)
+    form_index = span.get("fusion_form_region_index")
+    if isinstance(form_index, int):
+        return ("form", form_index)
+    return fallback
+
+
+def _control_scopes_compatible(
+    left: tuple[Any, ...],
+    right: tuple[Any, ...],
+) -> bool:
+    # Never join across independent Table Cells. A recovered form span may
+    # legitimately pair with an ordinary OCR label, so page/form scopes remain
+    # compatible when no conflicting table scope is present.
+    if (left and left[0] == "table") or (right and right[0] == "table"):
+        return left == right
+    if left and right and left[0] == right[0] == "form":
+        return left == right
+    return True
+
+
+def group_page_control_markers(
+    page: Mapping[str, Any],
+    page_index: int,
+    settings: FusionSettings,
+) -> tuple[dict[str, int], list[dict[str, Any]]]:
+    """Join standalone checkbox/list markers with their nearby content boxes.
+
+    This pass runs after pixel recovery and before bbox recognition. It works
+    on both ordinary text blocks and Table Cell content spans, preserves the
+    original marker metadata for Markdown, and hides only the redundant marker
+    overlay so the recognizer receives one union crop.
+    """
+    stats = {
+        "candidates": 0,
+        "groups": 0,
+        "checkbox_groups": 0,
+        "list_groups": 0,
+        "rejected": 0,
+    }
+    decisions: list[dict[str, Any]] = []
+    if not settings.bbox_control_grouping_enabled:
+        return stats, decisions
+
+    records: list[dict[str, Any]] = []
+    seen_spans: set[int] = set()
+
+    def add_record(
+        span: Mapping[str, Any],
+        line_bbox: Any,
+        scope: tuple[Any, ...],
+        container: tuple[Any, ...],
+    ) -> None:
+        if not isinstance(span, dict) or id(span) in seen_spans:
+            return
+        if span.get("fusion_visualization_hidden"):
+            return
+        bbox = _valid_bbox(span.get("bbox")) or _valid_bbox(line_bbox)
+        if bbox is None:
+            return
+        text = _content_span_text(span)
+        if not text and not span.get("fusion_recovered_bbox"):
+            return
+        seen_spans.add(id(span))
+        records.append(
+            {
+                "span": span,
+                "bbox": bbox,
+                "text": text,
+                "scope": _control_scope(span, scope),
+                "container": container,
+            }
+        )
+
+    def visit_block(block: Any, scope: tuple[Any, ...] = ("page",)) -> None:
+        if not isinstance(block, Mapping):
+            return
+        raw_lines = block.get("lines", [])
+        if isinstance(raw_lines, list):
+            for line in raw_lines:
+                if not isinstance(line, Mapping):
+                    continue
+                line_bbox = line.get("bbox")
+                raw_spans = line.get("spans", [])
+                if not isinstance(raw_spans, list):
+                    continue
+                for span in raw_spans:
+                    if not isinstance(span, Mapping):
+                        continue
+                    span_type = span.get("type")
+                    if span_type in TEXT_SPAN_TYPES:
+                        add_record(
+                            span,
+                            line_bbox,
+                            scope,
+                            ("block", id(block)),
+                        )
+                    elif span_type == "table":
+                        table_scope = ("table", id(span))
+                        raw_cells = span.get("table_cells", [])
+                        for cell in (
+                            raw_cells if isinstance(raw_cells, list) else []
+                        ):
+                            if not isinstance(cell, Mapping):
+                                continue
+                            cell_scope = ("table", id(span), id(cell))
+                            raw_content = cell.get("content_spans", [])
+                            for content in (
+                                raw_content
+                                if isinstance(raw_content, list)
+                                else []
+                            ):
+                                if isinstance(content, Mapping):
+                                    add_record(
+                                        content,
+                                        cell.get("bbox"),
+                                        cell_scope,
+                                        ("cell", id(cell)),
+                                    )
+                        # A few OCR variants expose content directly on the
+                        # table span rather than under Cells.
+                        add_record(
+                            span,
+                            line_bbox,
+                            table_scope,
+                            ("table", id(span)),
+                        )
+        nested = block.get("blocks", [])
+        if isinstance(nested, list):
+            for child in nested:
+                visit_block(child, scope)
+
+    raw_blocks = page.get("preproc_blocks", [])
+    if isinstance(raw_blocks, list):
+        for block in raw_blocks:
+            visit_block(block)
+    records.sort(key=lambda item: (item["bbox"][1], item["bbox"][0]))
+    markers = []
+    for record in records:
+        kind = _control_marker_kind(record["span"], record["text"])
+        if kind is None:
+            continue
+        if record["span"].get("fusion_group_id"):
+            continue
+        record["kind"] = kind
+        markers.append(record)
+    # OCR and pixel recovery can expose the same square/marker twice. Keep
+    # one candidate per scope and hide only near-identical duplicates; this
+    # prevents two overlays from surviving a successful group merge.
+    unique_markers = []
+    duplicate_markers = 0
+    for marker in markers:
+        duplicate = next(
+            (
+                existing
+                for existing in unique_markers
+                if existing["kind"] == marker["kind"]
+                and _control_scopes_compatible(
+                    existing["scope"], marker["scope"]
+                )
+                and _bbox_iou(existing["bbox"], marker["bbox"]) >= 0.65
+            ),
+            None,
+        )
+        if duplicate is None:
+            unique_markers.append(marker)
+            continue
+        marker_span = marker["span"]
+        marker_span["fusion_visualization_hidden"] = True
+        marker_span["fusion_visualization_hidden_reason"] = (
+            "duplicate_control_marker"
+        )
+        marker_span["fusion_duplicate_control_marker"] = True
+        duplicate_markers += 1
+    markers = unique_markers
+    stats["candidates"] = len(markers) + duplicate_markers
+    used_targets: set[int] = set()
+    max_gap_setting = max(float(settings.bbox_control_grouping_max_gap), 0.0)
+    minimum_overlap = min(
+        max(float(settings.bbox_control_grouping_min_vertical_overlap), 0.0),
+        1.0,
+    )
+    maximum_height_ratio = max(
+        float(settings.bbox_control_grouping_max_target_height_ratio), 1.0
+    )
+    for marker_index, marker in enumerate(markers):
+        marker_bbox = marker["bbox"]
+        marker_height = marker_bbox[3] - marker_bbox[1]
+        # A following marker in the same text column is a hard boundary for
+        # wrapped continuation lines. Without this boundary, the first item
+        # in a numbered/checkbox list can absorb the next item's label before
+        # that marker is processed.
+        next_marker_top = None
+        for other_marker in markers:
+            if other_marker is marker or not _control_scopes_compatible(
+                marker["scope"], other_marker["scope"]
+            ):
+                continue
+            other_bbox = other_marker["bbox"]
+            if other_bbox[1] < marker_bbox[3] - 1.0:
+                continue
+            if abs(other_bbox[0] - marker_bbox[0]) > max(
+                20.0,
+                marker_height * 4.0,
+            ):
+                continue
+            if next_marker_top is None or other_bbox[1] < next_marker_top:
+                next_marker_top = other_bbox[1]
+        candidates = []
+        for target_index, target in enumerate(records):
+            if target_index in used_targets or target is marker:
+                continue
+            target_span = target["span"]
+            target_kind = _control_marker_kind(target_span, target["text"])
+            if target_kind is not None or target_span.get("fusion_group_id"):
+                continue
+            if target_span.get("fusion_visualization_hidden"):
+                continue
+            if not _control_scopes_compatible(marker["scope"], target["scope"]):
+                continue
+            target_bbox = target["bbox"]
+            target_height = target_bbox[3] - target_bbox[1]
+            if target_height > marker_height * maximum_height_ratio and target["text"]:
+                continue
+            gap = target_bbox[0] - marker_bbox[2]
+            maximum_gap = max(max_gap_setting, marker_height * 4.0)
+            marker_coverage = _bbox_coverage(marker_bbox, target_bbox)
+            marker_contained = (
+                bool(target["text"])
+                and _center_inside(marker_bbox, target_bbox)
+                and marker_coverage >= 0.5
+            )
+            if (gap < -2.0 and not marker_contained) or gap > maximum_gap:
+                continue
+            vertical_overlap = max(
+                0.0,
+                min(marker_bbox[3], target_bbox[3])
+                - max(marker_bbox[1], target_bbox[1]),
+            )
+            overlap_ratio = vertical_overlap / max(
+                min(marker_height, target_height), 1.0
+            )
+            center_delta = abs(
+                (marker_bbox[1] + marker_bbox[3]) / 2
+                - (target_bbox[1] + target_bbox[3]) / 2
+            )
+            if overlap_ratio < minimum_overlap and center_delta > max(
+                marker_height,
+                target_height,
+            ) * 0.65:
+                continue
+            if not target["text"] and not target_span.get("fusion_recovered_bbox"):
+                continue
+            target_area = max(
+                (target_bbox[2] - target_bbox[0])
+                * (target_bbox[3] - target_bbox[1]),
+                1.0,
+            )
+            candidates.append(
+                (
+                    not bool(target["text"].strip()),
+                    not marker_contained,
+                    target_area if marker_contained else gap,
+                    center_delta,
+                    -overlap_ratio,
+                    target_index,
+                    target,
+                    marker_contained,
+                )
+            )
+        if not candidates:
+            stats["rejected"] += 1
+            continue
+        (
+            _blank_target,
+            _not_contained,
+            _gap,
+            _center_delta,
+            _overlap,
+            target_index,
+            target,
+            marker_contained,
+        ) = min(
+            candidates,
+            key=lambda item: item[:4],
+        )
+        target_span = target["span"]
+        target_bbox = target["bbox"]
+        member_records = [target]
+        member_indices = {target_index}
+        continuation_gap = max(6.0, marker_height * 1.5)
+        continuation_candidates = []
+        for continuation_index, continuation in enumerate(records):
+            if continuation_index in used_targets or continuation_index in member_indices:
+                continue
+            continuation_span = continuation["span"]
+            if (
+                _control_marker_kind(
+                    continuation_span,
+                    continuation["text"],
+                )
+                is not None
+                or continuation_span.get("fusion_group_id")
+                or not continuation["text"].strip()
+                or continuation["container"] != target["container"]
+                or not _control_scopes_compatible(
+                    target["scope"], continuation["scope"]
+                )
+            ):
+                continue
+            continuation_bbox = continuation["bbox"]
+            if (
+                next_marker_top is not None
+                and continuation_bbox[1] >= next_marker_top - 1.0
+            ):
+                continue
+            continuation_height = continuation_bbox[3] - continuation_bbox[1]
+            vertical_overlap = max(
+                0.0,
+                min(target_bbox[3], continuation_bbox[3])
+                - max(target_bbox[1], continuation_bbox[1]),
+            )
+            minimum_height = max(
+                min(
+                    target_bbox[3] - target_bbox[1],
+                    continuation_height,
+                ),
+                1.0,
+            )
+            same_row = vertical_overlap / minimum_height >= minimum_overlap
+            vertical_gap = max(
+                continuation_bbox[1] - target_bbox[3],
+                target_bbox[1] - continuation_bbox[3],
+                0.0,
+            )
+            horizontal_gap = max(
+                continuation_bbox[0] - target_bbox[2],
+                target_bbox[0] - continuation_bbox[2],
+                0.0,
+            )
+            aligned_left = abs(continuation_bbox[0] - target_bbox[0]) <= max(
+                8.0,
+                marker_height * 2.0,
+            )
+            same_row_neighbor = (
+                same_row
+                and continuation_bbox[0] >= target_bbox[0] - 2.0
+                and horizontal_gap <= max_gap_setting
+            )
+            wrapped_neighbor = (
+                not same_row
+                and continuation_bbox[1] >= target_bbox[3] - 1.0
+                and vertical_gap <= continuation_gap
+                and aligned_left
+            )
+            if not (same_row_neighbor or wrapped_neighbor):
+                continue
+            continuation_candidates.append(
+                (
+                    continuation_bbox[1],
+                    continuation_bbox[0],
+                    continuation_index,
+                    continuation,
+                )
+            )
+        continuation_candidates.sort(key=lambda item: item[:2])
+        current_bbox = target_bbox
+        maximum_group_height = max(
+            marker_height,
+            target_bbox[3] - target_bbox[1],
+        ) * max(maximum_height_ratio, 2.0)
+        for _top, _left, continuation_index, continuation in continuation_candidates:
+            candidate_bbox = continuation["bbox"]
+            proposed_height = max(current_bbox[3], candidate_bbox[3]) - min(
+                current_bbox[1], candidate_bbox[1]
+            )
+            if proposed_height > maximum_group_height:
+                continue
+            current_bbox = (
+                min(current_bbox[0], candidate_bbox[0]),
+                min(current_bbox[1], candidate_bbox[1]),
+                max(current_bbox[2], candidate_bbox[2]),
+                max(current_bbox[3], candidate_bbox[3]),
+            )
+            member_records.append(continuation)
+            member_indices.add(continuation_index)
+        union_bbox = (
+            min(marker_bbox[0], target_bbox[0]),
+            min(marker_bbox[1], target_bbox[1]),
+            max(marker_bbox[2], target_bbox[2]),
+            max(marker_bbox[3], target_bbox[3]),
+        )
+        union_bbox = (
+            min(union_bbox[0], current_bbox[0]),
+            min(union_bbox[1], current_bbox[1]),
+            max(union_bbox[2], current_bbox[2]),
+            max(union_bbox[3], current_bbox[3]),
+        )
+        group_id = f"p{page_index}-control-{marker_index}"
+        marker_span = marker["span"]
+        marker_text = marker["text"].strip()
+        target_text = target["text"].strip()
+        member_texts = [
+            member["text"].strip()
+            for member in member_records
+            if member["text"].strip()
+        ]
+        if member_texts:
+            target_text = "\n".join(member_texts)
+        target_span["bbox"] = list(union_bbox)
+        target_span["fusion_bbox_grouped"] = True
+        target_span["fusion_group_id"] = group_id
+        target_span["fusion_force_recognition"] = True
+        target_span["fusion_group_member_count"] = len(member_records)
+        marker_span["fusion_group_id"] = group_id
+        marker_span["fusion_grouped_into"] = group_id
+        marker_span["fusion_visualization_hidden"] = True
+        marker_span["fusion_visualization_hidden_reason"] = (
+            "control_marker_grouped"
+        )
+        for member_index in member_indices:
+            if member_index == target_index:
+                continue
+            member_span = records[member_index]["span"]
+            member_span["fusion_group_id"] = group_id
+            member_span["fusion_grouped_into"] = group_id
+            member_span["fusion_visualization_hidden"] = True
+            member_span["fusion_visualization_hidden_reason"] = (
+                "control_group_continuation"
+            )
+        if marker["kind"] == "list":
+            combined = f"{marker_text} {target_text}".strip()
+            for key in ("content", "text"):
+                if key in target_span:
+                    target_span[key] = combined
+            if "content" not in target_span and "text" not in target_span:
+                target_span["content"] = combined
+            target_span["fusion_list_marker_text"] = marker_text
+            target_span["fusion_list_item_original_text"] = target_text
+            target_span["fusion_list_marker_grouped"] = True
+            marker_span["fusion_grouped_list_marker"] = True
+            stats["list_groups"] += 1
+            action = "merge_list_marker"
+        else:
+            for key in ("content", "text"):
+                if key in target_span and len(member_records) > 1:
+                    target_span[key] = target_text
+            state = str(marker_span.get("fusion_checkbox_state") or "ambiguous")
+            if state not in {"checked", "unchecked", "ambiguous"}:
+                state = "ambiguous"
+            target_span["fusion_checkbox_grouped"] = True
+            target_span["fusion_checkbox_state"] = state
+            target_span["fusion_checkbox_marker_text"] = marker_text
+            target_span["fusion_grouped_checkbox"] = True
+            marker_span["fusion_grouped_checkbox"] = True
+            stats["checkbox_groups"] += 1
+            action = "merge_checkbox"
+        used_targets.update(member_indices)
+        stats["groups"] += 1
+        decisions.append(
+            {
+                "kind": "bbox_control_group",
+                "page": page_index,
+                "action": action,
+                "group_id": group_id,
+                "marker_text": marker_text,
+                "target_text": target_text,
+                "member_count": len(member_records),
+                "bbox": [round(value, 3) for value in union_bbox],
+                "reason": (
+                    "control_marker_inside_text_bbox"
+                    if marker_contained
+                    else "nearby_same_row_control_marker"
+                ),
+            }
+        )
+    return stats, decisions
+
+
 def _bbox_iou(left: Sequence[float], right: Sequence[float]) -> float:
     intersection = _intersection_area(left, right)
     left_area = max(0.0, left[2] - left[0]) * max(0.0, left[3] - left[1])
@@ -1120,22 +1677,119 @@ def _table_fringe_outer_bbox(
     )
 
 
+def _collect_page_existing_boxes(
+    page: Mapping[str, Any],
+    page_index: int,
+) -> list[dict[str, Any]]:
+    """Collect every visible OCR text bbox used to mask page recovery.
+
+    ``collect_text_lines`` intentionally ignores Table containers because its
+    callers need editable normal-text lines. Page-level pixel recovery has a
+    different job: it must not propose a second box for text nested inside a
+    Table or exposed only through ``content_spans``. Keep this helper local to
+    the recovery manifest so normal OCR/fusion line semantics remain intact.
+    """
+    records: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+
+    def add(bbox: Any, text: Any, source: str) -> None:
+        valid = _valid_bbox(bbox)
+        if valid is None:
+            return
+        content = str(text) if isinstance(text, str) else ""
+        key = (
+            tuple(round(value, 4) for value in valid),
+            content,
+        )
+        if key in seen:
+            return
+        seen.add(key)
+        records.append(
+            {
+                "bbox": list(valid),
+                "text": content,
+                "source": source,
+            }
+        )
+
+    for line in collect_text_lines(page, page_index):
+        add(line.bbox, line.text, line.block_type)
+
+    for block in _iter_blocks(page.get("preproc_blocks", [])):
+        raw_lines = block.get("lines", [])
+        if not isinstance(raw_lines, list):
+            continue
+        for line in raw_lines:
+            if not isinstance(line, Mapping):
+                continue
+            line_bbox = line.get("bbox")
+            raw_spans = line.get("spans", [])
+            if not isinstance(raw_spans, list):
+                continue
+            for span in raw_spans:
+                if not isinstance(span, Mapping):
+                    continue
+                if span.get("type") not in TEXT_SPAN_TYPES:
+                    continue
+                if span.get("fusion_visualization_hidden"):
+                    continue
+                add(
+                    span.get("bbox") or line_bbox,
+                    _content_span_text(span),
+                    "ocr_span",
+                )
+
+    # Some OCR middle JSON variants keep Cell content only under
+    # ``table_cells`` and never materialize it as a nested text block.
+    for table in collect_structured_spans(page, page_index, {"table"}):
+        raw_cells = table.span.get("table_cells", [])
+        if not isinstance(raw_cells, list):
+            continue
+        for cell in raw_cells:
+            if not isinstance(cell, Mapping):
+                continue
+            raw_spans = cell.get("content_spans", [])
+            if not isinstance(raw_spans, list):
+                continue
+            for span in raw_spans:
+                if not isinstance(span, Mapping):
+                    continue
+                if span.get("fusion_visualization_hidden"):
+                    continue
+                add(span.get("bbox"), _content_span_text(span), "content_span")
+
+    records.sort(key=lambda item: (item["bbox"][1], item["bbox"][0]))
+    return records
+
+
+def _span_contains_checkbox_marker(span: Mapping[str, Any]) -> bool:
+    """Detect tables whose serialized OCR already exposes checkbox controls."""
+    raw_html = span.get("html", "")
+    if not isinstance(raw_html, str):
+        return False
+    text = unescape(raw_html)
+    return bool(
+        re.search(
+            r"[☐☑☒□■✓✔]|(?:&#(?:9744|9745|9746|9633|9632);)",
+            text,
+        )
+    )
+
+
 def build_bbox_recovery_manifest(
     page: Mapping[str, Any],
     page_index: int,
+    settings: FusionSettings | None = None,
 ) -> list[dict[str, Any]]:
     """Describe post-OCR Table and Form geometry without granting mutation authority."""
     manifest: list[dict[str, Any]] = []
     structured_tables = collect_structured_spans(page, page_index, {"table"})
     page_lines = collect_text_lines(page, page_index)
-    page_existing = [
-        {
-            "bbox": list(line.bbox),
-            "text": line.text,
-            "source": line.block_type,
-        }
-        for line in page_lines
-    ]
+    page_existing = _collect_page_existing_boxes(page, page_index)
+    recoverable_table_bboxes: list[tuple[float, float, float, float]] = []
+    checkbox_fallback_bboxes: list[tuple[float, float, float, float]] = []
+    recoverable_form_bboxes: list[tuple[float, float, float, float]] = []
+    recoverable_demoted_bboxes: list[tuple[float, float, float, float]] = []
     for table_index, table in enumerate(structured_tables):
         raw_cells = table.span.get("table_cells", [])
         if not isinstance(raw_cells, list):
@@ -1209,6 +1863,7 @@ def build_bbox_recovery_manifest(
                 }
             )
         if cells:
+            recoverable_table_bboxes.append(table.bbox)
             manifest.append(
                 {
                     "id": f"p{page_index}-table-{table_index}",
@@ -1223,6 +1878,12 @@ def build_bbox_recovery_manifest(
                     ],
                 }
             )
+        elif _span_contains_checkbox_marker(table.span):
+            # Some OCR middle JSONs retain a Table HTML payload but omit
+            # table_cells entirely. Keep that region open to the residual
+            # Checkbox detector; normal orphan text remains excluded so the
+            # HTML does not get duplicated as page-level Markdown.
+            checkbox_fallback_bboxes.append(table.bbox)
 
     raw_regions = page.get("form_regions", [])
     raw_form_cells = page.get("form_cells", [])
@@ -1327,6 +1988,7 @@ def build_bbox_recovery_manifest(
                     }
                 )
             if cells:
+                recoverable_form_bboxes.append(region_bbox)
                 manifest.append(
                     {
                         "id": f"p{page_index}-form-{region_index}",
@@ -1402,11 +2064,19 @@ def build_bbox_recovery_manifest(
                     "reasons": [] if existing else ["missing_content_bbox"],
                     "form_region": True,
                     "form_recover_text": True,
+                    "form_recover_full_cell": bool(
+                        cell.get("form_recover_full_cell")
+                    ),
                     "demoted_form_cell": True,
-                    "demoted_form_cell_index": cell_index,
+                    "demoted_form_cell_index": cell.get(
+                        "demoted_form_cell_index",
+                        cell_index,
+                    ),
                 }
             )
         if cells:
+            full_region_recovery = bool(region.get("full_region_recovery"))
+            recoverable_demoted_bboxes.append(region_bbox)
             manifest.append(
                 {
                     "id": f"p{page_index}-demoted-form-{region_index}",
@@ -1416,10 +2086,156 @@ def build_bbox_recovery_manifest(
                     "cells": cells,
                     "page_existing": page_existing,
                     "page_exclusions": [list(bbox) for bbox in table_bboxes],
-                    "disable_orphan_recovery": True,
-                    "disable_marker_merges": True,
+                    # A full demoted narrative region is deliberately scanned
+                    # for ink outside OCR Cells. Older date-only regions keep
+                    # the conservative form guards.
+                    "allow_orphan_recovery": full_region_recovery,
+                    "allow_marker_merges": full_region_recovery,
+                    "disable_orphan_recovery": not full_region_recovery,
+                    "disable_marker_merges": not full_region_recovery,
                 }
             )
+
+    if settings is not None and settings.bbox_recovery_page_enabled:
+        page_size = page.get("page_size", [])
+        page_bbox = _valid_bbox(
+            (
+                0.0,
+                0.0,
+                page_size[0] if isinstance(page_size, (list, tuple)) and len(page_size) >= 2 else 0.0,
+                page_size[1] if isinstance(page_size, (list, tuple)) and len(page_size) >= 2 else 0.0,
+            )
+        )
+        if page_bbox is not None:
+            # The page fallback scans only areas not already owned by a
+            # Table, Form, formula, or image. Table exclusions include the
+            # bounded bottom fringe so two recovery scopes cannot emit the
+            # same footer/amount bbox.
+            orphan_exclusion_bboxes: list[tuple[float, float, float, float]] = [
+                _table_fringe_outer_bbox(
+                    page,
+                    table.bbox,
+                    settings.bbox_recovery_fringe_bottom_extension,
+                )
+                for table in structured_tables
+            ]
+            checkbox_exclusion_bboxes: list[tuple[float, float, float, float]] = [
+                _table_fringe_outer_bbox(
+                    page,
+                    table_bbox,
+                    settings.bbox_recovery_fringe_bottom_extension,
+                )
+                for table_bbox in recoverable_table_bboxes
+            ]
+            checkbox_exclusion_bboxes.extend(recoverable_form_bboxes)
+            checkbox_exclusion_bboxes.extend(recoverable_demoted_bboxes)
+            for raw_region in raw_regions if isinstance(raw_regions, list) else []:
+                if isinstance(raw_region, Mapping):
+                    region_bbox = _valid_bbox(raw_region.get("bbox"))
+                    if region_bbox is not None:
+                        orphan_exclusion_bboxes.append(region_bbox)
+                        checkbox_exclusion_bboxes.append(region_bbox)
+            for raw_region in (
+                raw_demoted_regions
+                if isinstance(raw_demoted_regions, list)
+                else []
+            ):
+                if isinstance(raw_region, Mapping):
+                    region_bbox = _valid_bbox(raw_region.get("bbox"))
+                    if region_bbox is not None:
+                        orphan_exclusion_bboxes.append(region_bbox)
+                        checkbox_exclusion_bboxes.append(region_bbox)
+            for block in _iter_blocks(page.get("preproc_blocks", [])):
+                if str(block.get("type", "")) not in {
+                    "image",
+                    "image_body",
+                    "chart",
+                    "chart_body",
+                    "interline_equation",
+                }:
+                    continue
+                block_bbox = _block_bbox(block)
+                if block_bbox is not None:
+                    orphan_exclusion_bboxes.append(block_bbox)
+                    checkbox_exclusion_bboxes.append(block_bbox)
+
+            def unique_boxes(raw_boxes: Sequence[Sequence[float]]) -> list[list[float]]:
+                unique: list[list[float]] = []
+                seen: set[tuple[float, ...]] = set()
+                for raw_box in raw_boxes:
+                    valid_box = _valid_bbox(raw_box)
+                    if valid_box is None:
+                        continue
+                    key = tuple(round(value, 4) for value in valid_box)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    unique.append(list(valid_box))
+                return unique
+
+            unique_exclusions = unique_boxes(orphan_exclusion_bboxes)
+            unique_checkbox_exclusions = unique_boxes(checkbox_exclusion_bboxes)
+            unique_checkbox_fallbacks = unique_boxes(checkbox_fallback_bboxes)
+            page_has_structure = bool(
+                structured_tables
+                or any(
+                    _valid_bbox(region.get("bbox")) is not None
+                    for region in (raw_regions if isinstance(raw_regions, list) else [])
+                    if isinstance(region, Mapping)
+                )
+                or any(
+                    _valid_bbox(region.get("bbox")) is not None
+                    for region in (
+                        raw_demoted_regions
+                        if isinstance(raw_demoted_regions, list)
+                        else []
+                    )
+                    if isinstance(region, Mapping)
+                )
+            )
+            page_table_id = f"p{page_index}-page-recovery"
+            page_cell_id = f"p{page_index}-page-c0"
+            page_cell = {
+                "id": page_cell_id,
+                "bbox": list(page_bbox),
+                "text": "",
+                "existing": [
+                    {
+                        "id": f"{page_cell_id}-b{line_index}",
+                        "bbox": list(record["bbox"]),
+                        "text": record.get("text", ""),
+                        "source": record.get("source", "page_existing"),
+                    }
+                    for line_index, record in enumerate(page_existing)
+                ],
+                "reasons": [],
+                "page_region": True,
+            }
+            page_region = {
+                "id": page_table_id,
+                "kind": "page_region",
+                "page_region": True,
+                "residual_page_region": page_has_structure,
+                "bbox": list(page_bbox),
+                "cells": [page_cell],
+                "page_existing": page_existing,
+                "page_exclusions": unique_exclusions,
+                "page_orphan_exclusions": unique_exclusions,
+                "page_checkbox_exclusions": unique_checkbox_exclusions,
+                "page_checkbox_fallback_regions": unique_checkbox_fallbacks,
+                "allow_orphan_recovery": True,
+                "disable_marker_merges": True,
+            }
+            manifest.append(page_region)
+            if isinstance(page, dict):
+                # apply_bbox_recovery_proposals receives only the reviewer
+                # response, so retain a short-lived lookup for its synthetic
+                # page Cell. fuse_middle_json removes it before output.
+                page["_fusion_bbox_page_recovery_state"] = {
+                    "id": page_table_id,
+                    "bbox": list(page_bbox),
+                    "cell": copy.deepcopy(page_cell),
+                }
     return manifest
 
 
@@ -1431,6 +2247,7 @@ def _bbox_recovery_lookup(
     dict[str, dict[str, Any]],
     dict[str, tuple[dict[str, Any], str]],
     set[str],
+    set[str],
 ]:
     tables: dict[
         str,
@@ -1439,6 +2256,7 @@ def _bbox_recovery_lookup(
     cells: dict[str, dict[str, Any]] = {}
     boxes: dict[str, tuple[dict[str, Any], str]] = {}
     form_cell_ids: set[str] = set()
+    page_cell_ids: set[str] = set()
     for table_index, table in enumerate(
         collect_structured_spans(page, page_index, {"table"})
     ):
@@ -1516,14 +2334,37 @@ def _bbox_recovery_lookup(
             recovery_cell["demoted_form_cell"] = True
             cells[cell_id] = recovery_cell
             form_cell_ids.add(cell_id)
-    return tables, cells, boxes, form_cell_ids
+    raw_page_state = page.get("_fusion_bbox_page_recovery_state")
+    if isinstance(raw_page_state, dict):
+        region_bbox = _valid_bbox(raw_page_state.get("bbox"))
+        table_id = raw_page_state.get("id")
+        raw_cell = raw_page_state.get("cell")
+        if (
+            region_bbox is not None
+            and isinstance(table_id, str)
+            and isinstance(raw_cell, Mapping)
+        ):
+            cell_bbox = _valid_bbox(raw_cell.get("bbox"))
+            cell_id = raw_cell.get("id")
+            if cell_bbox is not None and isinstance(cell_id, str):
+                tables[table_id] = (raw_page_state, region_bbox)
+                recovery_cell = dict(raw_cell)
+                recovery_cell["bbox"] = list(cell_bbox)
+                recovery_cell["_fusion_page_cell"] = True
+                recovery_cell["_fusion_page_table_id"] = table_id
+                cells[cell_id] = recovery_cell
+                page_cell_ids.add(cell_id)
+    return tables, cells, boxes, form_cell_ids, page_cell_ids
 
 
-def _append_form_recovery_block(
+def _append_recovery_block(
     page: dict[str, Any],
     bbox: Sequence[float],
     text: str,
     metadata: Mapping[str, Any],
+    *,
+    source: str,
+    recovery_type: str,
 ) -> dict[str, Any]:
     preproc_blocks = page.setdefault("preproc_blocks", [])
     if not isinstance(preproc_blocks, list):
@@ -1559,7 +2400,7 @@ def _append_form_recovery_block(
         "type": "text",
         "content": text,
         "bbox": list(bbox),
-        "fusion_source": "form_bbox_recovery",
+        "fusion_source": source,
         "fusion_recovered_bbox": True,
         **dict(metadata),
     }
@@ -1570,8 +2411,8 @@ def _append_form_recovery_block(
         "bbox": list(bbox),
         "index": block_index,
         "lines": [{"bbox": list(bbox), "spans": [span]}],
-        "fusion_source": "form_bbox_recovery",
-        "fusion_recovery_type": "form_field",
+        "fusion_source": source,
+        "fusion_recovery_type": recovery_type,
     }
     preproc_blocks.append(block)
     preproc_blocks.sort(
@@ -1580,6 +2421,38 @@ def _append_form_recovery_block(
         else 0.0
     )
     return span
+
+
+def _append_form_recovery_block(
+    page: dict[str, Any],
+    bbox: Sequence[float],
+    text: str,
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    return _append_recovery_block(
+        page,
+        bbox,
+        text,
+        metadata,
+        source="form_bbox_recovery",
+        recovery_type="form_field",
+    )
+
+
+def _append_page_recovery_block(
+    page: dict[str, Any],
+    bbox: Sequence[float],
+    text: str,
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    return _append_recovery_block(
+        page,
+        bbox,
+        text,
+        metadata,
+        source="page_bbox_recovery",
+        recovery_type="page_orphan",
+    )
 
 
 def _page_recovery_invariant_snapshot(
@@ -1640,6 +2513,7 @@ def apply_bbox_recovery_proposals(
         "fringe_added": 0,
         "checkbox_added": 0,
         "form_added": 0,
+        "page_added": 0,
         "checkbox_merged": 0,
         "list_marker_merged": 0,
         "ink_marker_merged": 0,
@@ -1660,7 +2534,13 @@ def apply_bbox_recovery_proposals(
     if not isinstance(raw_items, list):
         stats["errors"] = 1
         return stats, decisions, batches, True
-    tables, cells, boxes, form_cell_ids = _bbox_recovery_lookup(page, page_index)
+    (
+        tables,
+        cells,
+        boxes,
+        form_cell_ids,
+        page_cell_ids,
+    ) = _bbox_recovery_lookup(page, page_index)
     table_counts: Counter[str] = Counter()
     accepted_count = 0
     for item in raw_items:
@@ -1691,9 +2571,15 @@ def apply_bbox_recovery_proposals(
         cell = cells.get(cell_id) if isinstance(cell_id, str) else None
         cell_bbox = _valid_bbox(cell.get("bbox")) if cell is not None else None
         is_form_cell = isinstance(cell_id, str) and cell_id in form_cell_ids
+        is_page_cell = isinstance(cell_id, str) and cell_id in page_cell_ids
+        is_demoted_form_cell = bool(
+            is_form_cell and isinstance(cell, Mapping) and cell.get("demoted_form_cell")
+        )
         table_key = cell_id.rsplit("-c", 1)[0] if isinstance(cell_id, str) else ""
         expected_table_id = (
-            table_key.replace("-d", "-demoted-form-", 1)
+            str(cell.get("_fusion_page_table_id"))
+            if is_page_cell and isinstance(cell, Mapping)
+            else table_key.replace("-d", "-demoted-form-", 1)
             if is_form_cell and "-d" in table_key
             else table_key.replace("-f", "-form-", 1)
             if is_form_cell
@@ -1761,7 +2647,9 @@ def apply_bbox_recovery_proposals(
             )
         )
         decision["table_id"] = table_id
-        decision["region_kind"] = "form" if is_form_cell else "table"
+        decision["region_kind"] = (
+            "page" if is_page_cell else "form" if is_form_cell else "table"
+        )
         if action not in {
             "add",
             "adjust",
@@ -1773,8 +2661,18 @@ def apply_bbox_recovery_proposals(
             "merge_ink_marker",
         }:
             reason = "unsupported_action"
-        elif is_form_cell and action not in {"add", "add_checkbox"}:
+        elif is_form_cell and not is_demoted_form_cell and action not in {
+            "add",
+            "add_checkbox",
+        }:
             reason = "form_action_guard"
+        elif is_page_cell and action not in {
+            "add",
+            "add_orphan",
+            "add_fringe",
+            "add_checkbox",
+        }:
+            reason = "page_action_guard"
         elif cell is None or cell_bbox is None:
             reason = "unknown_cell"
         elif action in table_scoped_actions and (
@@ -1794,7 +2692,7 @@ def apply_bbox_recovery_proposals(
         elif table_counts[table_key] >= settings.bbox_recovery_max_proposals_per_table:
             reason = "table_budget"
         if reason is None:
-            if is_form_cell and not (
+            if is_form_cell and not is_demoted_form_cell and not (
                 terminal_field_extension or cell_bottom_overflow
             ):
                 outer_bbox = cell_bbox
@@ -1835,7 +2733,7 @@ def apply_bbox_recovery_proposals(
                     else "bbox_outside_cell"
                 )
         if reason is None:
-            if is_form_cell and not (
+            if is_form_cell and not is_demoted_form_cell and not (
                 terminal_field_extension or cell_bottom_overflow
             ):
                 outer_bbox = cell_bbox
@@ -1900,7 +2798,11 @@ def apply_bbox_recovery_proposals(
                 )
                 if not minimum_area_ratio <= area_ratio <= settings.bbox_recovery_max_area_ratio:
                     reason = "area_ratio_guard"
-        if reason is None and action in {"add_orphan", "add_fringe"}:
+        if (
+            reason is None
+            and action in {"add_orphan", "add_fringe"}
+            and not is_page_cell
+        ):
             bbox_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
             related_cell_bboxes = [
                 valid
@@ -1921,7 +2823,14 @@ def apply_bbox_recovery_proposals(
         existing_records: list[
             tuple[tuple[float, float, float, float], str]
         ] = []
-        if is_form_cell and cell_bbox is not None:
+        if is_page_cell:
+            existing_records.extend(
+                (line.bbox, str(cell_id or ""))
+                for line in collect_text_lines(page, page_index)
+                if line.source_span is not None
+                and not line.source_span.get("fusion_visualization_hidden")
+            )
+        elif is_form_cell and cell_bbox is not None:
             existing_records.extend(
                 (line.bbox, str(cell_id or ""))
                 for line in collect_text_lines(page, page_index)
@@ -2135,6 +3044,13 @@ def apply_bbox_recovery_proposals(
                 recovery_metadata[
                     "fusion_recovery_terminal_field_kind"
                 ] = "date"
+        if is_page_cell:
+            recovery_metadata.update(
+                {
+                    "fusion_recovery_page": True,
+                    "fusion_recovery_page_cell_id": cell_id,
+                }
+            )
         if spanning_cells:
             recovery_metadata["fusion_recovery_merged_cell_ids"] = list(
                 merged_cell_ids
@@ -2158,7 +3074,31 @@ def apply_bbox_recovery_proposals(
                     ),
                 }
             )
-        if is_form_cell and action in {"add", "add_checkbox"}:
+        if is_page_cell and action in {
+            "add",
+            "add_orphan",
+            "add_fringe",
+            "add_checkbox",
+        }:
+            recovery_text = (
+                str(item.get("text", ""))
+                if action == "add_checkbox"
+                else ""
+            )
+            _append_page_recovery_block(
+                page,
+                bbox,
+                recovery_text,
+                recovery_metadata,
+            )
+            stats["added"] += 1
+            stats["page_added"] += 1
+            if action == "add_checkbox":
+                stats["checkbox_added"] += 1
+        elif is_form_cell and (
+            action in {"add", "add_checkbox"}
+            or (is_demoted_form_cell and action in {"add_orphan", "add_fringe"})
+        ):
             recovery_text = (
                 str(item.get("text", ""))
                 if action == "add_checkbox"
@@ -2262,6 +3202,7 @@ def apply_bbox_recovery_proposals(
         stats["fringe_added"] = 0
         stats["checkbox_added"] = 0
         stats["form_added"] = 0
+        stats["page_added"] = 0
         stats["checkbox_merged"] = 0
         stats["list_marker_merged"] = 0
         stats["ink_marker_merged"] = 0
@@ -4591,6 +5532,7 @@ def fuse_middle_json(
         "bbox_recognition_table_rebuild_rejections": 0,
         "bbox_recovery_table_candidates": 0,
         "bbox_recovery_form_candidates": 0,
+        "bbox_recovery_page_candidates": 0,
         "bbox_recovery_tables_reviewed": 0,
         "bbox_recovery_table_budget_skips": 0,
         "bbox_recovery_proposal_budget_skips": 0,
@@ -4623,11 +5565,17 @@ def fuse_middle_json(
         "bbox_recovery_fringe_added": 0,
         "bbox_recovery_checkbox_added": 0,
         "bbox_recovery_form_added": 0,
+        "bbox_recovery_page_added": 0,
         "bbox_recovery_checkbox_merged": 0,
         "bbox_recovery_list_marker_merged": 0,
         "bbox_recovery_ink_marker_merged": 0,
         "bbox_recovery_rejected": 0,
         "bbox_recovery_errors": 0,
+        "bbox_control_group_candidates": 0,
+        "bbox_control_groups": 0,
+        "bbox_control_checkbox_groups": 0,
+        "bbox_control_list_groups": 0,
+        "bbox_control_group_rejected": 0,
         "table_targets": 0,
         "table_fallback_replacements": 0,
         "table_conflicts": 0,
@@ -4684,13 +5632,20 @@ def fuse_middle_json(
     for page_index, (hybrid_page, ocr_page) in enumerate(zip(hybrid_pages, ocr_pages)):
         page_size = hybrid_page.get("page_size", [0, 0])
         if settings.bbox_recovery_enabled:
-            recovery_manifest = build_bbox_recovery_manifest(ocr_page, page_index)
+            recovery_manifest = build_bbox_recovery_manifest(
+                ocr_page,
+                page_index,
+                settings,
+            )
             counts["bbox_recovery_table_candidates"] += sum(
                 item.get("kind") == "table" for item in recovery_manifest
             )
             counts["bbox_recovery_form_candidates"] += sum(
                 item.get("kind") in {"form_region", "demoted_form_region"}
                 for item in recovery_manifest
+            )
+            counts["bbox_recovery_page_candidates"] += sum(
+                item.get("kind") == "page_region" for item in recovery_manifest
             )
             if recovery_manifest and bbox_recovery_reviewer is None:
                 counts["bbox_recovery_errors"] += 1
@@ -4818,6 +5773,7 @@ def fuse_middle_json(
                         "fringe_added",
                         "checkbox_added",
                         "form_added",
+                        "page_added",
                         "checkbox_merged",
                         "list_marker_merged",
                         "ink_marker_merged",
@@ -4829,6 +5785,19 @@ def fuse_middle_json(
                     recovery_structure_unchanged &= page_recovery_unchanged
                     decisions.extend(recovery_decisions)
                     recovery_batches.extend(page_recovery_batches)
+            if isinstance(ocr_page, dict):
+                ocr_page.pop("_fusion_bbox_page_recovery_state", None)
+        control_stats, control_decisions = group_page_control_markers(
+            ocr_page,
+            page_index,
+            settings,
+        )
+        counts["bbox_control_group_candidates"] += control_stats["candidates"]
+        counts["bbox_control_groups"] += control_stats["groups"]
+        counts["bbox_control_checkbox_groups"] += control_stats["checkbox_groups"]
+        counts["bbox_control_list_groups"] += control_stats["list_groups"]
+        counts["bbox_control_group_rejected"] += control_stats["rejected"]
+        decisions.extend(control_decisions)
         recognition_invariant_before = (
             _page_recognition_invariant_snapshot(ocr_page)
             if settings.bbox_recognition_enabled

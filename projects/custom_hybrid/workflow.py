@@ -304,12 +304,14 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         "skip_vlm_for_mineru_models",
         "disable_after_invalid_schema",
         "share_recognizer_page_cache",
+        "page_recovery_enabled",
         "table_orphan_recovery_enabled",
         "table_fringe_recovery_enabled",
         "checkbox_recovery_enabled",
         "checkbox_accept_existing_label_bbox",
         "checkbox_merge_label_enabled",
         "checkbox_protruding_tick_enabled",
+        "checkbox_embedded_glyph_guard_enabled",
         "list_marker_merge_enabled",
         "table_diagonal_rule_enabled",
     ):
@@ -363,6 +365,8 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         "form_full_cell_recovery_max_width_ratio",
         "list_marker_confidence",
         "list_marker_min_vertical_overlap",
+        "page_recovery_graphic_min_ink_density",
+        "page_recovery_graphic_max_component_ratio",
     ):
         field = recovery.get(key)
         if field is not None and (
@@ -499,8 +503,15 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         ("table_fringe_bottom_extension", 72.0, True),
         ("date_range_field_bottom_extension", 6.0, True),
         ("form_full_cell_recovery_max_width_ratio", 0.6, False),
+        ("same_cell_fragment_max_vertical_gap", 2.5, True),
+        ("same_cell_fragment_max_center_delta_ratio", 0.8, False),
+        ("same_cell_fragment_max_union_height_ratio", 2.2, False),
         ("checkbox_label_max_gap", 24.0, True),
         ("list_marker_max_gap", 24.0, True),
+        ("page_recovery_graphic_min_height", 14.0, False),
+        ("page_recovery_max_line_height", 24.0, False),
+        ("checkbox_embedded_glyph_max_size", 7.5, False),
+        ("checkbox_embedded_glyph_max_left_offset", 16.0, True),
     ):
         field = recovery.get(key, default)
         if (
@@ -511,6 +522,20 @@ def _validate_fusion_config(fusion_config: Any) -> None:
             qualifier = "non-negative" if allow_zero else "positive"
             raise WorkflowConfigError(
                 f"fusion.recovery.{key} must be {qualifier}"
+            )
+    for key, default in (
+        ("same_cell_fragment_min_horizontal_overlap", 0.75),
+        ("split_content_min_horizontal_overlap", 0.8),
+        ("split_content_min_vertical_overlap", 0.35),
+    ):
+        field = recovery.get(key, default)
+        if (
+            isinstance(field, bool)
+            or not isinstance(field, (int, float))
+            or not 0 <= float(field) <= 1
+        ):
+            raise WorkflowConfigError(
+                f"fusion.recovery.{key} must be between 0 and 1"
             )
     checkbox_max_vertices = recovery.get("checkbox_max_vertices", 5)
     if (

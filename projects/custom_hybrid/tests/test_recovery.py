@@ -420,6 +420,413 @@ class BBoxRecoveryReviewerTests(unittest.TestCase):
         self.assertLess(merged["bbox"][1], 57)
         self.assertGreater(merged["bbox"][3], 78)
 
+    def test_same_cell_pixel_fragments_are_merged_but_separate_rows_are_kept(self):
+        reviewer = OpenAIBBoxRecoveryReviewer.__new__(
+            OpenAIBBoxRecoveryReviewer
+        )
+        reviewer.config = {}
+        proposals = [
+            {
+                "action": "add",
+                "cell_id": "p0-t0-c0",
+                "bbox": [30, 40, 120, 46],
+                "confidence": 0.96,
+                "recovery_source": "local_pixel_ink",
+                "recovery_reasons": ["uncovered_ink"],
+            },
+            {
+                "action": "add",
+                "cell_id": "p0-t0-c0",
+                "bbox": [31, 44, 119, 50],
+                "confidence": 0.94,
+                "recovery_source": "local_pixel_ink",
+                "recovery_reasons": ["uncovered_ink"],
+            },
+            {
+                "action": "add",
+                "cell_id": "p0-t0-c0",
+                "bbox": [30, 66, 120, 72],
+                "confidence": 0.95,
+                "recovery_source": "local_pixel_ink",
+                "recovery_reasons": ["uncovered_ink"],
+            },
+        ]
+
+        merged = reviewer._merge_split_local_proposals(proposals)
+
+        self.assertEqual(len(merged), 2)
+        first = min(merged, key=lambda item: item["bbox"][1])
+        self.assertEqual(first["bbox"], [30.0, 40.0, 120.0, 50.0])
+        self.assertEqual(first["fusion_same_cell_fragment_count"], 2)
+        self.assertEqual(
+            first["recovery_source"],
+            "local_same_cell_pixel_ink_merge",
+        )
+
+    def test_page_region_recovers_ink_outside_existing_ocr_boxes(self):
+        from PIL import Image, ImageDraw
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            image = Image.new("RGB", (200, 140), "white")
+            ImageDraw.Draw(image).text((30, 70), "Missing text 123", fill="black")
+            image.save(image_path)
+            image.close()
+            reviewer = OpenAIBBoxRecoveryReviewer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "mineru-local",
+                    "render_scale": 1.0,
+                    "checkbox_recovery_enabled": False,
+                    "table_orphan_max_boxes_per_table": 10,
+                },
+            )
+            try:
+                result = reviewer(
+                    0,
+                    [200, 140],
+                    [
+                        {
+                            "id": "p0-page-recovery",
+                            "page_region": True,
+                            "bbox": [0, 0, 200, 140],
+                            "cells": [
+                                {
+                                    "id": "p0-page-c0",
+                                    "bbox": [0, 0, 200, 140],
+                                    "existing": [],
+                                    "reasons": [],
+                                }
+                            ],
+                            "page_existing": [],
+                            "page_exclusions": [],
+                            "allow_orphan_recovery": True,
+                            "disable_marker_merges": True,
+                        }
+                    ],
+                )
+            finally:
+                reviewer.close()
+
+        self.assertEqual(len(result["items"]), 1)
+        self.assertEqual(result["items"][0]["action"], "add_orphan")
+        self.assertEqual(result["items"][0]["cell_id"], "p0-page-c0")
+
+    def test_page_region_recovers_only_residual_checkbox_without_table_budget(self):
+        from PIL import Image, ImageDraw
+
+        fake_httpx = FakeHttpx()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            image = Image.new("RGB", (220, 140), "white")
+            draw = ImageDraw.Draw(image)
+            draw.rectangle([20, 20, 31, 31], outline="black", width=2)
+            draw.text((40, 21), "Owned option", fill="black")
+            draw.rectangle([20, 82, 31, 93], outline="black", width=2)
+            draw.text((40, 83), "No / Yes", fill="black")
+            image.save(image_path)
+            image.close()
+            reviewer = OpenAIBBoxRecoveryReviewer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "vision-reviewer",
+                    "render_scale": 1.0,
+                    "local_missing_enabled": False,
+                    "local_uncovered_enabled": False,
+                    "table_orphan_recovery_enabled": False,
+                    "checkbox_recovery_enabled": True,
+                    "checkbox_min_size": 8.0,
+                    "checkbox_max_size": 18.0,
+                    "review_after_local_recovery": True,
+                    "max_tables_per_document": 0,
+                },
+            )
+            reviewer.httpx = fake_httpx
+            try:
+                result = reviewer(
+                    0,
+                    [220, 140],
+                    [
+                        {
+                            "id": "p0-page-recovery",
+                            "page_region": True,
+                            "residual_page_region": True,
+                            "bbox": [0, 0, 220, 140],
+                            "cells": [
+                                {
+                                    "id": "p0-page-c0",
+                                    "bbox": [0, 0, 220, 140],
+                                    "existing": [
+                                        {
+                                            "id": "p0-page-c0-b0",
+                                            "bbox": [39, 80, 150, 98],
+                                            "text": "No / Yes",
+                                        }
+                                    ],
+                                    "reasons": [],
+                                }
+                            ],
+                            "page_existing": [
+                                {
+                                    "bbox": [39, 80, 150, 98],
+                                    "text": "No / Yes",
+                                }
+                            ],
+                            "page_exclusions": [[0, 0, 220, 60]],
+                            "allow_orphan_recovery": True,
+                            "disable_marker_merges": True,
+                        }
+                    ],
+                )
+            finally:
+                reviewer.close()
+
+        checkboxes = [
+            item
+            for item in result["items"]
+            if item.get("action") == "add_checkbox"
+        ]
+        self.assertEqual(len(checkboxes), 1)
+        self.assertGreater(checkboxes[0]["bbox"][1], 60.0)
+        self.assertEqual(result["tables_reviewed"], 0)
+        self.assertEqual(result["table_budget_skips"], 0)
+        self.assertEqual(result["requests"], 0)
+        self.assertEqual(fake_httpx.requests, [])
+
+    def test_page_region_rejects_tall_graphic_but_keeps_text_line(self):
+        from PIL import Image, ImageDraw
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            image = Image.new("RGB", (200, 140), "white")
+            draw = ImageDraw.Draw(image)
+            draw.rectangle([20, 20, 52, 52], outline="black", width=2)
+            draw.text((30, 90), "Missing text", fill="black")
+            image.save(image_path)
+            image.close()
+            reviewer = OpenAIBBoxRecoveryReviewer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "mineru-local",
+                    "render_scale": 1.0,
+                    "checkbox_recovery_enabled": False,
+                    "table_diagonal_rule_enabled": False,
+                    "page_recovery_max_line_height": 16.0,
+                },
+            )
+            try:
+                result = reviewer(
+                    0,
+                    [200, 140],
+                    [
+                        {
+                            "id": "p0-page-recovery",
+                            "page_region": True,
+                            "bbox": [0, 0, 200, 140],
+                            "cells": [
+                                {
+                                    "id": "p0-page-c0",
+                                    "bbox": [0, 0, 200, 140],
+                                    "existing": [],
+                                    "reasons": [],
+                                }
+                            ],
+                            "page_existing": [],
+                            "page_exclusions": [],
+                            "allow_orphan_recovery": True,
+                            "disable_marker_merges": True,
+                        }
+                    ],
+                )
+            finally:
+                reviewer.close()
+
+        orphans = [
+            item for item in result["items"] if item.get("action") == "add_orphan"
+        ]
+        self.assertEqual(len(orphans), 1)
+        self.assertGreater(orphans[0]["bbox"][1], 80.0)
+
+    def test_form_checkbox_guard_rejects_small_embedded_paragraph_glyph(self):
+        from PIL import Image, ImageDraw
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            image = Image.new("RGB", (240, 100), "white")
+            draw = ImageDraw.Draw(image)
+            draw.rectangle([80, 20, 86, 26], outline="black", width=1)
+            draw.text((96, 20), "Paragraph text", fill="black")
+            image.save(image_path)
+            image.close()
+            reviewer = OpenAIBBoxRecoveryReviewer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "mineru-local",
+                    "render_scale": 1.0,
+                    "local_missing_enabled": False,
+                    "local_uncovered_enabled": False,
+                    "table_orphan_recovery_enabled": False,
+                    "checkbox_recovery_enabled": True,
+                    "checkbox_min_size": 5.5,
+                    "checkbox_max_size": 16.0,
+                },
+            )
+            try:
+                result = reviewer(
+                    0,
+                    [240, 100],
+                    [
+                        {
+                            "id": "p0-form-0",
+                            "form_region": True,
+                            "bbox": [0, 0, 240, 60],
+                            "cells": [
+                                {
+                                    "id": "p0-f0-c0",
+                                    "bbox": [0, 0, 240, 60],
+                                    "existing": [
+                                        {
+                                            "id": "p0-f0-c0-b0",
+                                            "bbox": [10, 18, 220, 36],
+                                            "text": "Ordinary disclaimer paragraph",
+                                        }
+                                    ],
+                                    "reasons": [],
+                                }
+                            ],
+                        }
+                    ],
+                )
+            finally:
+                reviewer.close()
+
+        self.assertFalse(
+            any(item.get("action") == "add_checkbox" for item in result["items"])
+        )
+
+    def test_residual_page_checkbox_guard_rejects_unanchored_icon(self):
+        from PIL import Image, ImageDraw
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            image = Image.new("RGB", (200, 80), "white")
+            draw = ImageDraw.Draw(image)
+            draw.rectangle([20, 20, 31, 31], outline="black", width=2)
+            draw.text((40, 21), "Raster icon label", fill="black")
+            image.save(image_path)
+            image.close()
+            reviewer = OpenAIBBoxRecoveryReviewer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "mineru-local",
+                    "render_scale": 1.0,
+                    "local_missing_enabled": False,
+                    "table_orphan_recovery_enabled": False,
+                    "checkbox_recovery_enabled": True,
+                    "checkbox_min_size": 8.0,
+                    "checkbox_max_size": 18.0,
+                },
+            )
+            try:
+                result = reviewer(
+                    0,
+                    [200, 80],
+                    [
+                        {
+                            "id": "p0-page-recovery",
+                            "page_region": True,
+                            "residual_page_region": True,
+                            "bbox": [0, 0, 200, 80],
+                            "cells": [
+                                {
+                                    "id": "p0-page-c0",
+                                    "bbox": [0, 0, 200, 80],
+                                    "existing": [],
+                                    "reasons": [],
+                                }
+                            ],
+                            "page_existing": [],
+                            "page_exclusions": [],
+                            "allow_orphan_recovery": True,
+                            "disable_marker_merges": True,
+                        }
+                    ],
+                )
+            finally:
+                reviewer.close()
+
+        self.assertFalse(
+            any(item.get("action") == "add_checkbox" for item in result["items"])
+        )
+
+    def test_form_checkbox_guard_keeps_multiple_choice_controls(self):
+        from PIL import Image, ImageDraw
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            image = Image.new("RGB", (240, 100), "white")
+            draw = ImageDraw.Draw(image)
+            draw.rectangle([20, 20, 26, 26], outline="black", width=1)
+            draw.text((35, 20), "No", fill="black")
+            draw.rectangle([100, 20, 106, 26], outline="black", width=1)
+            draw.text((115, 20), "Yes", fill="black")
+            image.save(image_path)
+            image.close()
+            reviewer = OpenAIBBoxRecoveryReviewer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "mineru-local",
+                    "render_scale": 1.0,
+                    "local_missing_enabled": False,
+                    "local_uncovered_enabled": False,
+                    "table_orphan_recovery_enabled": False,
+                    "checkbox_recovery_enabled": True,
+                    "checkbox_min_size": 5.5,
+                    "checkbox_max_size": 16.0,
+                },
+            )
+            try:
+                result = reviewer(
+                    0,
+                    [240, 100],
+                    [
+                        {
+                            "id": "p0-form-0",
+                            "form_region": True,
+                            "bbox": [0, 0, 240, 60],
+                            "cells": [
+                                {
+                                    "id": "p0-f0-c0",
+                                    "bbox": [0, 0, 240, 60],
+                                    "existing": [
+                                        {
+                                            "id": "p0-f0-c0-b0",
+                                            "bbox": [10, 18, 220, 36],
+                                            "text": "No 無 / Yes 有",
+                                        }
+                                    ],
+                                    "reasons": [],
+                                }
+                            ],
+                        }
+                    ],
+                )
+            finally:
+                reviewer.close()
+
+        checkboxes = [
+            item
+            for item in result["items"]
+            if item.get("action") == "add_checkbox"
+        ]
+        self.assertEqual(len(checkboxes), 2)
+
     def test_terminal_signature_row_analysis_extends_to_table_bottom(self):
         from PIL import Image, ImageDraw
 

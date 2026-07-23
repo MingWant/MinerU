@@ -107,8 +107,11 @@ BBOX_VLM_FUSION_OVERRIDES = {
     "max_structured_verifications_per_document": 0,
     "table_cell_fusion_enabled": False,
     "max_table_cell_verifications_per_document": 0,
-    "recover_missing_ocr_blocks": False,
-    "unreliable_table_recovery_enabled": False,
+    # BBox repair is still an OCR post-processing stage. Keep the generic
+    # recall switches on so unstructured OCR lines are not silently excluded
+    # when a page is routed through bbox_vlm.
+    "recover_missing_ocr_blocks": True,
+    "unreliable_table_recovery_enabled": True,
     "recognizer": {
         "enabled": True,
         "normal_ocr_enabled": False,
@@ -124,8 +127,9 @@ BBOX_VLM_FUSION_OVERRIDES = {
     # mode. Keep it on whenever the bbox-conditioned pipeline is selected.
     "recovery": {
         "enabled": True,
+        "page_recovery_enabled": True,
         "max_tables_per_document": 3,
-        "max_proposals_per_document": 200,
+        "max_proposals_per_document": 300,
         "max_proposals_per_table": 50,
         "max_requests_per_document": 3,
     },
@@ -403,7 +407,7 @@ def _normalize_task_parameters(
                     else 3,
                     "max_proposals_per_document": 500
                     if cost_profile == "quality"
-                    else 200,
+                    else 300,
                     "max_proposals_per_table": 100
                     if cost_profile == "quality"
                     else 50,
@@ -596,7 +600,7 @@ def _task_parameter_defaults(
                 "max_tables_per_document", 10
             ),
             "max_proposals_per_document": fusion_config.get("recovery", {}).get(
-                "max_proposals_per_document", 100
+                "max_proposals_per_document", 300
             ),
             "min_confidence": fusion_config.get("recovery", {}).get(
                 "min_confidence", 0.85

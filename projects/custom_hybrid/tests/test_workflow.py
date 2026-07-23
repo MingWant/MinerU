@@ -49,7 +49,7 @@ from projects.custom_hybrid.workflow import (
     _stop_parameter_proxy,
     _visualization_renderer_is_current,
 )
-from mineru.utils.draw_bbox import _form_table_overlay_bboxes
+from mineru.utils.draw_bbox import BBOX_RENDERER_VERSION, _form_table_overlay_bboxes
 
 
 class WorkflowTests(unittest.TestCase):
@@ -110,7 +110,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertFalse(
                 _visualization_renderer_is_current(parse_dir, "sample")
             )
-            marker["bbox_renderer_version"] = 11
+            marker["bbox_renderer_version"] = BBOX_RENDERER_VERSION
             marker_path.write_text(json.dumps(marker), encoding="utf-8")
             self.assertTrue(
                 _visualization_renderer_is_current(parse_dir, "sample")
@@ -412,7 +412,7 @@ class WorkflowTests(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
-            self.assertEqual(marker["bbox_renderer_version"], 11)
+            self.assertEqual(marker["bbox_renderer_version"], BBOX_RENDERER_VERSION)
             self.assertEqual(marker["form_detector_version"], 1)
             self.assertEqual(marker["form_segmenter_version"], 4)
             self.assertTrue((parse_dir / "renamed_forms.pdf").is_file())

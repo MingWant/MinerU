@@ -33,6 +33,18 @@ _TERMINAL_SIGNATURE_FIELD_RE = re.compile(
     r"(?:signature|signed|簽署|签署)",
     flags=re.IGNORECASE,
 )
+_CONTROL_CHOICE_PAIR_RE = re.compile(
+    r"(?:\b(?:yes|no)\b.{0,24}\b(?:yes|no)\b|"
+    r"(?:是.{0,8}否|否.{0,8}是|有.{0,8}無|無.{0,8}有))",
+    flags=re.IGNORECASE,
+)
+
+
+def _looks_like_control_choice_text(text: str) -> bool:
+    return bool(
+        re.search(r"[☐☑☒□■✓✔]", text)
+        or _CONTROL_CHOICE_PAIR_RE.search(text)
+    )
 
 
 def _is_date_range_field_text(text: str) -> bool:
@@ -1141,6 +1153,10 @@ class OpenAIBBoxRecoveryReviewer:
         crop = image.crop(crop_box).convert("L")
         self.orphan_tables_analyzed += 1
         try:
+            try:
+                import cv2
+            except ImportError:  # pragma: no cover - optional local dependency
+                cv2 = None
             histogram = crop.histogram()
             total_pixels = max(crop.width * crop.height, 1)
             target = total_pixels * 0.9
@@ -1186,8 +1202,10 @@ class OpenAIBBoxRecoveryReviewer:
 
             existing_mask = np.zeros_like(dark_mask, dtype=bool)
             existing_bboxes = []
+            mask_cell_geometry = not bool(table.get("page_region"))
             for cell in cells:
-                mark_bbox(cell_mask, cell.get("bbox"), padding_x, padding_y)
+                if mask_cell_geometry:
+                    mark_bbox(cell_mask, cell.get("bbox"), padding_x, padding_y)
                 for box in cell.get("existing", []):
                     if not isinstance(box, Mapping):
                         continue
@@ -1202,7 +1220,11 @@ class OpenAIBBoxRecoveryReviewer:
                 if bbox is not None:
                     existing_bboxes.append(bbox)
                     mark_bbox(existing_mask, bbox, padding_x, padding_y)
-            for raw_bbox in table.get("page_exclusions", []):
+            orphan_exclusions = table.get(
+                "page_orphan_exclusions",
+                table.get("page_exclusions", []),
+            )
+            for raw_bbox in orphan_exclusions:
                 mark_bbox(existing_mask, raw_bbox, padding_x, padding_y)
 
             orphan_mask = dark_mask & ~cell_mask & ~existing_mask
@@ -1284,6 +1306,22 @@ class OpenAIBBoxRecoveryReviewer:
             )
             maximum_ink_density = float(
                 self.config.get("table_orphan_max_ink_density", 0.7)
+            )
+            page_region = bool(table.get("page_region"))
+            page_graphic_density = float(
+                self.config.get("page_recovery_graphic_min_ink_density", 0.38)
+            )
+            page_graphic_component_ratio = float(
+                self.config.get("page_recovery_graphic_max_component_ratio", 0.72)
+            )
+            page_graphic_min_height = max(
+                float(
+                    self.config.get(
+                        "page_recovery_graphic_min_height",
+                        14.0,
+                    )
+                ),
+                0.0,
             )
             cells_with_bbox = [
                 (cell, _valid_bbox(cell.get("bbox"))) for cell in cells
@@ -1376,6 +1414,33 @@ class OpenAIBBoxRecoveryReviewer:
                         <= maximum_ink_density
                     ):
                         continue
+                    if page_region and cv2 is not None:
+                        # QR codes, logos, and stamps often form one very dense
+                        # connected component. Text lines usually contain many
+                        # disconnected glyphs, while short handwritten strokes
+                        # stay below the height gate and remain eligible.
+                        segment_pixels = segment_mask.astype(np.uint8)
+                        _component_count, _labels, component_stats, _centroids = (
+                            cv2.connectedComponentsWithStats(segment_pixels, 8)
+                        )
+                        largest_component = max(
+                            (
+                                int(row[cv2.CC_STAT_AREA])
+                                for row in component_stats[1:]
+                            ),
+                            default=0,
+                        )
+                        component_ratio = largest_component / max(
+                            int(dark_x.size),
+                            1,
+                        )
+                        raw_height_points = (max_y - min_y) / scale_y
+                        if (
+                            raw_height_points >= page_graphic_min_height
+                            and ink_density >= page_graphic_density
+                            and component_ratio >= page_graphic_component_ratio
+                        ):
+                            continue
                     bbox = _clip_bbox(
                         (
                             (crop_box[0] + min_x) / scale_x - 1.0,
@@ -1388,10 +1453,22 @@ class OpenAIBBoxRecoveryReviewer:
                     if bbox is None:
                         continue
                     height = bbox[3] - bbox[1]
-                    maximum_height = max(
-                        (table_bbox[3] - table_bbox[1])
-                        * maximum_height_ratio,
-                        minimum_height * 4,
+                    maximum_height = (
+                        max(
+                            float(
+                                self.config.get(
+                                    "page_recovery_max_line_height",
+                                    24.0,
+                                )
+                            ),
+                            minimum_height,
+                        )
+                        if page_region
+                        else max(
+                            (table_bbox[3] - table_bbox[1])
+                            * maximum_height_ratio,
+                            minimum_height * 4,
+                        )
                     )
                     if height < minimum_height or height > maximum_height:
                         continue
@@ -1935,7 +2012,9 @@ class OpenAIBBoxRecoveryReviewer:
             ]
             merge_with_label = bool(
                 self.config.get("checkbox_merge_label_enabled", True)
-            ) and not bool(table.get("form_region"))
+            ) and not bool(table.get("form_region")) and not bool(
+                table.get("page_region")
+            )
             label_max_gap = max(
                 float(self.config.get("checkbox_label_max_gap", 24.0)),
                 0.0,
@@ -1961,12 +2040,58 @@ class OpenAIBBoxRecoveryReviewer:
             )
             accept_existing_label_bbox = bool(
                 self.config.get("checkbox_accept_existing_label_bbox", True)
-            ) and not bool(table.get("form_region"))
+            ) and not bool(table.get("form_region")) and not bool(
+                table.get("page_region")
+            )
+            page_exclusions = [
+                bbox
+                for raw_bbox in table.get(
+                    "page_checkbox_exclusions",
+                    table.get("page_exclusions", []),
+                )
+                for bbox in [_valid_bbox(raw_bbox)]
+                if bbox is not None
+            ]
+            checkbox_fallback_regions = [
+                bbox
+                for raw_bbox in table.get("page_checkbox_fallback_regions", [])
+                for bbox in [_valid_bbox(raw_bbox)]
+                if bbox is not None
+            ]
+            embedded_glyph_guard = bool(
+                self.config.get(
+                    "checkbox_embedded_glyph_guard_enabled",
+                    True,
+                )
+            )
+            embedded_glyph_max_size = max(
+                float(
+                    self.config.get(
+                        "checkbox_embedded_glyph_max_size",
+                        7.5,
+                    )
+                ),
+                0.0,
+            )
+            embedded_glyph_max_left_offset = max(
+                float(
+                    self.config.get(
+                        "checkbox_embedded_glyph_max_left_offset",
+                        16.0,
+                    )
+                ),
+                0.0,
+            )
             for candidate in sorted(
                 candidates,
                 key=lambda item: (item["bbox"][1], item["bbox"][0]),
             ):
                 bbox = candidate["bbox"]
+                if table.get("page_region") and any(
+                    _bbox_overlap_ratio(bbox, exclusion) >= 0.25
+                    for exclusion in page_exclusions
+                ):
+                    continue
                 width = bbox[2] - bbox[0]
                 height = bbox[3] - bbox[1]
                 already_boxed = any(
@@ -2018,6 +2143,69 @@ class OpenAIBBoxRecoveryReviewer:
                 table_id = table.get("id")
                 if not isinstance(cell_id, str) or not isinstance(table_id, str):
                     continue
+                candidate_in_checkbox_fallback = any(
+                    _bbox_overlap_ratio(bbox, region) >= 0.5
+                    for region in checkbox_fallback_regions
+                )
+                aligned_text = []
+                for existing in nearest_cell.get("existing", []):
+                    if not isinstance(existing, Mapping):
+                        continue
+                    existing_bbox = _valid_bbox(existing.get("bbox"))
+                    existing_text = str(existing.get("text", "")).strip()
+                    if existing_bbox is None or not existing_text:
+                        continue
+                    vertical_overlap = max(
+                        0.0,
+                        min(bbox[3], existing_bbox[3])
+                        - max(bbox[1], existing_bbox[1]),
+                    )
+                    minimum_height = min(
+                        bbox[3] - bbox[1],
+                        existing_bbox[3] - existing_bbox[1],
+                    )
+                    overlap_ratio = (
+                        vertical_overlap / minimum_height
+                        if minimum_height > 0
+                        else 0.0
+                    )
+                    if overlap_ratio >= label_min_vertical_overlap:
+                        aligned_text.append((existing_bbox, existing_text))
+                guard_scope = bool(
+                    table.get("form_region")
+                    or table.get("residual_page_region")
+                )
+                if (
+                    embedded_glyph_guard
+                    and guard_scope
+                    and not candidate_in_checkbox_fallback
+                    and (
+                        table.get("residual_page_region")
+                        or min(width, height) <= embedded_glyph_max_size
+                    )
+                ):
+                    anchored_to_label = any(
+                        (
+                            0.0 <= existing_bbox[0] - bbox[2] <= label_max_gap
+                        )
+                        or (
+                            existing_bbox[0] <= bbox[0] <= existing_bbox[2]
+                            and bbox[0] - existing_bbox[0]
+                            <= embedded_glyph_max_left_offset
+                        )
+                        for existing_bbox, _text in aligned_text
+                    )
+                    has_choice_context = any(
+                        _looks_like_control_choice_text(text)
+                        for _existing_bbox, text in aligned_text
+                    )
+                    valid_context = (
+                        has_choice_context
+                        if table.get("residual_page_region")
+                        else anchored_to_label or has_choice_context
+                    )
+                    if not aligned_text or not valid_context:
+                        continue
                 state = str(candidate["state"])
                 confidence = float(
                     self.config.get(
@@ -2916,9 +3104,55 @@ class OpenAIBBoxRecoveryReviewer:
         self,
         proposals: Sequence[Mapping[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Merge one handwritten line detected by overlapping adjacent Cells."""
+        """Merge duplicate pixel fragments before applying recovery boxes.
+
+        A handwritten line can be split by both adjacent Cells and by the
+        raster line-band detector itself. The former uses the historical
+        cross-Cell merge rule; the latter is merged only when fragments in the
+        same Cell have strong horizontal alignment and nearly touching
+        vertical centers, which avoids collapsing ordinary neighbouring rows.
+        """
         if not self.config.get("merge_split_content_boxes_enabled", True):
             return [dict(item) for item in proposals]
+        same_cell_min_horizontal_overlap = min(
+            max(
+                float(
+                    self.config.get(
+                        "same_cell_fragment_min_horizontal_overlap",
+                        0.75,
+                    )
+                ),
+                0.0,
+            ),
+            1.0,
+        )
+        same_cell_max_vertical_gap = max(
+            float(
+                self.config.get(
+                    "same_cell_fragment_max_vertical_gap",
+                    2.5,
+                )
+            ),
+            0.0,
+        )
+        same_cell_max_center_ratio = max(
+            float(
+                self.config.get(
+                    "same_cell_fragment_max_center_delta_ratio",
+                    0.8,
+                )
+            ),
+            0.0,
+        )
+        same_cell_max_union_height_ratio = max(
+            float(
+                self.config.get(
+                    "same_cell_fragment_max_union_height_ratio",
+                    2.2,
+                )
+            ),
+            1.0,
+        )
         minimum_horizontal_overlap = min(
             max(
                 float(
@@ -2952,10 +3186,83 @@ class OpenAIBBoxRecoveryReviewer:
             ),
             1.0,
         )
+
+        def cell_ids_for(item: Mapping[str, Any]) -> set[str]:
+            values = {
+                value
+                for value in (
+                    list(item.get("merged_cell_ids", []))
+                    if isinstance(item.get("merged_cell_ids"), list)
+                    else []
+                )
+                if isinstance(value, str)
+            }
+            cell_id = item.get("cell_id")
+            if isinstance(cell_id, str):
+                values.add(cell_id)
+            return values
+
+        def merge_item(
+            existing: dict[str, Any],
+            item: Mapping[str, Any],
+            *,
+            same_cell: bool,
+        ) -> None:
+            existing_bbox = _valid_bbox(existing.get("bbox"))
+            item_bbox = _valid_bbox(item.get("bbox"))
+            if existing_bbox is None or item_bbox is None:
+                return
+            existing["bbox"] = [
+                min(item_bbox[0], existing_bbox[0]),
+                min(item_bbox[1], existing_bbox[1]),
+                max(item_bbox[2], existing_bbox[2]),
+                max(item_bbox[3], existing_bbox[3]),
+            ]
+            existing["confidence"] = min(
+                float(existing.get("confidence", 0.0)),
+                float(item.get("confidence", 0.0)),
+            )
+            reasons = {
+                reason
+                for candidate in (existing, item)
+                for reason in (
+                    candidate.get("recovery_reasons", [])
+                    if isinstance(candidate.get("recovery_reasons"), list)
+                    else []
+                )
+                if isinstance(reason, str)
+            }
+            if same_cell:
+                existing["fusion_same_cell_fragment_count"] = int(
+                    existing.get("fusion_same_cell_fragment_count", 1)
+                ) + 1
+                existing["recovery_source"] = "local_same_cell_pixel_ink_merge"
+                reasons.add("same_cell_fragment_bbox")
+            else:
+                existing_cells = cell_ids_for(existing)
+                existing_cells.update(cell_ids_for(item))
+                existing["merged_cell_ids"] = sorted(existing_cells)
+                existing["spanning_cells"] = True
+                # Spanning proposals already use the Table bbox as their
+                # bounded outer geometry. Do not retain a single Cell's
+                # overflow flag, which would route the merged line through
+                # the narrower short-Cell guard.
+                existing["cell_bottom_overflow"] = False
+                existing["recovery_source"] = "local_split_pixel_ink_merge"
+                reasons.add("split_content_bbox")
+            existing["recovery_reasons"] = sorted(reasons)
+
         merged: list[dict[str, Any]] = []
         for raw_item in sorted(
             proposals,
-            key=lambda item: tuple(item.get("bbox", (0, 0, 0, 0))),
+            key=lambda item: (
+                _valid_bbox(item.get("bbox"))[1]
+                if _valid_bbox(item.get("bbox")) is not None
+                else float("inf"),
+                _valid_bbox(item.get("bbox"))[0]
+                if _valid_bbox(item.get("bbox")) is not None
+                else float("inf"),
+            ),
         ):
             item = dict(raw_item)
             bbox = _valid_bbox(item.get("bbox"))
@@ -2964,22 +3271,73 @@ class OpenAIBBoxRecoveryReviewer:
                 merged.append(item)
                 continue
             match = None
+            same_cell_match = False
             for index, existing in enumerate(merged):
                 existing_bbox = _valid_bbox(existing.get("bbox"))
-                existing_cells = existing.get("merged_cell_ids", [])
-                existing_cell_id = existing.get("cell_id")
-                cell_ids = {
-                    value
-                    for value in (
-                        list(existing_cells)
-                        if isinstance(existing_cells, list)
-                        else []
+                if existing_bbox is None:
+                    continue
+                cell_ids = cell_ids_for(existing)
+                if cell_id in cell_ids:
+                    # Same-Cell fragments are only merged for ordinary pixel
+                    # additions. Marker/field proposals have their own
+                    # geometry guards and must stay independent.
+                    if (
+                        len(cell_ids) != 1
+                        or item.get("action") != "add"
+                        or existing.get("action") != "add"
+                    ):
+                        continue
+                    left_width = bbox[2] - bbox[0]
+                    right_width = existing_bbox[2] - existing_bbox[0]
+                    horizontal_overlap = max(
+                        0.0,
+                        min(bbox[2], existing_bbox[2])
+                        - max(bbox[0], existing_bbox[0]),
                     )
-                    if isinstance(value, str)
-                }
-                if isinstance(existing_cell_id, str):
-                    cell_ids.add(existing_cell_id)
-                if existing_bbox is None or cell_id in cell_ids:
+                    horizontal_ratio = horizontal_overlap / max(
+                        left_width,
+                        right_width,
+                        1e-6,
+                    )
+                    left_height = bbox[3] - bbox[1]
+                    right_height = existing_bbox[3] - existing_bbox[1]
+                    vertical_overlap = max(
+                        0.0,
+                        min(bbox[3], existing_bbox[3])
+                        - max(bbox[1], existing_bbox[1]),
+                    )
+                    vertical_gap = max(
+                        bbox[1] - existing_bbox[3],
+                        existing_bbox[1] - bbox[3],
+                        0.0,
+                    )
+                    center_delta = abs(
+                        (bbox[1] + bbox[3]) / 2
+                        - (existing_bbox[1] + existing_bbox[3]) / 2
+                    )
+                    union_height = max(bbox[3], existing_bbox[3]) - min(
+                        bbox[1], existing_bbox[1]
+                    )
+                    if (
+                        horizontal_ratio >= same_cell_min_horizontal_overlap
+                        and (
+                            vertical_overlap > 0.0
+                            or vertical_gap
+                            <= max(
+                                same_cell_max_vertical_gap,
+                                min(left_height, right_height) * 0.25,
+                            )
+                        )
+                        and center_delta
+                        <= max(left_height, right_height)
+                        * same_cell_max_center_ratio
+                        and union_height
+                        <= max(left_height, right_height)
+                        * same_cell_max_union_height_ratio
+                    ):
+                        match = index
+                        same_cell_match = True
+                        break
                     continue
                 left_width = bbox[2] - bbox[0]
                 right_width = existing_bbox[2] - existing_bbox[0]
@@ -3018,47 +3376,7 @@ class OpenAIBBoxRecoveryReviewer:
             if match is None:
                 merged.append(item)
                 continue
-            existing = merged[match]
-            existing_bbox = _valid_bbox(existing.get("bbox"))
-            existing_cells = existing.get("merged_cell_ids", [])
-            merged_cells = {
-                value
-                for value in (
-                    list(existing_cells)
-                    if isinstance(existing_cells, list)
-                    else []
-                )
-                if isinstance(value, str)
-            }
-            if isinstance(existing.get("cell_id"), str):
-                merged_cells.add(existing["cell_id"])
-            merged_cells.add(cell_id)
-            existing["bbox"] = [
-                min(bbox[0], existing_bbox[0]),
-                min(bbox[1], existing_bbox[1]),
-                max(bbox[2], existing_bbox[2]),
-                max(bbox[3], existing_bbox[3]),
-            ]
-            existing["merged_cell_ids"] = sorted(merged_cells)
-            existing["spanning_cells"] = True
-            # Spanning proposals already use the Table bbox as their bounded
-            # outer geometry. Do not retain a single Cell's overflow flag,
-            # which would incorrectly route the merged line through the much
-            # narrower short-Cell overflow guard.
-            existing["cell_bottom_overflow"] = False
-            existing["confidence"] = min(
-                float(existing.get("confidence", 0.0)),
-                float(item.get("confidence", 0.0)),
-            )
-            existing["recovery_source"] = "local_split_pixel_ink_merge"
-            reasons = {
-                reason
-                for candidate in (existing, item)
-                for reason in candidate.get("recovery_reasons", [])
-                if isinstance(reason, str)
-            }
-            reasons.add("split_content_bbox")
-            existing["recovery_reasons"] = sorted(reasons)
+            merge_item(merged[match], item, same_cell=same_cell_match)
         return merged
 
     def __call__(
@@ -3116,7 +3434,10 @@ class OpenAIBBoxRecoveryReviewer:
         local_only_tables = 0
         for table in tables:
             is_form_region = bool(table.get("form_region"))
-            if mineru_local_only:
+            is_page_region = bool(table.get("page_region"))
+            allow_marker_merges = bool(table.get("allow_marker_merges"))
+            allow_orphan_recovery = bool(table.get("allow_orphan_recovery"))
+            if mineru_local_only and not is_page_region:
                 local_only_tables += 1
             pixel_started = time.monotonic()
             try:
@@ -3126,12 +3447,16 @@ class OpenAIBBoxRecoveryReviewer:
                     table.get("bbox", []),
                 )
                 self.diagonal_rules_removed += len(diagonal_rules)
-                suspicious = self._suspicious_cells(
-                    image,
-                    page_size,
-                    table,
-                    missing_only=mineru_local_only,
-                    diagonal_rules=diagonal_rules,
+                suspicious = (
+                    []
+                    if is_page_region
+                    else self._suspicious_cells(
+                        image,
+                        page_size,
+                        table,
+                        missing_only=mineru_local_only,
+                        diagonal_rules=diagonal_rules,
+                    )
                 )
             finally:
                 pixel_analysis_seconds += time.monotonic() - pixel_started
@@ -3166,7 +3491,10 @@ class OpenAIBBoxRecoveryReviewer:
             )
             list_marker_items = (
                 []
-                if is_form_region or table.get("disable_marker_merges")
+                if (
+                    table.get("disable_marker_merges")
+                    or (is_form_region and not allow_marker_merges)
+                )
                 else self._table_list_marker_proposals(table, list_marker_limit)
             )
             ink_marker_limit = min(
@@ -3186,7 +3514,10 @@ class OpenAIBBoxRecoveryReviewer:
             try:
                 ink_marker_items = (
                     []
-                    if is_form_region or table.get("disable_marker_merges")
+                    if (
+                        table.get("disable_marker_merges")
+                        or (is_form_region and not allow_marker_merges)
+                    )
                     else self._table_ink_marker_proposals(
                         image,
                         page_size,
@@ -3285,7 +3616,10 @@ class OpenAIBBoxRecoveryReviewer:
             try:
                 orphan_items = (
                     []
-                    if is_form_region or table.get("disable_orphan_recovery")
+                    if (
+                        table.get("disable_orphan_recovery")
+                        or (is_form_region and not allow_orphan_recovery)
+                    )
                     else self._table_orphan_proposals(
                         image,
                         page_size,
@@ -3324,7 +3658,8 @@ class OpenAIBBoxRecoveryReviewer:
                 local_count = len(local_items)
                 local_proposals += local_count
                 self.proposals_returned += local_count
-                tables_reviewed += 1
+                if not is_page_region:
+                    tables_reviewed += 1
                 batches.append(
                     {
                         "page": page_index,
@@ -3343,7 +3678,12 @@ class OpenAIBBoxRecoveryReviewer:
                         ),
                     }
                 )
-                if not self.config.get("review_after_local_recovery", False):
+                # The page scope is a residual pixel scan. It has no Cell
+                # semantics for the VLM to review, so never spend a table
+                # request or table-review budget on it.
+                if is_page_region or not self.config.get(
+                    "review_after_local_recovery", False
+                ):
                     continue
                 remaining_proposals = max(
                     remaining_proposals - local_count,
