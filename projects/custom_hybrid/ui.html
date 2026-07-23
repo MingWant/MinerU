@@ -565,7 +565,7 @@
             <div class="sorting-metric"><strong id="sortingGroupsValue">-</strong><span>Groups</span></div>
             <div class="sorting-metric"><strong id="sortingUnresolvedValue">-</strong><span>Unresolved</span></div>
             <div class="sorting-metric"><strong id="sortingOrderValue">-</strong><span>Validated Order</span></div>
-            <div class="sorting-metric"><strong id="sortingModeValue">-</strong><span>Mode</span></div>
+            <div class="sorting-metric"><strong id="sortingModeValue">-</strong><span>Strategy / Mode</span></div>
           </div>
 
           <section class="sorting-section" aria-labelledby="sortingGroupsTitle">
@@ -1145,6 +1145,15 @@
   function formatSortingEvidence(group) {
     const groupInfo = group && typeof group === 'object' ? group : {};
     const lines = [];
+    if (groupInfo.document_kind) {
+      lines.push(`<div><strong>Document type:</strong> ${escapeHtml(humanizeSortingStatus(groupInfo.document_kind))}</div>`);
+    }
+    if (groupInfo.document_title) {
+      lines.push(`<div><strong>Title:</strong> ${escapeHtml(groupInfo.document_title)}</div>`);
+    }
+    if (groupInfo.boundary_reason) {
+      lines.push(`<div><strong>Boundary:</strong> ${escapeHtml(humanizeSortingStatus(groupInfo.boundary_reason))}</div>`);
+    }
     const identifiers = groupInfo.identifiers && typeof groupInfo.identifiers === 'object'
       ? Object.entries(groupInfo.identifiers)
       : [];
@@ -1219,10 +1228,24 @@
     sortingOrderValue.className = report.can_auto_sort
       ? 'sorting-value-success'
       : 'sorting-value-warning';
-    sortingModeValue.textContent = report.report_only
+    const strategy = report.grouping_strategy
+      ? humanizeSortingStatus(report.grouping_strategy)
+      : 'Page anchors';
+    const mode = report.report_only
       ? 'Report only'
       : humanizeSortingStatus(report.mode || 'unknown');
-    sortingGroupCount.textContent = `${groups.length} group${groups.length === 1 ? '' : 's'}`;
+    sortingModeValue.textContent = `${strategy} / ${mode}`;
+    const packet = report.packet_pagination && typeof report.packet_pagination === 'object'
+      ? report.packet_pagination
+      : null;
+    const inferredPacketPages = packet && Array.isArray(packet.inferred_page_ids)
+      ? packet.inferred_page_ids.length
+      : 0;
+    const packetSummary = packet
+      ? ` · Packet markers ${packet.observed_count ?? 0}/${packet.total ?? report.page_count ?? '-'}`
+        + (inferredPacketPages ? ` · ${inferredPacketPages} inferred` : '')
+      : '';
+    sortingGroupCount.textContent = `${groups.length} group${groups.length === 1 ? '' : 's'}${packetSummary}`;
     sortingGroupBody.innerHTML = groups.length
       ? groups.map(group => {
         const groupInfo = group && typeof group === 'object' ? group : {};

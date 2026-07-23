@@ -21,7 +21,8 @@ PAGE_SORTING_VERSION = 1
 REPORT_ONLY_MODE = "report_only"
 
 PAGE_WORD_RE = re.compile(
-    r"\bpage\s*([0-9A-Za-z|]+)\s*(?:of|/)\s*([0-9A-Za-z|]+)\b",
+    r"\bpage\s*([0-9A-Za-z|]+)\s*['’`·,.:;-]*\s*"
+    r"(?:of|/)\s*([0-9A-Za-z|]+)\b",
     re.IGNORECASE,
 )
 P_SHORT_RE = re.compile(
@@ -58,7 +59,8 @@ IDENTIFIER_RE = re.compile(
 )
 TOKEN_RE = re.compile(r"[a-z0-9]{2,}|[\u3400-\u9fff]{2,}")
 PAGE_MARKER_RE = re.compile(
-    r"\bpage\s*[0-9A-Za-z|]+\s*(?:of|/)\s*[0-9A-Za-z|]+\b|"
+    r"\bpage\s*[0-9A-Za-z|]+\s*['’`·,.:;-]*\s*"
+    r"(?:of|/)\s*[0-9A-Za-z|]+\b|"
     r"\bp\s*[.,]?\s*[0-9A-Za-z|]+\s*/\s*[0-9A-Za-z|]+\b",
     re.IGNORECASE,
 )
@@ -90,6 +92,43 @@ FAMILY_STOPWORDS = {
     "id",
     "form",
 }
+DOCUMENT_TITLE_BLOCK_TYPES = frozenset({"title", "heading", "table_caption"})
+DOCUMENT_KIND_PATTERNS = (
+    (
+        "letter_of_guarantee",
+        re.compile(r"\bletter\s+of\s+guarantee\b|保證書|擔保信", re.IGNORECASE),
+    ),
+    (
+        "statement_summary",
+        re.compile(
+            r"\bsummary\s+of\s+(?:the\s+)?statement\s+of\s+account\b|"
+            r"賬單摘要|帳單摘要",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "statement_of_account",
+        re.compile(
+            r"\bstatement\s+of\s+account\b|留醫賬單|住院賬單|住院帳單",
+            re.IGNORECASE,
+        ),
+    ),
+    ("invoice", re.compile(r"^\s*invoice\s*$|發票", re.IGNORECASE)),
+    ("receipt", re.compile(r"^\s*receipt\s*$|收據", re.IGNORECASE)),
+    (
+        "discharge_summary",
+        re.compile(r"\bdischarge\s+summary\b|出院總結|出院摘要", re.IGNORECASE),
+    ),
+    (
+        "medical_report",
+        re.compile(r"\bmedical\s+report\b|醫療報告|醫事報告", re.IGNORECASE),
+    ),
+    (
+        "claim_form",
+        re.compile(r"\bclaim\s+form\b|索償.*申請表|理賠.*申請表", re.IGNORECASE),
+    ),
+)
+PACKET_PAGINATION_MIN_COVERAGE = 0.60
 OCR_IDENTIFIER_CONFUSABLE_PAIRS = frozenset(
     {
         frozenset(("0", "o")),
@@ -165,6 +204,8 @@ class PageEvidence:
     evidence_text_count: int
     family_tokens: frozenset[str]
     identifiers: dict[str, tuple[str, ...]]
+    document_kind: str | None
+    document_title: str | None
 
     def best_candidate(
         self,
@@ -635,6 +676,26 @@ def _family_tokens(
     return frozenset(tokens)
 
 
+def _document_profile(
+    observations: Sequence[TextObservation],
+) -> tuple[str | None, str | None]:
+    """Classify strong document titles without using body-text semantics."""
+
+    seen: set[str] = set()
+    for observation in observations:
+        if observation.block_type not in DOCUMENT_TITLE_BLOCK_TYPES:
+            continue
+        title = " ".join(observation.text.split())
+        normalized = title.casefold()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        for kind, pattern in DOCUMENT_KIND_PATTERNS:
+            if pattern.search(title):
+                return kind, title
+    return None, None
+
+
 def build_manifest(
     middle_json: Mapping[str, Any],
     page_order: Sequence[Mapping[str, Any]] | None = None,
@@ -686,6 +747,7 @@ def build_evidence(
             page_size=size,
             candidates=_extract_candidates(observations, size),
         )
+        document_kind, document_title = _document_profile(observations)
         provisional = PageEvidence(
             page_id=record.page_id,
             physical_page_idx=record.physical_page_idx,
@@ -695,6 +757,8 @@ def build_evidence(
             evidence_text_count=len(observations),
             family_tokens=_family_tokens(observations, record.page_size),
             identifiers=_identifier_values(observations),
+            document_kind=document_kind,
+            document_title=document_title,
         )
         result.append(provisional)
     return result
@@ -881,6 +945,333 @@ def _page_strength(page: PageEvidence) -> tuple[int, int, int, int]:
     )
 
 
+def _is_packet_margin_candidate(
+    page: PageEvidence,
+    candidate: PageCandidate,
+) -> bool:
+    if candidate.source_type in {"header", "footer", "page_number"}:
+        return True
+    if page.page_size is None or candidate.bbox is None:
+        return False
+    height = page.page_size[1]
+    return candidate.bbox[3] <= height * 0.15 or candidate.bbox[1] >= height * 0.85
+
+
+def _detect_packet_pagination(
+    evidence: Sequence[PageEvidence],
+) -> dict[str, Any] | None:
+    """Detect a wrapper page sequence that validates the physical packet order."""
+
+    page_count = len(evidence)
+    if page_count < 3:
+        return None
+
+    observed: dict[str, PageCandidate] = {}
+    source_counts: dict[str, int] = {}
+    for page in evidence:
+        packet_candidates = [
+            candidate
+            for candidate in page.record.candidates
+            if candidate.explicit
+            and candidate.total == page_count
+            and _is_packet_margin_candidate(page, candidate)
+        ]
+        expected_current = page.physical_page_idx + 1
+        if any(candidate.current != expected_current for candidate in packet_candidates):
+            return None
+        matching = [
+            candidate
+            for candidate in packet_candidates
+            if candidate.current == expected_current
+        ]
+        if not matching:
+            continue
+        selected = max(matching, key=lambda item: item.confidence)
+        observed[page.page_id] = selected
+        source_counts[selected.source_type] = source_counts.get(selected.source_type, 0) + 1
+
+    coverage = len(observed) / page_count
+    if (
+        coverage < PACKET_PAGINATION_MIN_COVERAGE
+        or evidence[0].page_id not in observed
+        or evidence[-1].page_id not in observed
+    ):
+        return None
+    dominant_source, dominant_count = max(
+        source_counts.items(),
+        key=lambda item: (item[1], item[0]),
+    )
+    if dominant_count / len(observed) < 0.80:
+        return None
+
+    minimum_confidence = min(candidate.confidence for candidate in observed.values())
+    inferred_confidence = round(max(0.70, minimum_confidence - 0.10), 4)
+    pages: dict[str, dict[str, Any]] = {}
+    inferred_page_ids: list[str] = []
+    for page in evidence:
+        candidate = observed.get(page.page_id)
+        inferred = candidate is None
+        if inferred:
+            inferred_page_ids.append(page.page_id)
+        pages[page.page_id] = {
+            "current": page.physical_page_idx + 1,
+            "total": page_count,
+            "raw": candidate.raw if candidate is not None else None,
+            "source_type": (
+                candidate.source_type if candidate is not None else dominant_source
+            ),
+            "confidence": (
+                candidate.confidence if candidate is not None else inferred_confidence
+            ),
+            "inferred": inferred,
+        }
+    return {
+        "status": "recovered" if inferred_page_ids else "complete",
+        "total": page_count,
+        "observed_count": len(observed),
+        "coverage": round(coverage, 6),
+        "dominant_source_type": dominant_source,
+        "aligned_with_physical_order": True,
+        "inferred_page_ids": inferred_page_ids,
+        "resolved_order": [page.page_id for page in evidence],
+        "pages": pages,
+    }
+
+
+def _segment_identifier_conflict(
+    page: PageEvidence,
+    identifiers: Mapping[str, set[str]],
+) -> bool:
+    for key, values in page.identifiers.items():
+        existing = identifiers.get(key)
+        if not existing or not set(values).isdisjoint(existing):
+            continue
+        if (
+            len(values) == 1
+            and len(existing) == 1
+            and _is_ocr_near_identifier(values[0], next(iter(existing)))
+        ):
+            continue
+        return True
+    return False
+
+
+def _segment_packet_documents(
+    evidence: Sequence[PageEvidence],
+) -> list[dict[str, Any]]:
+    """Split an ordered packet only at strong title or identifier boundaries."""
+
+    segments: list[dict[str, Any]] = []
+    for page in evidence:
+        if not segments:
+            segments.append(
+                {
+                    "document_kind": page.document_kind,
+                    "document_title": page.document_title,
+                    "members": [page],
+                    "identifiers": {
+                        key: set(values) for key, values in page.identifiers.items()
+                    },
+                    "boundary_reason": "packet_start",
+                }
+            )
+            continue
+
+        current = segments[-1]
+        kind_change = bool(
+            page.document_kind
+            and current["document_kind"]
+            and page.document_kind != current["document_kind"]
+        )
+        identifier_change = _segment_identifier_conflict(
+            page,
+            current["identifiers"],
+        )
+        if kind_change or identifier_change:
+            reason = (
+                f"document_kind_change:{current['document_kind']}"
+                f"->{page.document_kind}"
+                if kind_change
+                else "identifier_change"
+            )
+            segments.append(
+                {
+                    "document_kind": page.document_kind,
+                    "document_title": page.document_title,
+                    "members": [page],
+                    "identifiers": {
+                        key: set(values) for key, values in page.identifiers.items()
+                    },
+                    "boundary_reason": reason,
+                }
+            )
+            continue
+
+        current["members"].append(page)
+        if current["document_kind"] is None and page.document_kind is not None:
+            current["document_kind"] = page.document_kind
+            current["document_title"] = page.document_title
+        for key, values in page.identifiers.items():
+            current["identifiers"].setdefault(key, set()).update(values)
+
+    known_kinds = {
+        segment["document_kind"]
+        for segment in segments
+        if segment["document_kind"] is not None
+    }
+    if len(segments) < 2 or len(known_kinds) < 2:
+        return []
+    return segments
+
+
+def _packet_segment_group(
+    segment: Mapping[str, Any],
+    group_index: int,
+    packet_pagination: Mapping[str, Any],
+) -> dict[str, Any]:
+    members = list(segment["members"])
+    group_id = f"doc-{group_index:03d}"
+    resolved_order = [page.page_id for page in members]
+    family_tokens = sorted(
+        set().union(*(set(page.family_tokens) for page in members))
+    )
+    pages: list[dict[str, Any]] = []
+    decisions: list[dict[str, Any]] = []
+    for logical_position, page in enumerate(members, start=1):
+        packet_page = packet_pagination["pages"][page.page_id]
+        reasons = [
+            "packet_order_validated",
+            f"document_kind={segment['document_kind'] or 'unknown'}",
+        ]
+        if packet_page["inferred"]:
+            reasons.append("packet_page_inferred")
+        decisions.append(
+            {
+                "page_id": page.page_id,
+                "group_id": group_id,
+                "score": round(100.0 * float(packet_page["confidence"]), 3),
+                "reasons": reasons,
+                "selected_page_number": logical_position,
+            }
+        )
+        pages.append(
+            {
+                "page_id": page.page_id,
+                "physical_page_idx": page.physical_page_idx,
+                "source_page_idx": page.source_page_idx,
+                "candidates": [asdict(item) for item in page.record.candidates],
+                "selected": None,
+                "status": "ordered_by_packet_pagination",
+                "logical_position": logical_position,
+                "packet_page": packet_page,
+                "document_kind": page.document_kind,
+                "document_title": page.document_title,
+            }
+        )
+    return {
+        "group_id": group_id,
+        "seed_page_id": members[0].page_id,
+        "expected_total": len(members),
+        "member_page_ids": resolved_order,
+        "identifiers": {
+            key: sorted(values)
+            for key, values in sorted(segment["identifiers"].items())
+        },
+        "family_tokens": family_tokens,
+        "document_kind": segment["document_kind"],
+        "document_title": segment["document_title"],
+        "boundary_reason": segment["boundary_reason"],
+        "status": "complete",
+        "resolved_order": resolved_order,
+        "duplicates": {},
+        "missing_numbers": [],
+        "unexpected_numbers": [],
+        "ambiguous_pages": {},
+        "pages": pages,
+        "decisions": decisions,
+    }
+
+
+def _analyze_packet_segments(
+    evidence: Sequence[PageEvidence],
+    segments: Sequence[Mapping[str, Any]],
+    packet_pagination: Mapping[str, Any],
+    semantic_report: Mapping[str, Any] | None,
+    mode: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    groups = [
+        _packet_segment_group(segment, index, packet_pagination)
+        for index, segment in enumerate(segments, start=1)
+    ]
+    proposed_document_order = [
+        {
+            "group_id": group["group_id"],
+            "seed_page_id": group["seed_page_id"],
+            "document_kind": group["document_kind"],
+            "resolved_order": group["resolved_order"],
+            "status": group["status"],
+        }
+        for group in groups
+    ]
+    report = SortingReport(
+        version=PAGE_SORTING_VERSION,
+        mode=mode,
+        status="complete",
+        page_count=len(evidence),
+        anchor_count=len(groups),
+        group_count=len(groups),
+        can_auto_sort=True,
+        physical_order=[page.page_id for page in evidence],
+        proposed_document_order=proposed_document_order,
+        unresolved=[],
+        groups=groups,
+        semantic_quality=_semantic_quality_summary(semantic_report),
+    ).to_dict()
+    report.update(
+        {
+            "assignment_count": len(evidence) - len(groups),
+            "unresolved_count": 0,
+            "report_only": True,
+            "grouping_strategy": "packet_document_segmentation",
+            "packet_pagination": dict(packet_pagination),
+            "packet_groups": [
+                {
+                    "group_id": "packet-001",
+                    "member_document_group_ids": [
+                        group["group_id"] for group in groups
+                    ],
+                    "resolved_document_order": [
+                        group["group_id"] for group in groups
+                    ],
+                }
+            ],
+        }
+    )
+
+    group_by_page = {
+        page_id: group["group_id"]
+        for group in groups
+        for page_id in group["member_page_ids"]
+    }
+    manifest_pages: list[dict[str, Any]] = []
+    for page in evidence:
+        entry = _page_manifest_entry(page, semantic_report)
+        entry["packet_page"] = packet_pagination["pages"][page.page_id]
+        entry["document_group_id"] = group_by_page[page.page_id]
+        manifest_pages.append(entry)
+    manifest = {
+        "version": PAGE_SORTING_VERSION,
+        "mode": mode,
+        "page_count": len(evidence),
+        "anchor_count": len(groups),
+        "grouping_strategy": "packet_document_segmentation",
+        "packet_pagination": dict(packet_pagination),
+        "pages": manifest_pages,
+        "semantic_quality": _semantic_quality_summary(semantic_report),
+    }
+    return manifest, report
+
+
 def _candidate_dict(candidate: PageCandidate | None) -> dict[str, Any] | None:
     return asdict(candidate) if candidate is not None else None
 
@@ -1015,6 +1406,8 @@ def _page_manifest_entry(page: PageEvidence, semantic_report: Mapping[str, Any] 
         "identifiers": {
             key: list(values) for key, values in sorted(page.identifiers.items())
         },
+        "document_kind": page.document_kind,
+        "document_title": page.document_title,
         "selection_status": selection_status,
         "selected_candidate": (
             asdict(selected) if selection_status == "selected" else None
@@ -1038,6 +1431,22 @@ def analyze_middle_json(
     if not isinstance(pages, list):
         raise ValueError("middle_json.pdf_info must be a list")
     evidence = build_evidence(middle_json, page_order)
+
+    # A fused packet can carry one continuous physical page sequence while
+    # containing several adjacent documents.  Validate that wrapper sequence
+    # first; only then use strong document titles/identifiers to segment it.
+    packet_pagination = _detect_packet_pagination(evidence)
+    if packet_pagination is not None:
+        packet_segments = _segment_packet_documents(evidence)
+        if packet_segments:
+            return _analyze_packet_segments(
+                evidence,
+                packet_segments,
+                packet_pagination,
+                semantic_report,
+                mode,
+            )
+
     anchors: list[tuple[PageEvidence, PageCandidate]] = []
     for page in evidence:
         candidate, reason = page.best_candidate()

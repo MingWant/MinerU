@@ -72,6 +72,25 @@ def payload(pages: list[dict]) -> dict:
     return {"pdf_info": result}
 
 
+def titled_packet_page(
+    current: int,
+    total: int,
+    title: str,
+    marker: str | None = None,
+) -> dict:
+    page = numbered_page(
+        current,
+        total,
+        family="Packet",
+        marker=marker or f"Page {current} of {total}",
+    )
+    page["preproc_blocks"].insert(
+        0,
+        text_block(title, "title", [80, 60, 520, 100]),
+    )
+    return page
+
+
 class PageSortingTests(unittest.TestCase):
     def test_groups_and_sorts_interleaved_documents_with_different_totals(self) -> None:
         alpha = [
@@ -92,6 +111,129 @@ class PageSortingTests(unittest.TestCase):
         groups = {group["expected_total"]: group for group in report["groups"]}
         self.assertEqual(groups[3]["resolved_order"], ["p0002", "p0004", "p0000"])
         self.assertEqual(groups[2]["resolved_order"], ["p0003", "p0001"])
+        self.assertNotEqual(
+            report.get("grouping_strategy"),
+            "packet_document_segmentation",
+        )
+
+    def test_noisy_packet_page_marker_is_recognized(self) -> None:
+        page = numbered_page(3, 17, marker="Page 3 'of 17")
+
+        evidence = build_evidence(payload([page]))
+
+        self.assertEqual(len(evidence[0].record.candidates), 1)
+        candidate = evidence[0].record.candidates[0]
+        self.assertEqual((candidate.current, candidate.total), (3, 17))
+        self.assertEqual(candidate.raw, "Page 3 'of 17")
+
+    def test_packet_recovers_one_missing_wrapper_marker(self) -> None:
+        pages = [
+            titled_packet_page(1, 4, "INVOICE"),
+            titled_packet_page(2, 4, "INVOICE"),
+            titled_packet_page(3, 4, "Letter of Guarantee"),
+            titled_packet_page(4, 4, "Letter of Guarantee"),
+        ]
+        pages[2]["discarded_blocks"] = []
+
+        manifest, report = analyze_middle_json(payload(pages))
+
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(report["grouping_strategy"], "packet_document_segmentation")
+        self.assertEqual(report["packet_pagination"]["status"], "recovered")
+        self.assertEqual(report["packet_pagination"]["inferred_page_ids"], ["p0002"])
+        self.assertTrue(manifest["pages"][2]["packet_page"]["inferred"])
+        self.assertEqual(
+            [group["member_page_ids"] for group in report["groups"]],
+            [["p0000", "p0001"], ["p0002", "p0003"]],
+        )
+
+    def test_packet_does_not_infer_a_missing_first_marker(self) -> None:
+        pages = [
+            titled_packet_page(1, 4, "INVOICE"),
+            titled_packet_page(2, 4, "INVOICE"),
+            titled_packet_page(3, 4, "Letter of Guarantee"),
+            titled_packet_page(4, 4, "Letter of Guarantee"),
+        ]
+        pages[0]["discarded_blocks"] = []
+
+        _manifest, report = analyze_middle_json(payload(pages))
+
+        self.assertNotEqual(
+            report.get("grouping_strategy"),
+            "packet_document_segmentation",
+        )
+        self.assertFalse(report["can_auto_sort"])
+
+    def test_packet_does_not_overwrite_a_conflicting_wrapper_marker(self) -> None:
+        pages = [
+            titled_packet_page(1, 4, "INVOICE"),
+            titled_packet_page(2, 4, "INVOICE", marker="Page 3 of 4"),
+            titled_packet_page(3, 4, "Letter of Guarantee"),
+            titled_packet_page(4, 4, "Letter of Guarantee"),
+        ]
+
+        _manifest, report = analyze_middle_json(payload(pages))
+
+        self.assertNotEqual(
+            report.get("grouping_strategy"),
+            "packet_document_segmentation",
+        )
+        self.assertFalse(report["can_auto_sort"])
+        self.assertEqual(report["status"], "needs_review")
+        self.assertEqual(report["unresolved"][0]["reason"], "ambiguous_group")
+
+    def test_packet_titles_split_four_adjacent_subdocuments(self) -> None:
+        pages = [
+            titled_packet_page(1, 6, "INVOICE"),
+            titled_packet_page(2, 6, "Summary of Statement of Account"),
+            titled_packet_page(3, 6, "留醫賬單"),
+            titled_packet_page(4, 6, "留醫賬單"),
+            titled_packet_page(5, 6, "留醫賬單"),
+            titled_packet_page(6, 6, "Letter of Guarantee"),
+        ]
+
+        _manifest, report = analyze_middle_json(payload(pages))
+
+        self.assertEqual(report["status"], "complete")
+        self.assertTrue(report["can_auto_sort"])
+        self.assertEqual(report["group_count"], 4)
+        self.assertEqual(
+            [group["document_kind"] for group in report["groups"]],
+            [
+                "invoice",
+                "statement_summary",
+                "statement_of_account",
+                "letter_of_guarantee",
+            ],
+        )
+        self.assertEqual(
+            [group["resolved_order"] for group in report["groups"]],
+            [
+                ["p0000"],
+                ["p0001"],
+                ["p0002", "p0003", "p0004"],
+                ["p0005"],
+            ],
+        )
+
+    def test_single_document_packet_keeps_existing_sorting_path(self) -> None:
+        pages = [
+            titled_packet_page(index, 3, "INVOICE")
+            for index in range(1, 4)
+        ]
+
+        _manifest, report = analyze_middle_json(payload(pages))
+
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(report["group_count"], 1)
+        self.assertNotEqual(
+            report.get("grouping_strategy"),
+            "packet_document_segmentation",
+        )
+        self.assertEqual(
+            report["groups"][0]["resolved_order"],
+            ["p0000", "p0001", "p0002"],
+        )
 
     def test_same_template_uses_identifier_present_on_every_page(self) -> None:
         left = [

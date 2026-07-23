@@ -2191,6 +2191,15 @@ def fuse_output_trees(
                 document_summary["page_sorting"] = {
                     "status": sorting_summary.get("status"),
                     "can_auto_sort": sorting_summary.get("can_auto_sort", False),
+                    "grouping_strategy": sorting_summary.get("grouping_strategy"),
+                    "packet_pagination_status": (
+                        sorting_summary.get("packet_pagination", {}).get("status")
+                        if isinstance(
+                            sorting_summary.get("packet_pagination"),
+                            Mapping,
+                        )
+                        else None
+                    ),
                     "manifest": (
                         str(sorting_manifest_path)
                         if sorting_manifest_path.is_file()
