@@ -10,6 +10,7 @@ from reportlab.pdfgen import canvas
 
 from .enum_class import BlockType, ContentType, SplitFlag
 from .table_cell_quality import (
+    assess_table_cell_geometry,
     cell_content_bboxes,
     deduplicate_bboxes,
 )
@@ -35,7 +36,7 @@ DIRECT_LAYOUT_BBOX_BLOCK_TYPES = TEXT_LIKE_BLOCK_TYPES_FOR_BBOX | {
 
 # span.pdf 从这些结构性 block 中收集内部 span bbox。
 SPAN_SOURCE_BLOCK_TYPES = DIRECT_LAYOUT_BBOX_BLOCK_TYPES
-BBOX_RENDERER_VERSION = 10
+BBOX_RENDERER_VERSION = 11
 
 
 def _get_layout_source_blocks(page):
@@ -142,9 +143,21 @@ def _form_table_overlay_bboxes(page):
         bbox = _valid_overlay_bbox(table.get("bbox"))
         if bbox is not None:
             regions.append(bbox)
-        for cell in table.get("cells", []):
-            if not isinstance(cell, dict):
-                continue
+        raw_cells = table.get("cells", [])
+        table_cells = (
+            [cell for cell in raw_cells if isinstance(cell, dict)]
+            if isinstance(raw_cells, list)
+            else []
+        )
+        # A demoted pseudo Table retains its original Cell windows for audit and
+        # targeted recovery. Some recognizers produce overlapping sliding
+        # windows instead of a real grid; drawing those windows obscures the
+        # final content-tight OCR boxes. Keep the outer structural region, but
+        # expose original Cells only when their shared geometry gate is reliable.
+        geometry = assess_table_cell_geometry({"table_cells": table_cells})
+        if not geometry.reliable:
+            continue
+        for cell in table_cells:
             cell_bbox = _valid_overlay_bbox(cell.get("bbox"))
             if cell_bbox is not None:
                 cells.append(cell_bbox)

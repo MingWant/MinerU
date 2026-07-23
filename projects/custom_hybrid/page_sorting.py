@@ -90,6 +90,23 @@ FAMILY_STOPWORDS = {
     "id",
     "form",
 }
+OCR_IDENTIFIER_CONFUSABLE_PAIRS = frozenset(
+    {
+        frozenset(("0", "o")),
+        frozenset(("1", "i")),
+        # OCR can split a printed K into ``1<``; identifier cleanup removes <.
+        frozenset(("1", "k")),
+        frozenset(("1", "l")),
+        frozenset(("2", "z")),
+        frozenset(("5", "s")),
+        frozenset(("6", "g")),
+        frozenset(("8", "b")),
+        frozenset(("9", "q")),
+    }
+)
+MIN_OCR_NEAR_IDENTIFIER_LENGTH = 8
+MIN_OCR_NEAR_PAGE_CONFIDENCE = 0.90
+MIN_OCR_NEAR_SHARED_FAMILY_TOKENS = 2
 OCR_DIGIT_TRANSLATION = str.maketrans(
     {
         "O": "0",
@@ -696,12 +713,95 @@ def _add_to_group(group: DocumentGroup, page: PageEvidence) -> None:
         group.identifiers.setdefault(key, set()).update(values)
 
 
-def _identifier_conflict(page: PageEvidence, group: DocumentGroup) -> str | None:
+def _is_ocr_near_identifier(left: str, right: str) -> bool:
+    """Return true only for one known OCR-confusable substitution."""
+
+    if (
+        left == right
+        or len(left) != len(right)
+        or len(left) < MIN_OCR_NEAR_IDENTIFIER_LENGTH
+    ):
+        return False
+    differences = [
+        (left_char, right_char)
+        for left_char, right_char in zip(left, right)
+        if left_char != right_char
+    ]
+    return bool(
+        len(differences) == 1
+        and frozenset(differences[0]) in OCR_IDENTIFIER_CONFUSABLE_PAIRS
+    )
+
+
+def _supports_ocr_near_identifier(
+    page: PageEvidence,
+    group: DocumentGroup,
+    candidate: PageCandidate | None,
+) -> bool:
+    """Require independent structure before relaxing an identifier conflict."""
+
+    if (
+        candidate is None
+        or not candidate.explicit
+        or candidate.total != group.expected_total
+        or candidate.confidence < MIN_OCR_NEAR_PAGE_CONFIDENCE
+    ):
+        return False
+
+    occupied_slots: set[int] = set()
+    for member in group.members:
+        selected, status = member.best_candidate(group.expected_total)
+        if selected is None or status != "selected":
+            return False
+        occupied_slots.add(selected.current)
+    missing_slots = set(range(1, group.expected_total + 1)) - occupied_slots
+    if (
+        len(group.members) != group.expected_total - 1
+        or len(occupied_slots) != len(group.members)
+        or missing_slots != {candidate.current}
+    ):
+        return False
+
+    shared_family = page.family_tokens & group.family_tokens
+    return bool(
+        len(shared_family) >= MIN_OCR_NEAR_SHARED_FAMILY_TOKENS
+        and any(token in FAMILY_HINTS for token in shared_family)
+    )
+
+
+def _identifier_match_evidence(
+    page: PageEvidence,
+    group: DocumentGroup,
+    candidate: PageCandidate | None,
+) -> tuple[list[str], list[str], list[str]]:
+    exact: list[str] = []
+    ocr_near: list[str] = []
+    conflicts: list[str] = []
+    structural_support: bool | None = None
     for key, values in page.identifiers.items():
         existing = group.identifiers.get(key)
-        if existing and set(values).isdisjoint(existing):
-            return f"{key}_conflict"
-    return None
+        if not existing:
+            continue
+        if not set(values).isdisjoint(existing):
+            exact.append(key)
+            continue
+        if structural_support is None:
+            structural_support = _supports_ocr_near_identifier(
+                page,
+                group,
+                candidate,
+            )
+        near_match = bool(
+            structural_support
+            and len(values) == 1
+            and len(existing) == 1
+            and _is_ocr_near_identifier(values[0], next(iter(existing)))
+        )
+        if near_match:
+            ocr_near.append(key)
+        else:
+            conflicts.append(key)
+    return exact, ocr_near, conflicts
 
 
 def _group_score(
@@ -718,19 +818,25 @@ def _group_score(
         if candidate.total != group.expected_total:
             return float("-inf"), ["total_conflict"], candidate
         reasons.append("total_match")
-    identifier_conflict = _identifier_conflict(page, group)
-    if identifier_conflict is not None:
-        return float("-inf"), [identifier_conflict], candidate
+    exact_ids, ocr_near_ids, identifier_conflicts = _identifier_match_evidence(
+        page,
+        group,
+        candidate,
+    )
+    if identifier_conflicts:
+        return (
+            float("-inf"),
+            [f"{key}_conflict" for key in identifier_conflicts],
+            candidate,
+        )
 
     score = 0.0
-    shared_ids = [
-        key
-        for key, values in page.identifiers.items()
-        if key in group.identifiers and not set(values).isdisjoint(group.identifiers[key])
-    ]
-    if shared_ids:
-        score += 105.0 + 12.0 * len(shared_ids)
-        reasons.extend(f"{key}_match" for key in shared_ids)
+    if exact_ids:
+        score += 105.0 + 12.0 * len(exact_ids)
+        reasons.extend(f"{key}_match" for key in exact_ids)
+    if ocr_near_ids:
+        score += 72.0 + 8.0 * len(ocr_near_ids)
+        reasons.extend(f"{key}_ocr_near_match" for key in ocr_near_ids)
 
     if page.family_tokens and group.family_tokens:
         similarity = _jaccard(page.family_tokens, group.family_tokens)
@@ -999,14 +1105,25 @@ def analyze_middle_json(
                 continue
             best_score, best_group, reasons, candidate = scored[0]
             second_score = scored[1][0] if len(scored) > 1 else float("-inf")
-            exact_id = any(reason.endswith("_match") for reason in reasons)
+            ocr_near_id = any(
+                reason.endswith("_ocr_near_match") for reason in reasons
+            )
+            exact_id = any(
+                reason.endswith("_match") and not reason.endswith("_ocr_near_match")
+                for reason in reasons
+            )
             minimum_score = 25.0
-            margin_required = 8.0 if exact_id else 12.0
+            if exact_id:
+                margin_required = 8.0
+            elif ocr_near_id:
+                margin_required = 10.0
+            else:
+                margin_required = 12.0
             ambiguous = best_score < minimum_score or (
                 len(scored) > 1 and best_score - second_score < margin_required
             )
             duplicate_slot = "duplicate_logical_slot" in reasons
-            if ambiguous or (duplicate_slot and not exact_id):
+            if ambiguous or (duplicate_slot and not (exact_id or ocr_near_id)):
                 unresolved[page.page_id] = {
                     "page_id": page.page_id,
                     "physical_page_idx": page.physical_page_idx,

@@ -41,6 +41,7 @@ def numbered_page(
     total: str | int,
     family: str = "Example Claim Form",
     identifier: str | None = None,
+    identifier_label: str = "Case ID",
     page_idx: int | None = None,
     marker: str | None = None,
 ) -> dict:
@@ -55,7 +56,10 @@ def numbered_page(
     }
     if identifier is not None:
         page["preproc_blocks"].append(
-            text_block(f"Case ID: {identifier}", bbox=[350, 80, 570, 105])
+            text_block(
+                f"{identifier_label}: {identifier}",
+                bbox=[350, 80, 570, 105],
+            )
         )
     return page
 
@@ -161,6 +165,119 @@ class PageSortingTests(unittest.TestCase):
         self.assertTrue(
             all(item["reason"] == "ambiguous_group" for item in report["unresolved"])
         )
+
+    def test_ocr_near_identifier_completes_unique_missing_slot(self) -> None:
+        pages = [
+            numbered_page(
+                3,
+                3,
+                "Accident Benefit Claim Form",
+                "SLHK5544332",
+                identifier_label="Policy No.",
+            ),
+            numbered_page(1, 3, "Accident Benefit Claim Form"),
+            numbered_page(
+                2,
+                3,
+                "Accident Benefit Claim Form",
+                "SLH1<554-4332",
+                identifier_label="Policy No.",
+            ),
+        ]
+
+        _manifest, report = analyze_middle_json(payload(pages))
+
+        self.assertEqual(report["status"], "complete")
+        self.assertTrue(report["can_auto_sort"])
+        self.assertEqual(
+            report["groups"][0]["resolved_order"],
+            ["p0001", "p0002", "p0000"],
+        )
+        decisions = {
+            decision["page_id"]: decision
+            for decision in report["groups"][0]["decisions"]
+        }
+        self.assertIn("policy_ocr_near_match", decisions["p0002"]["reasons"])
+
+    def test_non_confusable_identifier_difference_remains_hard_conflict(self) -> None:
+        pages = [
+            numbered_page(
+                1,
+                3,
+                "Accident Benefit Claim Form",
+                "SLHK5544332",
+                identifier_label="Policy No.",
+            ),
+            numbered_page(
+                2,
+                3,
+                "Accident Benefit Claim Form",
+                "SLHM5544332",
+                identifier_label="Policy No.",
+            ),
+            numbered_page(
+                3,
+                3,
+                "Accident Benefit Claim Form",
+                "SLHK5544332",
+                identifier_label="Policy No.",
+            ),
+        ]
+
+        _manifest, report = analyze_middle_json(payload(pages))
+
+        self.assertEqual(report["status"], "needs_review")
+        self.assertFalse(report["can_auto_sort"])
+        unresolved = {item["page_id"]: item for item in report["unresolved"]}
+        self.assertEqual(unresolved["p0001"]["reason"], "no_compatible_group")
+
+    def test_ocr_near_identifier_requires_unique_missing_slot(self) -> None:
+        pages = [
+            numbered_page(
+                1,
+                4,
+                "Accident Benefit Claim Form",
+                "SLHK5544332",
+                identifier_label="Policy No.",
+            ),
+            numbered_page(
+                2,
+                4,
+                "Accident Benefit Claim Form",
+                "SLH1<554-4332",
+                identifier_label="Policy No.",
+            ),
+        ]
+
+        _manifest, report = analyze_middle_json(payload(pages))
+
+        self.assertEqual(report["status"], "needs_review")
+        unresolved = {item["page_id"]: item for item in report["unresolved"]}
+        self.assertEqual(unresolved["p0001"]["reason"], "no_compatible_group")
+
+    def test_ocr_near_identifier_requires_matching_family(self) -> None:
+        pages = [
+            numbered_page(
+                1,
+                2,
+                "Accident Benefit Claim Form",
+                "SLHK5544332",
+                identifier_label="Policy No.",
+            ),
+            numbered_page(
+                2,
+                2,
+                "Warehouse Invoice",
+                "SLH1<554-4332",
+                identifier_label="Policy No.",
+            ),
+        ]
+
+        _manifest, report = analyze_middle_json(payload(pages))
+
+        self.assertEqual(report["status"], "needs_review")
+        unresolved = {item["page_id"]: item for item in report["unresolved"]}
+        self.assertEqual(unresolved["p0001"]["reason"], "no_compatible_group")
 
     def test_missing_page_keeps_group_incomplete(self) -> None:
         pages = [numbered_page(1, 3), numbered_page(3, 3)]

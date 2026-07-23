@@ -47,6 +47,7 @@ from projects.custom_hybrid.workflow import (
     _resolve_visualization_pdf,
     _start_parameter_proxy,
     _stop_parameter_proxy,
+    _visualization_renderer_is_current,
 )
 from mineru.utils.draw_bbox import _form_table_overlay_bboxes
 
@@ -74,6 +75,46 @@ class WorkflowTests(unittest.TestCase):
             cells,
             [[10.0, 10.0, 190.0, 60.0], [10.0, 210.0, 190.0, 250.0]],
         )
+
+    def test_span_overlay_hides_overlapping_demoted_pseudo_table_cells(self):
+        regions, cells = _form_table_overlay_bboxes(
+            {
+                "demoted_narrative_tables": [
+                    {
+                        "bbox": [10, 10, 190, 290],
+                        "cells": [
+                            {"bbox": [15, 20, 170, 100]},
+                            {"bbox": [16, 50, 171, 130]},
+                            {"bbox": [17, 80, 172, 160]},
+                            {"bbox": [18, 110, 173, 190]},
+                        ],
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(regions, [[10.0, 10.0, 190.0, 290.0]])
+        self.assertEqual(cells, [])
+
+    def test_visualization_renderer_version_invalidates_cached_preview(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parse_dir = Path(temp_dir)
+            marker_path = parse_dir / "sample_visualization.json"
+            marker = {
+                "bbox_renderer_version": 10,
+                "form_detector_version": 1,
+                "form_segmenter_version": 4,
+            }
+            marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+            self.assertFalse(
+                _visualization_renderer_is_current(parse_dir, "sample")
+            )
+            marker["bbox_renderer_version"] = 11
+            marker_path.write_text(json.dumps(marker), encoding="utf-8")
+            self.assertTrue(
+                _visualization_renderer_is_current(parse_dir, "sample")
+            )
 
     def test_semantic_markdown_replaces_primary_and_preserves_native_ab(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -371,7 +412,7 @@ class WorkflowTests(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
-            self.assertEqual(marker["bbox_renderer_version"], 10)
+            self.assertEqual(marker["bbox_renderer_version"], 11)
             self.assertEqual(marker["form_detector_version"], 1)
             self.assertEqual(marker["form_segmenter_version"], 4)
             self.assertTrue((parse_dir / "renamed_forms.pdf").is_file())
