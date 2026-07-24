@@ -357,6 +357,66 @@ class FusionTests(unittest.TestCase):
         self.assertEqual(stats["rejected"], 1)
         self.assertEqual(decisions[1]["reason"], "cross_cell_duplicate_bbox")
 
+    def test_bbox_recovery_deduplicates_table_fringe_and_page_scan(self):
+        page = structured_middle(
+            "table",
+            html="<table><tr><td>Header</td></tr></table>",
+            table_cells=[
+                {
+                    "bbox": [10, 10, 190, 80],
+                    "text": "Header",
+                    "content_spans": [
+                        {"bbox": [20, 18, 80, 30], "text": "Header"}
+                    ],
+                    "row_start": 0,
+                    "row_end": 0,
+                    "col_start": 0,
+                    "col_end": 0,
+                }
+            ],
+        )["pdf_info"][0]
+        settings = FusionSettings.from_mapping(
+            {
+                "mode": "bbox_vlm",
+                "recovery": {"page_recovery_enabled": True},
+            }
+        )
+        build_bbox_recovery_manifest(page, 0, settings)
+
+        stats, decisions, _batches, unchanged = apply_bbox_recovery_proposals(
+            page,
+            0,
+            {
+                "items": [
+                    {
+                        "action": "add_fringe",
+                        "table_id": "p0-table-0",
+                        "cell_id": "p0-t0-c0",
+                        "target_id": "",
+                        "bbox": [60, 90, 150, 104],
+                        "confidence": 0.92,
+                        "recovery_source": "local_table_fringe_ink",
+                    },
+                    {
+                        "action": "add_orphan",
+                        "table_id": "p0-page-recovery",
+                        "cell_id": "p0-page-c0",
+                        "target_id": "",
+                        "bbox": [60, 90, 150, 104],
+                        "confidence": 0.92,
+                        "recovery_source": "local_table_orphan_ink",
+                    },
+                ]
+            },
+            settings,
+            remaining_document_budget=10,
+        )
+
+        self.assertEqual(stats["accepted"], 1)
+        self.assertEqual(stats["rejected"], 1)
+        self.assertEqual(decisions[1]["reason"], "duplicate_recovery_bbox")
+        self.assertTrue(unchanged)
+
     def test_bbox_recovery_accepts_locally_merged_spanning_content_box(self):
         cells = [
             {

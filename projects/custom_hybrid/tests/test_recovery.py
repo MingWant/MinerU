@@ -1511,6 +1511,74 @@ class BBoxRecoveryReviewerTests(unittest.TestCase):
         self.assertGreater(fringe[0]["bbox"][1], 75.0)
         self.assertLess(fringe[0]["bbox"][3] - fringe[0]["bbox"][1], 24.0)
 
+    def test_table_fringe_recovers_multiline_notice_and_adjacent_amount(self):
+        from PIL import Image, ImageDraw, ImageFont
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            image = Image.new("RGB", (260, 150), "white")
+            draw = ImageDraw.Draw(image)
+            font = ImageFont.load_default(size=14)
+            draw.rectangle([10, 10, 250, 60], outline="black", width=2)
+            draw.rectangle([175, 68, 250, 118], outline="black", width=2)
+            draw.text((64, 72), "Bill is due", font=font, fill="black")
+            draw.line([64, 87, 169, 87], fill="black", width=1)
+            draw.text((76, 94), "Please pay", font=font, fill="black")
+            draw.line([76, 109, 169, 109], fill="black", width=1)
+            draw.text((188, 82), "840.0", font=font, fill="black")
+            image.save(image_path)
+            image.close()
+            reviewer = OpenAIBBoxRecoveryReviewer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "mineru-local",
+                    "render_scale": 1.0,
+                    "checkbox_recovery_enabled": False,
+                    "max_requests_per_document": 0,
+                },
+            )
+            try:
+                result = reviewer(
+                    0,
+                    [260, 150],
+                    [
+                        {
+                            "id": "p0-table-0",
+                            "bbox": [10, 10, 250, 60],
+                            "page_existing": [],
+                            "cells": [
+                                {
+                                    "id": "p0-t0-c0",
+                                    "bbox": [10, 10, 250, 55],
+                                    "text": "Header",
+                                    "existing": [
+                                        {
+                                            "id": "p0-t0-c0-b0",
+                                            "bbox": [20, 20, 80, 32],
+                                            "text": "Header",
+                                        }
+                                    ],
+                                    "reasons": [],
+                                }
+                            ],
+                        }
+                    ],
+                )
+            finally:
+                reviewer.close()
+
+        fringe = [
+            item for item in result["items"] if item.get("action") == "add_fringe"
+        ]
+        notice_lines = [item for item in fringe if item["bbox"][2] < 175.0]
+        amounts = [item for item in fringe if item["bbox"][0] > 175.0]
+        self.assertGreaterEqual(len(notice_lines), 2)
+        self.assertGreaterEqual(len(amounts), 1)
+        self.assertTrue(
+            all(item["bbox"][3] - item["bbox"][1] < 24.0 for item in fringe)
+        )
+
     def test_table_fringe_rejects_empty_local_box_after_rule_removal(self):
         from PIL import Image, ImageDraw
 

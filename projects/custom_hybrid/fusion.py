@@ -2554,6 +2554,7 @@ def apply_bbox_recovery_proposals(
     ) = _bbox_recovery_lookup(page, page_index)
     table_counts: Counter[str] = Counter()
     accepted_count = 0
+    accepted_addition_bboxes: list[tuple[float, float, float, float]] = []
     for item in raw_items:
         if not isinstance(item, Mapping):
             stats["rejected"] += 1
@@ -2902,6 +2903,22 @@ def apply_bbox_recovery_proposals(
             "add_orphan",
             "add_fringe",
             "add_checkbox",
+        } and any(
+            _bbox_iou(bbox, accepted_bbox)
+            >= settings.bbox_recovery_duplicate_iou
+            for accepted_bbox in accepted_addition_bboxes
+        ):
+            # Table-fringe and residual-page scans intentionally overlap near
+            # a Table boundary. Their manifests have different ownership
+            # scopes, so neither scope can always see an addition already
+            # accepted for the other one. Keep a response-local geometry guard
+            # to ensure the same physical line is transcribed only once.
+            reason = "duplicate_recovery_bbox"
+        if reason is None and action in {
+            "add",
+            "add_orphan",
+            "add_fringe",
+            "add_checkbox",
         } and target_id not in {"", None}:
             reason = "unexpected_add_target"
         if reason is None and action in {
@@ -3197,6 +3214,13 @@ def apply_bbox_recovery_proposals(
             elif action == "merge_ink_marker":
                 stats["ink_marker_merged"] += 1
         accepted_count += 1
+        if action in {
+            "add",
+            "add_orphan",
+            "add_fringe",
+            "add_checkbox",
+        }:
+            accepted_addition_bboxes.append(bbox)
         table_counts[table_key] += 1
         stats["accepted"] += 1
         decision.update(result="accepted", bbox=list(bbox))
