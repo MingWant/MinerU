@@ -91,6 +91,21 @@ def titled_packet_page(
     return page
 
 
+def add_document_page_marker(
+    page: dict,
+    current: int,
+    total: int,
+) -> dict:
+    page["discarded_blocks"].append(
+        text_block(
+            f"Document Page {current} of {total}",
+            "footer",
+            [180, 740, 420, 760],
+        )
+    )
+    return page
+
+
 class PageSortingTests(unittest.TestCase):
     def test_groups_and_sorts_interleaved_documents_with_different_totals(self) -> None:
         alpha = [
@@ -141,10 +156,30 @@ class PageSortingTests(unittest.TestCase):
         self.assertEqual(report["grouping_strategy"], "packet_document_segmentation")
         self.assertEqual(report["packet_pagination"]["status"], "recovered")
         self.assertEqual(report["packet_pagination"]["inferred_page_ids"], ["p0002"])
+        self.assertEqual(report["grouping_status"], "complete")
+        self.assertEqual(report["ordering_status"], "preserved_packet_order")
+        self.assertIn(
+            "page_one_anchor",
+            report["packet_wrapper_policy"]["excluded_from"],
+        )
         self.assertTrue(manifest["pages"][2]["packet_page"]["inferred"])
+        self.assertTrue(
+            all(
+                candidate["evidence_role"] == "packet_wrapper"
+                for page in manifest["pages"]
+                for candidate in page["candidates"]
+            )
+        )
         self.assertEqual(
             [group["member_page_ids"] for group in report["groups"]],
             [["p0000", "p0001"], ["p0002", "p0003"]],
+        )
+        self.assertTrue(
+            all(
+                decision["selected_page_number"] is None
+                for group in report["groups"]
+                for decision in group["decisions"]
+            )
         )
 
     def test_packet_does_not_infer_a_missing_first_marker(self) -> None:
@@ -192,11 +227,21 @@ class PageSortingTests(unittest.TestCase):
             titled_packet_page(6, 6, "Letter of Guarantee"),
         ]
 
-        _manifest, report = analyze_middle_json(payload(pages))
+        manifest, report = analyze_middle_json(payload(pages))
 
         self.assertEqual(report["status"], "complete")
         self.assertTrue(report["can_auto_sort"])
         self.assertEqual(report["group_count"], 4)
+        self.assertEqual(report["grouping_status"], "complete")
+        self.assertEqual(report["ordering_status"], "preserved_packet_order")
+        self.assertTrue(report["can_auto_group"])
+        self.assertTrue(
+            all(
+                candidate["evidence_role"] == "packet_wrapper"
+                for page in manifest["pages"]
+                for candidate in page["candidates"]
+            )
+        )
         self.assertEqual(
             [group["document_kind"] for group in report["groups"]],
             [
@@ -216,13 +261,13 @@ class PageSortingTests(unittest.TestCase):
             ],
         )
 
-    def test_single_document_packet_keeps_existing_sorting_path(self) -> None:
+    def test_single_document_pagination_is_not_forced_to_packet_wrapper(self) -> None:
         pages = [
             titled_packet_page(index, 3, "INVOICE")
             for index in range(1, 4)
         ]
 
-        _manifest, report = analyze_middle_json(payload(pages))
+        manifest, report = analyze_middle_json(payload(pages))
 
         self.assertEqual(report["status"], "complete")
         self.assertEqual(report["group_count"], 1)
@@ -233,6 +278,164 @@ class PageSortingTests(unittest.TestCase):
         self.assertEqual(
             report["groups"][0]["resolved_order"],
             ["p0000", "p0001", "p0002"],
+        )
+        self.assertTrue(
+            all(
+                candidate["evidence_role"] == "document_pagination_candidate"
+                for page in manifest["pages"]
+                for candidate in page["candidates"]
+            )
+        )
+        self.assertNotIn("packet_wrapper_policy", report)
+
+    def test_internal_document_pagination_overrides_packet_order(self) -> None:
+        pages = [
+            add_document_page_marker(
+                titled_packet_page(1, 4, "INVOICE"),
+                2,
+                2,
+            ),
+            add_document_page_marker(
+                titled_packet_page(2, 4, "INVOICE"),
+                1,
+                2,
+            ),
+            add_document_page_marker(
+                titled_packet_page(3, 4, "Letter of Guarantee"),
+                1,
+                2,
+            ),
+            add_document_page_marker(
+                titled_packet_page(4, 4, "Letter of Guarantee"),
+                2,
+                2,
+            ),
+        ]
+
+        manifest, report = analyze_middle_json(payload(pages))
+
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(
+            report["ordering_status"],
+            "validated_internal_pagination",
+        )
+        self.assertEqual(
+            [group["resolved_order"] for group in report["groups"]],
+            [["p0001", "p0000"], ["p0002", "p0003"]],
+        )
+        self.assertTrue(
+            all(
+                group["order_evidence"] == "document_pagination"
+                for group in report["groups"]
+            )
+        )
+        roles = {
+            candidate["evidence_role"]
+            for page in manifest["pages"]
+            for candidate in page["candidates"]
+        }
+        self.assertEqual(
+            roles,
+            {"packet_wrapper", "document_pagination_candidate"},
+        )
+
+    def test_packet_order_does_not_hide_internal_pagination_conflict(self) -> None:
+        pages = [
+            add_document_page_marker(
+                titled_packet_page(1, 4, "INVOICE"),
+                1,
+                2,
+            ),
+            add_document_page_marker(
+                titled_packet_page(2, 4, "INVOICE"),
+                1,
+                2,
+            ),
+            titled_packet_page(3, 4, "Letter of Guarantee"),
+            titled_packet_page(4, 4, "Letter of Guarantee"),
+        ]
+
+        _manifest, report = analyze_middle_json(payload(pages))
+
+        self.assertEqual(report["status"], "needs_review")
+        self.assertTrue(report["can_auto_group"])
+        self.assertFalse(report["can_auto_sort"])
+        self.assertEqual(report["ordering_status"], "needs_review")
+        first_group = report["groups"][0]
+        self.assertEqual(first_group["ordering_status"], "needs_review")
+        self.assertEqual(
+            first_group["order_evidence"],
+            "conflicting_document_pagination",
+        )
+        self.assertIsNone(first_group["resolved_order"])
+        self.assertEqual(
+            first_group["duplicates"],
+            {"1": ["p0000", "p0001"]},
+        )
+
+    def test_partial_internal_pagination_must_align_with_packet_order(self) -> None:
+        pages = [
+            add_document_page_marker(
+                titled_packet_page(1, 4, "INVOICE"),
+                2,
+                2,
+            ),
+            titled_packet_page(2, 4, "INVOICE"),
+            titled_packet_page(3, 4, "Letter of Guarantee"),
+            titled_packet_page(4, 4, "Letter of Guarantee"),
+        ]
+
+        _manifest, report = analyze_middle_json(payload(pages))
+
+        self.assertEqual(report["status"], "needs_review")
+        self.assertFalse(report["can_auto_sort"])
+        self.assertEqual(report["groups"][0]["ordering_status"], "needs_review")
+        self.assertEqual(
+            report["groups"][0]["order_issues"],
+            [
+                {
+                    "page_id": "p0000",
+                    "reason": (
+                        "partial_document_pagination_conflicts_with_packet_order"
+                    ),
+                }
+            ],
+        )
+
+    def test_strong_identifier_change_splits_same_template_packet(self) -> None:
+        pages = [
+            titled_packet_page(index, 4, "INVOICE")
+            for index in range(1, 5)
+        ]
+        pages[0]["preproc_blocks"].append(
+            text_block("Invoice No: INVA111", bbox=[330, 90, 560, 115])
+        )
+        pages[2]["preproc_blocks"].append(
+            text_block("Invoice No: INVB222", bbox=[330, 90, 560, 115])
+        )
+
+        manifest, report = analyze_middle_json(payload(pages))
+
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(report["group_count"], 2)
+        self.assertEqual(
+            [group["member_page_ids"] for group in report["groups"]],
+            [["p0000", "p0001"], ["p0002", "p0003"]],
+        )
+        self.assertEqual(
+            report["groups"][1]["boundary_reason"],
+            "identifier_change:invoice",
+        )
+        self.assertEqual(
+            [group["identifiers"]["invoice"] for group in report["groups"]],
+            [["inva111"], ["invb222"]],
+        )
+        self.assertTrue(
+            all(
+                candidate["evidence_role"] == "packet_wrapper"
+                for page in manifest["pages"]
+                for candidate in page["candidates"]
+            )
         )
 
     def test_same_template_uses_identifier_present_on_every_page(self) -> None:

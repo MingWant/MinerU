@@ -564,7 +564,7 @@
             <div class="sorting-metric"><strong id="sortingPagesValue">-</strong><span>Pages</span></div>
             <div class="sorting-metric"><strong id="sortingGroupsValue">-</strong><span>Groups</span></div>
             <div class="sorting-metric"><strong id="sortingUnresolvedValue">-</strong><span>Unresolved</span></div>
-            <div class="sorting-metric"><strong id="sortingOrderValue">-</strong><span>Validated Order</span></div>
+            <div class="sorting-metric"><strong id="sortingOrderValue">-</strong><span>Order Status</span></div>
             <div class="sorting-metric"><strong id="sortingModeValue">-</strong><span>Strategy / Mode</span></div>
           </div>
 
@@ -578,7 +578,7 @@
                 <thead>
                   <tr>
                     <th>Group</th>
-                    <th>State</th>
+                    <th>Group / Order</th>
                     <th>Pages</th>
                     <th>Physical Members</th>
                     <th>Proposed Order</th>
@@ -1121,7 +1121,13 @@
 
   function sortingStatusTone(value) {
     const status = String(value ?? '').toLowerCase();
-    if (status === 'complete' || status === 'ready') return 'success';
+    if ([
+      'complete',
+      'ready',
+      'validated_internal_pagination',
+      'preserved_packet_order',
+      'mixed_internal_and_packet_order',
+    ].includes(status)) return 'success';
     if (status === 'error') return 'danger';
     return 'warning';
   }
@@ -1153,6 +1159,12 @@
     }
     if (groupInfo.boundary_reason) {
       lines.push(`<div><strong>Boundary:</strong> ${escapeHtml(humanizeSortingStatus(groupInfo.boundary_reason))}</div>`);
+    }
+    if (groupInfo.ordering_status) {
+      lines.push(`<div><strong>Order:</strong> ${escapeHtml(humanizeSortingStatus(groupInfo.ordering_status))}</div>`);
+    }
+    if (groupInfo.order_evidence) {
+      lines.push(`<div><strong>Order evidence:</strong> ${escapeHtml(humanizeSortingStatus(groupInfo.order_evidence))}</div>`);
     }
     const identifiers = groupInfo.identifiers && typeof groupInfo.identifiers === 'object'
       ? Object.entries(groupInfo.identifiers)
@@ -1224,7 +1236,18 @@
     sortingPagesValue.textContent = String(report.page_count ?? '-');
     sortingGroupsValue.textContent = String(report.group_count ?? groups.length);
     sortingUnresolvedValue.textContent = String(report.unresolved_count ?? unresolved.length);
-    sortingOrderValue.textContent = report.can_auto_sort ? 'Ready' : 'Blocked';
+    const orderingStatus = report.ordering_status || (
+      report.can_auto_sort ? 'validated_internal_pagination' : 'needs_review'
+    );
+    const orderingLabels = {
+      validated_internal_pagination: 'Internal pages validated',
+      preserved_packet_order: 'Packet order preserved',
+      mixed_internal_and_packet_order: 'Mixed order evidence',
+      needs_review: 'Needs review',
+      empty: 'No pages',
+    };
+    sortingOrderValue.textContent = orderingLabels[orderingStatus]
+      || humanizeSortingStatus(orderingStatus);
     sortingOrderValue.className = report.can_auto_sort
       ? 'sorting-value-success'
       : 'sorting-value-warning';
@@ -1254,10 +1277,14 @@
         const order = Array.isArray(groupInfo.resolved_order)
           ? formatSortingTokens(groupInfo.resolved_order, true)
           : '<span class="sorting-muted">Not validated</span>';
+        const groupingState = groupInfo.grouping_status || groupInfo.status || 'unknown';
+        const orderingState = groupInfo.ordering_status || (
+          groupInfo.status === 'complete' ? 'validated_internal_pagination' : 'needs_review'
+        );
         return `
           <tr>
             <td><strong>${escapeHtml(groupInfo.group_id || '-')}</strong></td>
-            <td>${sortingBadge(groupInfo.status || 'unknown')}</td>
+            <td><div class="sorting-cell-stack"><div><span class="sorting-muted">Group:</span> ${sortingBadge(groupingState)}</div><div><span class="sorting-muted">Order:</span> ${sortingBadge(orderingState)}</div></div></td>
             <td>${escapeHtml(members.length)} found<br><span class="sorting-muted">${escapeHtml(expected)} expected</span></td>
             <td>${formatSortingTokens(members)}</td>
             <td>${order}</td>

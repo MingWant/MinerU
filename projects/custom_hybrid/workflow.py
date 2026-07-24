@@ -2216,11 +2216,22 @@ def fuse_output_trees(
                 document_summary["page_sorting"] = {
                     "status": sorting_summary.get("status"),
                     "can_auto_sort": sorting_summary.get("can_auto_sort", False),
+                    "can_auto_group": sorting_summary.get("can_auto_group", False),
                     "grouping_strategy": sorting_summary.get("grouping_strategy"),
+                    "grouping_status": sorting_summary.get("grouping_status"),
+                    "ordering_status": sorting_summary.get("ordering_status"),
                     "packet_pagination_status": (
                         sorting_summary.get("packet_pagination", {}).get("status")
                         if isinstance(
                             sorting_summary.get("packet_pagination"),
+                            Mapping,
+                        )
+                        else None
+                    ),
+                    "packet_wrapper_role": (
+                        sorting_summary.get("packet_wrapper_policy", {}).get("role")
+                        if isinstance(
+                            sorting_summary.get("packet_wrapper_policy"),
                             Mapping,
                         )
                         else None

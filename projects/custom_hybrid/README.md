@@ -161,26 +161,37 @@ review. `page_idx` remains the physical input position and is never treated as
 the printed logical page number. Semantic Markdown coverage warnings are copied
 into the manifest as diagnostics, but they do not override page evidence.
 
-Packets with one continuous wrapper sequence, such as `Page X of 17`, use a
-second deterministic path. The wrapper is accepted only when its declared total
-matches the physical page count, observed numbers agree with physical order,
-the first and last markers are present, at least 60% of pages carry aligned
-markers, and at least 80% use the same header/footer source type. Once those
-checks pass, missing interior wrapper markers can be inferred from physical
-continuity; conflicting or shifted markers disable this path instead of being
-guessed. OCR punctuation between the current page and `of`, including
-`Page 3 'of 17` and `Page 11· of 17`, is tolerated.
+Packets with one continuous full-length sequence, such as `Page X of 17`, use a
+second deterministic path. A matching `1..N` sequence alone is only a packet
+candidate because a legitimate single document can have the same pagination.
+It is promoted to `packet_wrapper` only after independent title or strong,
+non-recurring document-identifier evidence proves that multiple adjacent
+documents are present. The candidate sequence must declare the physical page
+count, agree with physical order, carry first and last markers, cover at least
+60% of pages, and use the same header/footer source type on at least 80% of
+observed pages. After promotion, missing interior wrapper markers can be
+inferred from physical continuity; missing endpoints or conflicting markers
+disable promotion. OCR punctuation between the current page and `of`,
+including `Page 3 'of 17` and `Page 11· of 17`, is tolerated.
 
-The validated packet is then split only at strong adjacent boundaries: known
+The validated packet is split only at strong adjacent boundaries: known
 document titles/templates such as Invoice, Statement of Account, and Letter of
 Guarantee, or incompatible document identifiers. Untitled continuation pages
-stay with their current segment. These reports expose
-`grouping_strategy=packet_document_segmentation`, `packet_pagination`,
-`document_kind`, `document_title`, and `boundary_reason`; the UI shows the same
-evidence. If there are not at least two reliable document types, the analyzer
-falls back to the existing page-one-anchor path. This is deliberately not a
-semantic substitute for an LLM when titles, identifiers, and template evidence
-are all absent.
+stay with their current segment. Confirmed wrapper candidates are tagged with
+`evidence_role=packet_wrapper` and are excluded from document membership,
+document page numbers, and page-one anchors. Complete internal document
+pagination takes precedence for Sorting. With no internal pagination, the
+existing packet sequence is retained as `preserved_packet_order`; partial or
+conflicting internal pagination produces `needs_review` instead of being hidden
+by the wrapper.
+
+Reports separately expose `grouping_status` and `ordering_status`, together
+with `packet_wrapper_policy`, `document_kind`, `document_title`,
+`boundary_reason`, and `order_evidence`; the UI shows the same distinction. If
+independent evidence does not prove multiple documents, the full-length
+sequence is not forced into the wrapper role, preserving the existing ordinary
+single-document path. This is deliberately not a semantic substitute for an
+LLM when titles, identifiers, and template evidence are all absent.
 
 The only supported mode is currently `report_only`: the pass does not rewrite
 the PDF, fused middle JSON, or Markdown. A fused middle JSON can be replayed
