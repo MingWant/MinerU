@@ -306,7 +306,9 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         "share_recognizer_page_cache",
         "page_recovery_enabled",
         "table_orphan_recovery_enabled",
+        "table_orphan_axis_rule_enabled",
         "table_fringe_recovery_enabled",
+        "table_fringe_separator_enabled",
         "checkbox_recovery_enabled",
         "checkbox_accept_existing_label_bbox",
         "checkbox_merge_label_enabled",
@@ -500,7 +502,12 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         ("table_orphan_min_dark_height", 2.0, False),
         ("table_orphan_min_line_width", 8.0, False),
         ("table_orphan_horizontal_gap", 12.0, False),
+        ("table_orphan_axis_rule_min_length", 18.0, False),
+        ("table_orphan_axis_rule_max_gap", 2.0, True),
+        ("table_orphan_axis_rule_padding", 1.5, True),
+        ("table_fringe_horizontal_extension", 6.0, True),
         ("table_fringe_bottom_extension", 72.0, True),
+        ("table_fringe_separator_min_gap", 6.0, True),
         ("date_range_field_bottom_extension", 6.0, True),
         ("form_full_cell_recovery_max_width_ratio", 0.6, False),
         ("same_cell_fragment_max_vertical_gap", 2.5, True),
@@ -510,6 +517,7 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         ("list_marker_max_gap", 24.0, True),
         ("page_recovery_graphic_min_height", 14.0, False),
         ("page_recovery_max_line_height", 24.0, False),
+        ("page_recovery_rule_min_aspect_ratio", 20.0, False),
         ("checkbox_embedded_glyph_max_size", 7.5, False),
         ("checkbox_embedded_glyph_max_left_offset", 16.0, True),
     ):
@@ -537,6 +545,28 @@ def _validate_fusion_config(fusion_config: Any) -> None:
             raise WorkflowConfigError(
                 f"fusion.recovery.{key} must be between 0 and 1"
             )
+    axis_rule_angle = recovery.get("table_orphan_axis_rule_max_angle", 5.0)
+    if (
+        isinstance(axis_rule_angle, bool)
+        or not isinstance(axis_rule_angle, (int, float))
+        or not 0 <= float(axis_rule_angle) <= 45
+    ):
+        raise WorkflowConfigError(
+            "fusion.recovery.table_orphan_axis_rule_max_angle must be between 0 and 45"
+        )
+    page_rule_component_ratio = recovery.get(
+        "page_recovery_rule_min_component_width_ratio",
+        0.8,
+    )
+    if (
+        isinstance(page_rule_component_ratio, bool)
+        or not isinstance(page_rule_component_ratio, (int, float))
+        or not 0 <= float(page_rule_component_ratio) <= 1
+    ):
+        raise WorkflowConfigError(
+            "fusion.recovery.page_recovery_rule_min_component_width_ratio "
+            "must be between 0 and 1"
+        )
     checkbox_max_vertices = recovery.get("checkbox_max_vertices", 5)
     if (
         isinstance(checkbox_max_vertices, bool)

@@ -406,9 +406,23 @@ budget is full, more substantial text-line candidates are preferred over thin
 ink fragments; `table_orphan_preferred_line_height` controls that ranking bias.
 
 `table_fringe_recovery_enabled=true` extends that masked scan a bounded distance
-below a detected Table. It recovers labels and dates that visually belong to the
-form but fell just outside the Pipeline Table boundary, without expanding or
-moving the Table/Cell geometry.
+below a detected Table and by the small
+`table_fringe_horizontal_extension` margin on either side. The horizontal margin
+keeps a local amount/date frame intact when the OCR Table boundary is a few
+points too narrow; it does not expand or move the Table/Cell geometry. The scan
+recovers labels and dates that visually belong to the form but fell just outside
+the Pipeline Table boundary. Local rectangular rules are removed before line
+segmentation, so a bold amount or date inside a small bordered box remains a
+content candidate instead of becoming one over-height graphic component. The
+axis-rule detector is bounded by `table_orphan_axis_rule_*`; only long, nearly
+horizontal or vertical strokes are removed, while shorter glyph strokes remain.
+When `table_fringe_separator_enabled=true`, a long horizontal separator at
+least `table_fringe_separator_min_gap` below the Table ends fringe ownership;
+text below it is left to page recovery instead of being attached to the last
+Table Cell.
+Page recovery also rejects a single connected, ultra-wide thin component as a
+separator rule (`page_recovery_rule_*`) instead of sending an empty bbox to the
+recognizer.
 
 `checkbox_recovery_enabled=true` runs a separate local contour detector for
 small square form controls. It accepts both empty and tick-connected outlines,

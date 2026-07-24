@@ -368,6 +368,281 @@ class OpenAIBBoxRecoveryReviewer:
             )
         mask[rule_mask.astype(bool)] = False
 
+    def _mask_orphan_axis_rules(
+        self,
+        mask: np.ndarray,
+        scale_x: float,
+        scale_y: float,
+    ) -> None:
+        """Remove local rectangular rules before orphan line segmentation.
+
+        The ordinary row/column guards remove rules only when they span a large
+        fraction of the whole Table crop. A small amount/date box in the Table
+        fringe therefore survives as one connected, over-height component and
+        hides the text inside it. Hough line segments let us remove those local
+        straight edges without erasing shorter character strokes.
+        """
+        if not self.config.get("table_orphan_axis_rule_enabled", True):
+            return
+        try:
+            import cv2
+        except ImportError:  # pragma: no cover - optional local dependency
+            return
+        minimum_length = max(
+            float(
+                self.config.get(
+                    "table_orphan_axis_rule_min_length",
+                    18.0,
+                )
+            ),
+            0.0,
+        )
+        if minimum_length <= 0:
+            return
+        minimum_scale = min(scale_x, scale_y)
+        minimum_length_pixels = max(
+            int(round(minimum_length * minimum_scale)),
+            1,
+        )
+        maximum_gap = max(
+            float(
+                self.config.get(
+                    "table_orphan_axis_rule_max_gap",
+                    2.0,
+                )
+            ),
+            0.0,
+        )
+        maximum_angle = min(
+            max(
+                float(
+                    self.config.get(
+                        "table_orphan_axis_rule_max_angle",
+                        5.0,
+                    )
+                ),
+                0.0,
+            ),
+            45.0,
+        )
+        padding = max(
+            float(
+                self.config.get(
+                    "table_orphan_axis_rule_padding",
+                    1.5,
+                )
+            ),
+            0.0,
+        )
+        binary = mask.astype(np.uint8) * 255
+        lines = cv2.HoughLinesP(
+            binary,
+            1,
+            np.pi / 180,
+            threshold=max(int(round(minimum_length_pixels * 0.5)), 12),
+            minLineLength=minimum_length_pixels,
+            maxLineGap=max(int(round(maximum_gap * minimum_scale)), 0),
+        )
+        if lines is None:
+            return
+        source_mask = mask.copy()
+        thickness = max(
+            int(round(padding * minimum_scale)) * 2 + 1,
+            1,
+        )
+        maximum_rule_thickness = max(
+            float(self.config.get("cell_rule_max_thickness", 2.5)),
+            0.0,
+        )
+
+        def sampled_perpendicular_thickness(
+            x1: int,
+            y1: int,
+            x2: int,
+            y2: int,
+            *,
+            horizontal: bool,
+        ) -> float:
+            samples = []
+            for fraction in (0.15, 0.325, 0.5, 0.675, 0.85):
+                x = min(
+                    max(int(round(x1 + (x2 - x1) * fraction)), 0),
+                    source_mask.shape[1] - 1,
+                )
+                y = min(
+                    max(int(round(y1 + (y2 - y1) * fraction)), 0),
+                    source_mask.shape[0] - 1,
+                )
+                if not source_mask[y, x]:
+                    continue
+                if horizontal:
+                    start = stop = y
+                    while start > 0 and source_mask[start - 1, x]:
+                        start -= 1
+                    while (
+                        stop + 1 < source_mask.shape[0]
+                        and source_mask[stop + 1, x]
+                    ):
+                        stop += 1
+                    samples.append((stop - start + 1) / scale_y)
+                else:
+                    start = stop = x
+                    while start > 0 and source_mask[y, start - 1]:
+                        start -= 1
+                    while (
+                        stop + 1 < source_mask.shape[1]
+                        and source_mask[y, stop + 1]
+                    ):
+                        stop += 1
+                    samples.append((stop - start + 1) / scale_x)
+            return float(np.median(samples)) if samples else float("inf")
+
+        horizontal_rules = []
+        vertical_rules = []
+        for raw_line in lines:
+            coordinates = np.asarray(raw_line).reshape(-1)
+            if coordinates.size < 4:
+                continue
+            x1, y1, x2, y2 = (int(value) for value in coordinates[:4])
+            delta_x = x2 - x1
+            delta_y = y2 - y1
+            angle = abs(math.degrees(math.atan2(delta_y, delta_x)))
+            angle = min(angle, 180.0 - angle)
+            horizontal = angle <= maximum_angle
+            vertical = angle >= 90.0 - maximum_angle
+            if not (horizontal or vertical):
+                continue
+            if sampled_perpendicular_thickness(
+                x1,
+                y1,
+                x2,
+                y2,
+                horizontal=horizontal,
+            ) > maximum_rule_thickness:
+                continue
+            if horizontal:
+                horizontal_rules.append(
+                    {
+                        "start": min(x1, x2),
+                        "end": max(x1, x2),
+                        "position": (y1 + y2) / 2,
+                    }
+                )
+            else:
+                vertical_rules.append(
+                    {
+                        "start": min(y1, y2),
+                        "end": max(y1, y2),
+                        "position": (x1 + x2) / 2,
+                    }
+                )
+
+        # Remove only closed/near-closed local rectangles. A long thin glyph
+        # stroke or underline can also produce a Hough segment, but it does not
+        # have two endpoint-aligned parallel edges plus a perpendicular
+        # connector. Requiring that geometry preserves ordinary text while
+        # still opening framed amount/date fields whose other connector is
+        # clipped or interrupted by neighboring ink.
+        rule_mask = np.zeros_like(binary, dtype=np.uint8)
+        connector_tolerance = max(
+            int(round((maximum_gap + padding + 1.0) * minimum_scale)),
+            3,
+        )
+        minimum_box_side = max(int(round(6.0 * minimum_scale)), thickness + 1)
+        for first_index, first in enumerate(horizontal_rules):
+            for second in horizontal_rules[first_index + 1 :]:
+                top = min(first["position"], second["position"])
+                bottom = max(first["position"], second["position"])
+                if bottom - top < minimum_box_side:
+                    continue
+                shared_left = max(first["start"], second["start"])
+                shared_right = min(first["end"], second["end"])
+                if shared_right - shared_left < minimum_length_pixels:
+                    continue
+                connectors = [
+                    rule
+                    for rule in vertical_rules
+                    if rule["start"] <= top + connector_tolerance
+                    and rule["end"] >= bottom - connector_tolerance
+                ]
+                left_connectors = [
+                    rule
+                    for rule in connectors
+                    if abs(rule["position"] - shared_left) <= connector_tolerance
+                ]
+                right_connectors = [
+                    rule
+                    for rule in connectors
+                    if abs(rule["position"] - shared_right) <= connector_tolerance
+                ]
+                aligned_left = (
+                    abs(first["start"] - second["start"])
+                    <= connector_tolerance
+                )
+                aligned_right = (
+                    abs(first["end"] - second["end"])
+                    <= connector_tolerance
+                )
+                if not left_connectors and not right_connectors:
+                    continue
+                if not left_connectors and not aligned_left:
+                    continue
+                if not right_connectors and not aligned_right:
+                    continue
+                left = int(
+                    round(
+                        float(
+                            np.median(
+                                [rule["position"] for rule in left_connectors]
+                                or [first["start"], second["start"]]
+                            )
+                        )
+                    )
+                )
+                right = int(
+                    round(
+                        float(
+                            np.median(
+                                [rule["position"] for rule in right_connectors]
+                                or [first["end"], second["end"]]
+                            )
+                        )
+                    )
+                )
+                if right - left < minimum_length_pixels:
+                    continue
+                top_int = int(round(top))
+                bottom_int = int(round(bottom))
+                cv2.line(
+                    rule_mask,
+                    (left, top_int),
+                    (right, top_int),
+                    255,
+                    thickness=thickness,
+                )
+                cv2.line(
+                    rule_mask,
+                    (left, bottom_int),
+                    (right, bottom_int),
+                    255,
+                    thickness=thickness,
+                )
+                cv2.line(
+                    rule_mask,
+                    (left, top_int),
+                    (left, bottom_int),
+                    255,
+                    thickness=thickness,
+                )
+                cv2.line(
+                    rule_mask,
+                    (right, top_int),
+                    (right, bottom_int),
+                    255,
+                    thickness=thickness,
+                )
+        mask[rule_mask.astype(bool)] = False
+
     def _ink_analysis(
         self,
         image,
@@ -1119,9 +1394,23 @@ class OpenAIBBoxRecoveryReviewer:
         if table_bbox is None or not cells:
             return []
         scale_x, scale_y = self._page_scale(image, page_size)
+        page_width = float(page_size[0]) if len(page_size) >= 2 else table_bbox[2]
         page_height = float(page_size[1]) if len(page_size) >= 2 else table_bbox[3]
         fringe_enabled = bool(
             self.config.get("table_fringe_recovery_enabled", True)
+        )
+        fringe_horizontal_extension = (
+            max(
+                float(
+                    self.config.get(
+                        "table_fringe_horizontal_extension",
+                        6.0,
+                    )
+                ),
+                0.0,
+            )
+            if fringe_enabled
+            else 0.0
         )
         fringe_bottom_extension = (
             max(
@@ -1137,9 +1426,9 @@ class OpenAIBBoxRecoveryReviewer:
             else 0.0
         )
         search_bbox = (
-            table_bbox[0],
+            max(0.0, table_bbox[0] - fringe_horizontal_extension),
             table_bbox[1],
-            table_bbox[2],
+            min(page_width, table_bbox[2] + fringe_horizontal_extension),
             min(page_height, table_bbox[3] + fringe_bottom_extension),
         )
         crop_box = (
@@ -1233,6 +1522,14 @@ class OpenAIBBoxRecoveryReviewer:
             orphan_mask[-border_px:, :] = False
             orphan_mask[:, :border_px] = False
             orphan_mask[:, -border_px:] = False
+            # Detect local closed frames while all four edges are still
+            # present. The broad row/column cleanup below may remove only one
+            # edge and would otherwise destroy the rectangle evidence.
+            self._mask_orphan_axis_rules(
+                orphan_mask,
+                scale_x,
+                scale_y,
+            )
 
             horizontal_ratio = float(
                 self.config.get("table_orphan_horizontal_line_ratio", 0.5)
@@ -1248,6 +1545,93 @@ class OpenAIBBoxRecoveryReviewer:
                 np.count_nonzero(dark_mask, axis=0)
                 >= max(int(crop.height * vertical_ratio), 1)
             )
+            if (
+                fringe_enabled
+                and table.get("kind") == "table"
+                and self.config.get("table_fringe_separator_enabled", True)
+            ):
+                # A page-wide rule below a Table usually starts a new footer or
+                # section. Do not let the Table's bounded fringe claim text on
+                # the far side of that separator; page-level residual recovery
+                # can preserve the new section's natural reading order.
+                separator_gap = max(
+                    float(
+                        self.config.get(
+                            "table_fringe_separator_min_gap",
+                            6.0,
+                        )
+                    ),
+                    0.0,
+                )
+                table_bottom_row = int(
+                    math.ceil(
+                        (table_bbox[3] + separator_gap) * scale_y
+                    )
+                ) - crop_box[1]
+                separator_candidates = [
+                    int(row) for row in long_rows if row >= table_bottom_row
+                ]
+                if cv2 is not None:
+                    minimum_separator_length = max(
+                        int(round(crop.width * horizontal_ratio)),
+                        1,
+                    )
+                    separator_lines = cv2.HoughLinesP(
+                        dark_mask.astype(np.uint8) * 255,
+                        1,
+                        np.pi / 180,
+                        threshold=max(
+                            int(round(minimum_separator_length * 0.15)),
+                            20,
+                        ),
+                        minLineLength=minimum_separator_length,
+                        maxLineGap=max(
+                            int(
+                                round(
+                                    float(
+                                        self.config.get(
+                                            "table_diagonal_rule_max_gap",
+                                            8.0,
+                                        )
+                                    )
+                                    * min(scale_x, scale_y)
+                                )
+                            ),
+                            0,
+                        ),
+                    )
+                    maximum_separator_angle = min(
+                        max(
+                            float(
+                                self.config.get(
+                                    "table_orphan_axis_rule_max_angle",
+                                    5.0,
+                                )
+                            ),
+                            0.0,
+                        ),
+                        45.0,
+                    )
+                    for raw_line in (
+                        separator_lines if separator_lines is not None else []
+                    ):
+                        coordinates = np.asarray(raw_line).reshape(-1)
+                        if coordinates.size < 4:
+                            continue
+                        x1, y1, x2, y2 = (
+                            int(value) for value in coordinates[:4]
+                        )
+                        angle = abs(
+                            math.degrees(math.atan2(y2 - y1, x2 - x1))
+                        )
+                        angle = min(angle, 180.0 - angle)
+                        if (
+                            angle <= maximum_separator_angle
+                            and min(y1, y2) >= table_bottom_row
+                        ):
+                            separator_candidates.append(min(y1, y2))
+                if separator_candidates:
+                    orphan_mask[min(separator_candidates) :, :] = False
             for row in long_rows:
                 orphan_mask[max(0, row - 1) : min(crop.height, row + 2), :] = False
             for column in long_columns:
@@ -1322,6 +1706,27 @@ class OpenAIBBoxRecoveryReviewer:
                     )
                 ),
                 0.0,
+            )
+            page_rule_min_aspect = max(
+                float(
+                    self.config.get(
+                        "page_recovery_rule_min_aspect_ratio",
+                        20.0,
+                    )
+                ),
+                0.0,
+            )
+            page_rule_min_component_width_ratio = min(
+                max(
+                    float(
+                        self.config.get(
+                            "page_recovery_rule_min_component_width_ratio",
+                            0.8,
+                        )
+                    ),
+                    0.0,
+                ),
+                1.0,
             )
             cells_with_bbox = [
                 (cell, _valid_bbox(cell.get("bbox"))) for cell in cells
@@ -1430,15 +1835,36 @@ class OpenAIBBoxRecoveryReviewer:
                             ),
                             default=0,
                         )
+                        largest_component_width = max(
+                            (
+                                int(row[cv2.CC_STAT_WIDTH])
+                                for row in component_stats[1:]
+                            ),
+                            default=0,
+                        )
                         component_ratio = largest_component / max(
                             int(dark_x.size),
                             1,
                         )
                         raw_height_points = (max_y - min_y) / scale_y
+                        candidate_pixel_width = max(max_x - min_x, 1)
+                        candidate_pixel_height = max(max_y - min_y, 1)
+                        long_thin_rule = (
+                            candidate_pixel_width
+                            >= crop.width * horizontal_ratio
+                            and candidate_pixel_width / candidate_pixel_height
+                            >= page_rule_min_aspect
+                            and largest_component_width / candidate_pixel_width
+                            >= page_rule_min_component_width_ratio
+                        )
                         if (
-                            raw_height_points >= page_graphic_min_height
-                            and ink_density >= page_graphic_density
-                            and component_ratio >= page_graphic_component_ratio
+                            long_thin_rule
+                            or (
+                                raw_height_points >= page_graphic_min_height
+                                and ink_density >= page_graphic_density
+                                and component_ratio
+                                >= page_graphic_component_ratio
+                            )
                         ):
                             continue
                     bbox = _clip_bbox(
@@ -1453,6 +1879,12 @@ class OpenAIBBoxRecoveryReviewer:
                     if bbox is None:
                         continue
                     height = bbox[3] - bbox[1]
+                    center_x = (bbox[0] + bbox[2]) / 2
+                    center_y = (bbox[1] + bbox[3]) / 2
+                    is_fringe = not (
+                        table_bbox[0] <= center_x <= table_bbox[2]
+                        and table_bbox[1] <= center_y <= table_bbox[3]
+                    )
                     maximum_height = (
                         max(
                             float(
@@ -1463,14 +1895,218 @@ class OpenAIBBoxRecoveryReviewer:
                             ),
                             minimum_height,
                         )
-                        if page_region
+                        if page_region or is_fringe
                         else max(
                             (table_bbox[3] - table_bbox[1])
                             * maximum_height_ratio,
                             minimum_height * 4,
                         )
                     )
-                    if height < minimum_height or height > maximum_height:
+                    maximum_gate_height = (
+                        raw_height if page_region or is_fringe else height
+                    )
+                    if (
+                        (page_region or is_fringe)
+                        and maximum_gate_height > maximum_height
+                        and (bbox[2] - bbox[0])
+                        >= maximum_gate_height * 2.0
+                    ):
+                        # Ink in another horizontal zone can keep the global
+                        # row projection continuously active and merge several
+                        # short text lines into one over-height candidate. Once
+                        # a column band is known, split it again at genuine
+                        # local row gaps so tightly spaced footer/address lines
+                        # are recovered independently.
+                        local_active_rows = np.flatnonzero(
+                            np.count_nonzero(segment_mask, axis=1) > 0
+                        )
+                        local_bands: list[tuple[int, int]] = []
+                        if local_active_rows.size:
+                            local_start = local_previous = int(
+                                local_active_rows[0]
+                            )
+                            for raw_local_row in local_active_rows[1:]:
+                                local_row = int(raw_local_row)
+                                if local_row - local_previous > max_gap + 1:
+                                    local_bands.append(
+                                        (local_start, local_previous + 1)
+                                    )
+                                    local_start = local_row
+                                local_previous = local_row
+                            local_bands.append(
+                                (local_start, local_previous + 1)
+                            )
+                        split_proposals = 0
+                        if len(local_bands) > 1:
+                            for local_top, local_bottom in local_bands:
+                                local_mask = segment_mask[
+                                    local_top:local_bottom,
+                                    :,
+                                ]
+                                local_dark_y, local_dark_x = np.nonzero(
+                                    local_mask
+                                )
+                                if local_dark_x.size < minimum_row_ink:
+                                    continue
+                                local_min_x = left + int(local_dark_x.min())
+                                local_max_x = left + int(local_dark_x.max()) + 1
+                                local_min_y = (
+                                    top
+                                    + local_top
+                                    + int(local_dark_y.min())
+                                )
+                                local_max_y = (
+                                    top
+                                    + local_top
+                                    + int(local_dark_y.max())
+                                    + 1
+                                )
+                                local_raw_height = (
+                                    local_max_y - local_min_y
+                                ) / scale_y
+                                if not (
+                                    float(
+                                        self.config.get(
+                                            "table_orphan_min_dark_height",
+                                            2.0,
+                                        )
+                                    )
+                                    <= local_raw_height
+                                    <= maximum_height
+                                ):
+                                    continue
+                                local_area = max(
+                                    (local_max_x - local_min_x)
+                                    * (local_max_y - local_min_y),
+                                    1,
+                                )
+                                local_density = (
+                                    local_dark_x.size / local_area
+                                )
+                                if not (
+                                    minimum_ink_density
+                                    <= local_density
+                                    <= maximum_ink_density
+                                ):
+                                    continue
+                                if page_region and cv2 is not None:
+                                    (
+                                        _local_component_count,
+                                        _local_labels,
+                                        local_component_stats,
+                                        _local_centroids,
+                                    ) = cv2.connectedComponentsWithStats(
+                                        local_mask.astype(np.uint8),
+                                        8,
+                                    )
+                                    local_largest_component = max(
+                                        (
+                                            int(row[cv2.CC_STAT_AREA])
+                                            for row in local_component_stats[1:]
+                                        ),
+                                        default=0,
+                                    )
+                                    local_component_ratio = (
+                                        local_largest_component
+                                        / max(int(local_dark_x.size), 1)
+                                    )
+                                    if (
+                                        local_raw_height
+                                        >= page_graphic_min_height
+                                        and local_density
+                                        >= page_graphic_density
+                                        and local_component_ratio
+                                        >= page_graphic_component_ratio
+                                    ):
+                                        continue
+                                local_bbox = _clip_bbox(
+                                    (
+                                        (crop_box[0] + local_min_x)
+                                        / scale_x
+                                        - 1.0,
+                                        (crop_box[1] + local_min_y)
+                                        / scale_y
+                                        - 0.8,
+                                        (crop_box[0] + local_max_x)
+                                        / scale_x
+                                        + 1.0,
+                                        (crop_box[1] + local_max_y)
+                                        / scale_y
+                                        + 0.8,
+                                    ),
+                                    search_bbox,
+                                )
+                                if (
+                                    local_bbox is None
+                                    or local_bbox[3] - local_bbox[1]
+                                    < minimum_height
+                                    or local_bbox[2] - local_bbox[0]
+                                    < minimum_width
+                                    or any(
+                                        _bbox_overlap_ratio(
+                                            local_bbox,
+                                            existing_bbox,
+                                        )
+                                        >= 0.5
+                                        for existing_bbox in existing_bboxes
+                                    )
+                                ):
+                                    continue
+                                local_nearest_cell, _local_nearest_bbox = min(
+                                    cells_with_bbox,
+                                    key=lambda item: cell_distance(
+                                        item,
+                                        local_bbox,
+                                    ),
+                                )
+                                local_cell_id = local_nearest_cell.get("id")
+                                local_table_id = table.get("id")
+                                if not isinstance(
+                                    local_cell_id,
+                                    str,
+                                ) or not isinstance(local_table_id, str):
+                                    continue
+                                proposals.append(
+                                    {
+                                        "action": (
+                                            "add_fringe"
+                                            if is_fringe
+                                            else "add_orphan"
+                                        ),
+                                        "table_id": local_table_id,
+                                        "cell_id": local_cell_id,
+                                        "target_id": "",
+                                        "bbox": list(local_bbox),
+                                        "confidence": float(
+                                            self.config.get(
+                                                "table_orphan_confidence",
+                                                0.92,
+                                            )
+                                        ),
+                                        "recovery_reasons": [
+                                            "table_fringe_ink_without_bbox"
+                                            if is_fringe
+                                            else "table_ink_outside_cells"
+                                        ],
+                                        "recovery_source": (
+                                            "local_table_fringe_ink"
+                                            if is_fringe
+                                            else "local_table_orphan_ink"
+                                        ),
+                                        "_ink_pixels": int(
+                                            local_dark_x.size
+                                        ),
+                                    }
+                                )
+                                split_proposals += 1
+                                if len(proposals) >= candidate_limit:
+                                    break
+                        if split_proposals:
+                            continue
+                    if (
+                        height < minimum_height
+                        or maximum_gate_height > maximum_height
+                    ):
                         continue
                     if bbox[2] - bbox[0] < minimum_width:
                         continue
@@ -1491,12 +2127,6 @@ class OpenAIBBoxRecoveryReviewer:
                         str,
                     ):
                         continue
-                    center_x = (bbox[0] + bbox[2]) / 2
-                    center_y = (bbox[1] + bbox[3]) / 2
-                    is_fringe = not (
-                        table_bbox[0] <= center_x <= table_bbox[2]
-                        and table_bbox[1] <= center_y <= table_bbox[3]
-                    )
                     proposals.append(
                         {
                             "action": (

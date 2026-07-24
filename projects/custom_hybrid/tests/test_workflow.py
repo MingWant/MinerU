@@ -935,6 +935,40 @@ class WorkflowTests(unittest.TestCase):
                 "table_orphan_min_ink_density",
             ),
             (
+                ("fusion", "recovery", "table_orphan_axis_rule_enabled"),
+                "yes",
+                "table_orphan_axis_rule_enabled",
+            ),
+            (
+                ("fusion", "recovery", "table_orphan_axis_rule_min_length"),
+                0,
+                "table_orphan_axis_rule_min_length",
+            ),
+            (
+                ("fusion", "recovery", "table_orphan_axis_rule_max_angle"),
+                46,
+                "table_orphan_axis_rule_max_angle",
+            ),
+            (
+                ("fusion", "recovery", "table_fringe_horizontal_extension"),
+                -1,
+                "table_fringe_horizontal_extension",
+            ),
+            (
+                ("fusion", "recovery", "table_fringe_separator_enabled"),
+                "yes",
+                "table_fringe_separator_enabled",
+            ),
+            (
+                (
+                    "fusion",
+                    "recovery",
+                    "page_recovery_rule_min_component_width_ratio",
+                ),
+                1.1,
+                "page_recovery_rule_min_component_width_ratio",
+            ),
+            (
                 ("fusion", "recovery", "checkbox_tick_min_square_coverage"),
                 1.1,
                 "checkbox_tick_min_square_coverage",

@@ -650,6 +650,267 @@ class BBoxRecoveryReviewerTests(unittest.TestCase):
         self.assertEqual(len(orphans), 1)
         self.assertGreater(orphans[0]["bbox"][1], 80.0)
 
+    def test_page_region_height_guard_uses_unpadded_ink_height(self):
+        from PIL import Image, ImageDraw, ImageFont
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            image = Image.new("RGB", (200, 100), "white")
+            draw = ImageDraw.Draw(image)
+            draw.text(
+                (30, 25),
+                "Kwok",
+                font=ImageFont.load_default(size=31),
+                fill="black",
+            )
+            image.save(image_path)
+            image.close()
+            reviewer = OpenAIBBoxRecoveryReviewer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "mineru-local",
+                    "render_scale": 1.0,
+                    "checkbox_recovery_enabled": False,
+                    "table_diagonal_rule_enabled": False,
+                    "page_recovery_max_line_height": 23.0,
+                },
+            )
+            try:
+                result = reviewer(
+                    0,
+                    [200, 100],
+                    [
+                        {
+                            "id": "p0-page-recovery",
+                            "kind": "page_region",
+                            "page_region": True,
+                            "bbox": [0, 0, 200, 100],
+                            "cells": [
+                                {
+                                    "id": "p0-page-c0",
+                                    "bbox": [0, 0, 200, 100],
+                                    "existing": [],
+                                    "reasons": [],
+                                }
+                            ],
+                            "page_existing": [],
+                            "page_exclusions": [],
+                            "allow_orphan_recovery": True,
+                            "disable_marker_merges": True,
+                        }
+                    ],
+                )
+            finally:
+                reviewer.close()
+
+        orphans = [
+            item for item in result["items"] if item.get("action") == "add_orphan"
+        ]
+        self.assertEqual(len(orphans), 1)
+        self.assertGreater(orphans[0]["bbox"][3] - orphans[0]["bbox"][1], 23.0)
+
+    def test_table_fringe_stops_at_separator_and_leaves_footer_to_page(self):
+        from PIL import Image, ImageDraw
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            image = Image.new("RGB", (300, 190), "white")
+            draw = ImageDraw.Draw(image)
+            draw.rectangle([50, 20, 250, 80], outline="black", width=1)
+            draw.text((70, 40), "Owned table text", fill="black")
+            draw.line([10, 110, 290, 110], fill="black", width=1)
+            draw.text((15, 125), "Hospital & Address: Footer", fill="black")
+            image.save(image_path)
+            image.close()
+            reviewer = OpenAIBBoxRecoveryReviewer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "mineru-local",
+                    "render_scale": 1.0,
+                    "checkbox_recovery_enabled": False,
+                    "max_requests_per_document": 0,
+                },
+            )
+            try:
+                result = reviewer(
+                    0,
+                    [300, 190],
+                    [
+                        {
+                            "id": "p0-table-0",
+                            "kind": "table",
+                            "bbox": [50, 20, 250, 80],
+                            "page_existing": [
+                                {"bbox": [68, 38, 155, 52], "text": "Owned table text"}
+                            ],
+                            "cells": [
+                                {
+                                    "id": "p0-t0-c0",
+                                    "bbox": [50, 20, 250, 80],
+                                    "text": "Owned table text",
+                                    "existing": [
+                                        {
+                                            "id": "p0-t0-c0-b0",
+                                            "bbox": [68, 38, 155, 52],
+                                            "text": "Owned table text",
+                                        }
+                                    ],
+                                    "reasons": [],
+                                }
+                            ],
+                        },
+                        {
+                            "id": "p0-page-recovery",
+                            "kind": "page_region",
+                            "page_region": True,
+                            "bbox": [0, 0, 300, 190],
+                            "page_existing": [
+                                {"bbox": [68, 38, 155, 52], "text": "Owned table text"}
+                            ],
+                            "page_orphan_exclusions": [[50, 20, 250, 80]],
+                            "cells": [
+                                {
+                                    "id": "p0-page-c0",
+                                    "bbox": [0, 0, 300, 190],
+                                    "existing": [
+                                        {
+                                            "id": "p0-page-c0-b0",
+                                            "bbox": [68, 38, 155, 52],
+                                            "text": "Owned table text",
+                                        }
+                                    ],
+                                    "reasons": [],
+                                }
+                            ],
+                            "allow_orphan_recovery": True,
+                            "disable_marker_merges": True,
+                        },
+                    ],
+                )
+            finally:
+                reviewer.close()
+
+        footer_items = [item for item in result["items"] if item["bbox"][1] > 110]
+        self.assertEqual(len(footer_items), 1)
+        self.assertEqual(footer_items[0]["table_id"], "p0-page-recovery")
+        self.assertLess(footer_items[0]["bbox"][0], 20.0)
+
+    def test_page_region_resplits_overheight_column_into_local_lines(self):
+        from PIL import Image, ImageDraw
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            image = Image.new("RGB", (300, 150), "white")
+            draw = ImageDraw.Draw(image)
+            draw.text((15, 30), "Address line one", fill="black")
+            draw.text((15, 55), "Office hours two", fill="black")
+            draw.text((15, 80), "Footer line three", fill="black")
+            # A separate vertical graphic keeps the page-wide row projection
+            # active, but must not merge the three lines in the left column.
+            draw.line([270, 25, 270, 100], fill="black", width=2)
+            image.save(image_path)
+            image.close()
+            reviewer = OpenAIBBoxRecoveryReviewer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "mineru-local",
+                    "render_scale": 1.0,
+                    "checkbox_recovery_enabled": False,
+                    "table_diagonal_rule_enabled": False,
+                    "page_recovery_max_line_height": 16.0,
+                },
+            )
+            try:
+                result = reviewer(
+                    0,
+                    [300, 150],
+                    [
+                        {
+                            "id": "p0-page-recovery",
+                            "kind": "page_region",
+                            "page_region": True,
+                            "bbox": [0, 0, 300, 150],
+                            "cells": [
+                                {
+                                    "id": "p0-page-c0",
+                                    "bbox": [0, 0, 300, 150],
+                                    "existing": [],
+                                    "reasons": [],
+                                }
+                            ],
+                            "page_existing": [],
+                            "page_exclusions": [],
+                            "allow_orphan_recovery": True,
+                            "disable_marker_merges": True,
+                        }
+                    ],
+                )
+            finally:
+                reviewer.close()
+
+        text_items = [
+            item
+            for item in result["items"]
+            if item.get("action") == "add_orphan" and item["bbox"][0] < 100
+        ]
+        self.assertEqual(len(text_items), 3)
+        self.assertTrue(
+            all(item["bbox"][3] - item["bbox"][1] < 16.0 for item in text_items)
+        )
+
+    def test_page_region_rejects_long_sloped_separator(self):
+        from PIL import Image, ImageDraw
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            image = Image.new("RGB", (240, 120), "white")
+            draw = ImageDraw.Draw(image)
+            draw.line([10, 55, 230, 60], fill="black", width=2)
+            image.save(image_path)
+            image.close()
+            reviewer = OpenAIBBoxRecoveryReviewer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "mineru-local",
+                    "render_scale": 1.0,
+                    "checkbox_recovery_enabled": False,
+                    "table_diagonal_rule_enabled": False,
+                },
+            )
+            try:
+                result = reviewer(
+                    0,
+                    [240, 120],
+                    [
+                        {
+                            "id": "p0-page-recovery",
+                            "kind": "page_region",
+                            "page_region": True,
+                            "bbox": [0, 0, 240, 120],
+                            "cells": [
+                                {
+                                    "id": "p0-page-c0",
+                                    "bbox": [0, 0, 240, 120],
+                                    "existing": [],
+                                    "reasons": [],
+                                }
+                            ],
+                            "page_existing": [],
+                            "page_exclusions": [],
+                            "allow_orphan_recovery": True,
+                            "disable_marker_merges": True,
+                        }
+                    ],
+                )
+            finally:
+                reviewer.close()
+
+        self.assertEqual(result["items"], [])
+
     def test_form_checkbox_guard_rejects_small_embedded_paragraph_glyph(self):
         from PIL import Image, ImageDraw
 
@@ -1173,6 +1434,129 @@ class BBoxRecoveryReviewerTests(unittest.TestCase):
         self.assertGreaterEqual(len(fringe), 2)
         self.assertTrue(all(item["bbox"][0] > 90 for item in fringe))
         self.assertEqual(result["fringe_proposals"], len(fringe))
+
+    def test_table_fringe_recovers_repeated_bold_amount_inside_local_box(self):
+        from PIL import Image, ImageDraw, ImageFont
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            image = Image.new("RGB", (240, 150), "white")
+            draw = ImageDraw.Draw(image)
+            draw.rectangle([10, 10, 230, 60], outline="black", width=2)
+            # The amount frame extends beyond the detected Table's right edge.
+            # The fringe scan must preserve the clipped connector so its rules
+            # can be removed without merging the amount into one tall band.
+            draw.line([155, 68, 230, 68], fill="black", width=2)
+            draw.line([155, 112, 230, 112], fill="black", width=2)
+            draw.line([230, 68, 230, 112], fill="black", width=2)
+            # A neighboring underline can interrupt one connector in the
+            # binary mask even though the frame is visually unambiguous.
+            draw.line([155, 92, 155, 112], fill="black", width=2)
+            draw.text(
+                (162, 80),
+                "840.00",
+                font=ImageFont.load_default(size=18),
+                fill="black",
+            )
+            image.save(image_path)
+            image.close()
+            reviewer = OpenAIBBoxRecoveryReviewer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "mineru-local",
+                    "render_scale": 1.0,
+                    "checkbox_recovery_enabled": False,
+                    "max_requests_per_document": 0,
+                },
+            )
+            try:
+                result = reviewer(
+                    0,
+                    [240, 150],
+                    [
+                        {
+                            "id": "p0-table-0",
+                            "bbox": [10, 10, 225, 60],
+                            "page_existing": [],
+                            "cells": [
+                                {
+                                    "id": "p0-t0-c0",
+                                    "bbox": [10, 10, 225, 55],
+                                    # The same value already exists at another
+                                    # physical position inside the Table.
+                                    "text": "840.00",
+                                    "existing": [
+                                        {
+                                            "id": "p0-t0-c0-b0",
+                                            "bbox": [190, 20, 225, 35],
+                                            "text": "840.00",
+                                        }
+                                    ],
+                                    "reasons": [],
+                                }
+                            ],
+                        }
+                    ],
+                )
+            finally:
+                reviewer.close()
+
+        fringe = [
+            item for item in result["items"] if item.get("action") == "add_fringe"
+        ]
+        self.assertEqual(len(fringe), 1)
+        self.assertGreater(fringe[0]["bbox"][0], 150.0)
+        self.assertLess(fringe[0]["bbox"][2], 225.0)
+        self.assertGreater(fringe[0]["bbox"][1], 75.0)
+        self.assertLess(fringe[0]["bbox"][3] - fringe[0]["bbox"][1], 24.0)
+
+    def test_table_fringe_rejects_empty_local_box_after_rule_removal(self):
+        from PIL import Image, ImageDraw
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            image = Image.new("RGB", (240, 150), "white")
+            draw = ImageDraw.Draw(image)
+            draw.rectangle([10, 10, 230, 60], outline="black", width=2)
+            draw.rectangle([155, 68, 230, 112], outline="black", width=2)
+            image.save(image_path)
+            image.close()
+            reviewer = OpenAIBBoxRecoveryReviewer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "mineru-local",
+                    "render_scale": 1.0,
+                    "checkbox_recovery_enabled": False,
+                    "max_requests_per_document": 0,
+                },
+            )
+            try:
+                result = reviewer(
+                    0,
+                    [240, 150],
+                    [
+                        {
+                            "id": "p0-table-0",
+                            "bbox": [10, 10, 230, 60],
+                            "page_existing": [],
+                            "cells": [
+                                {
+                                    "id": "p0-t0-c0",
+                                    "bbox": [10, 10, 230, 55],
+                                    "text": "",
+                                    "existing": [],
+                                    "reasons": [],
+                                }
+                            ],
+                        }
+                    ],
+                )
+            finally:
+                reviewer.close()
+
+        self.assertEqual(result["items"], [])
 
     def test_checkbox_recovery_uses_existing_checkbox_label_bbox(self):
         from PIL import Image, ImageDraw

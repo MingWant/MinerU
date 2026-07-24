@@ -1413,7 +1413,7 @@ class FusionTests(unittest.TestCase):
         page_region = manifest[0]
         self.assertTrue(page_region["residual_page_region"])
         self.assertIn(
-            [10.0, 10.0, 190.0, 152.0],
+            [10.0, 10.0, 190.0, 80.0],
             page_region["page_orphan_exclusions"],
         )
         self.assertNotIn(

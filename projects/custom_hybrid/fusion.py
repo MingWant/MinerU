@@ -2107,16 +2107,23 @@ def build_bbox_recovery_manifest(
             )
         )
         if page_bbox is not None:
-            # The page fallback scans only areas not already owned by a
-            # Table, Form, formula, or image. Table exclusions include the
-            # bounded bottom fringe so two recovery scopes cannot emit the
-            # same footer/amount bbox.
-            orphan_exclusion_bboxes: list[tuple[float, float, float, float]] = [
+            # The page fallback scans only areas not already owned by a Table,
+            # Form, formula, or image. Keep the area below a Table available to
+            # page recovery: a long separator can terminate Table-fringe
+            # ownership before the configured maximum extension. If both
+            # scopes still observe the same amount, the Table proposal is
+            # applied first and the ordinary duplicate-bbox guard rejects the
+            # page copy.
+            page_exclusion_bboxes: list[tuple[float, float, float, float]] = [
                 _table_fringe_outer_bbox(
                     page,
                     table.bbox,
                     settings.bbox_recovery_fringe_bottom_extension,
                 )
+                for table in structured_tables
+            ]
+            orphan_exclusion_bboxes: list[tuple[float, float, float, float]] = [
+                table.bbox
                 for table in structured_tables
             ]
             checkbox_exclusion_bboxes: list[tuple[float, float, float, float]] = [
@@ -2133,6 +2140,7 @@ def build_bbox_recovery_manifest(
                 if isinstance(raw_region, Mapping):
                     region_bbox = _valid_bbox(raw_region.get("bbox"))
                     if region_bbox is not None:
+                        page_exclusion_bboxes.append(region_bbox)
                         orphan_exclusion_bboxes.append(region_bbox)
                         checkbox_exclusion_bboxes.append(region_bbox)
             for raw_region in (
@@ -2143,6 +2151,7 @@ def build_bbox_recovery_manifest(
                 if isinstance(raw_region, Mapping):
                     region_bbox = _valid_bbox(raw_region.get("bbox"))
                     if region_bbox is not None:
+                        page_exclusion_bboxes.append(region_bbox)
                         orphan_exclusion_bboxes.append(region_bbox)
                         checkbox_exclusion_bboxes.append(region_bbox)
             for block in _iter_blocks(page.get("preproc_blocks", [])):
@@ -2156,6 +2165,7 @@ def build_bbox_recovery_manifest(
                     continue
                 block_bbox = _block_bbox(block)
                 if block_bbox is not None:
+                    page_exclusion_bboxes.append(block_bbox)
                     orphan_exclusion_bboxes.append(block_bbox)
                     checkbox_exclusion_bboxes.append(block_bbox)
 
@@ -2173,7 +2183,8 @@ def build_bbox_recovery_manifest(
                     unique.append(list(valid_box))
                 return unique
 
-            unique_exclusions = unique_boxes(orphan_exclusion_bboxes)
+            unique_exclusions = unique_boxes(page_exclusion_bboxes)
+            unique_orphan_exclusions = unique_boxes(orphan_exclusion_bboxes)
             unique_checkbox_exclusions = unique_boxes(checkbox_exclusion_bboxes)
             unique_checkbox_fallbacks = unique_boxes(checkbox_fallback_bboxes)
             page_has_structure = bool(
@@ -2220,7 +2231,7 @@ def build_bbox_recovery_manifest(
                 "cells": [page_cell],
                 "page_existing": page_existing,
                 "page_exclusions": unique_exclusions,
-                "page_orphan_exclusions": unique_exclusions,
+                "page_orphan_exclusions": unique_orphan_exclusions,
                 "page_checkbox_exclusions": unique_checkbox_exclusions,
                 "page_checkbox_fallback_regions": unique_checkbox_fallbacks,
                 "allow_orphan_recovery": True,
