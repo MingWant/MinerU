@@ -819,14 +819,13 @@ There is no Custom Hybrid bearer-token header. Do not expose this service to the
 public internet; use a trusted LAN, VPN, firewall, or authenticated reverse proxy
 if the network itself is not trusted. The server uses
 `workflow.local.json` as its baseline. API tasks default to the `balanced` cost
-profile, which forces `effort=medium`, caps output at 2048 tokens, disables formula
-and image analysis, and prevents verifier/recognizer/reconciliation requests. It
-does not disable Table extraction, Pipeline OCR, deterministic fusion, or cyan
-content bboxes. Submit `extraction_mode=bbox_vlm` after either cost profile to
-enable the Pipeline OCR -> bbox repair -> local VLM path; this task override
-enables both the required Table recognizer and the selective geometry-review /
-pixel-refinement pass, while disabling unrelated verifier/reconciliation
-requests. In BBox VLM
+profile and `bbox_vlm` extraction mode. Balanced forces `effort=medium`, caps
+output at 2048 tokens, and disables formula, image analysis, unrelated
+verification, and reconciliation requests. BBox VLM runs the Pipeline OCR ->
+bbox repair -> local VLM path and enables the required Table recognizer plus the
+selective geometry-review / pixel-refinement pass. Submit
+`extraction_mode=hybrid_fusion` to run the dual Hybrid + Pipeline workflow
+instead. In BBox VLM
 mode with a general structured VLM, `balanced` sends target and row crops while
 keeping whole-Table images off; `quality` also enables the whole-Table context
 image. MinerU-native recognition always sends one target crop only. Both

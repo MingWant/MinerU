@@ -74,6 +74,7 @@ COST_PROFILES = {"balanced", "quality"}
 EXTRACTION_MODES = {"hybrid_fusion", "bbox_vlm"}
 LEGACY_EXTRACTION_MODE_ALIASES = {"bbox_vlm_recovery": "bbox_vlm"}
 DEFAULT_COST_PROFILE = "balanced"
+DEFAULT_EXTRACTION_MODE = "bbox_vlm"
 OPENAPI_MULTIPART_FILES_SCHEMA = {
     # OpenAPI 3.1 normally describes UploadFile with ``contentMediaType``.
     # Swagger UI currently needs the established ``format: binary`` hint to
@@ -350,7 +351,7 @@ class CustomHybridTaskManager:
 def _normalize_task_parameters(
     *,
     cost_profile: str | None = None,
-    extraction_mode: str | None = None,
+    extraction_mode: str | None = DEFAULT_EXTRACTION_MODE,
     effort: str | None = None,
     method: str | None = None,
     lang: str | None = None,
@@ -364,6 +365,8 @@ def _normalize_task_parameters(
     recovery_min_confidence: float | None = None,
     page_sorting_llm_enabled: bool | None = None,
 ) -> dict[str, Any]:
+    if extraction_mode is None:
+        extraction_mode = DEFAULT_EXTRACTION_MODE
     mineru: dict[str, Any] = {}
     generation: dict[str, Any] = {}
     recognizer_generation: dict[str, Any] = {}
@@ -968,7 +971,7 @@ def create_app(
             json_schema_extra=OPENAPI_MULTIPART_FILES_SCHEMA,
         ),
         cost_profile: str = Form(default=DEFAULT_COST_PROFILE),
-        extraction_mode: str | None = _optional_form(),
+        extraction_mode: str = Form(default=DEFAULT_EXTRACTION_MODE),
         effort: str | None = _optional_form(),
         method: str | None = _optional_form(),
         lang: str | None = _optional_form(),
@@ -1183,7 +1186,7 @@ def create_app(
             json_schema_extra=OPENAPI_MULTIPART_FILES_SCHEMA,
         ),
         cost_profile: str = Form(default=DEFAULT_COST_PROFILE),
-        extraction_mode: str | None = _optional_form(),
+        extraction_mode: str = Form(default=DEFAULT_EXTRACTION_MODE),
         effort: str | None = _optional_form(),
         method: str | None = _optional_form(),
         lang: str | None = _optional_form(),

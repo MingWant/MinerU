@@ -34,7 +34,7 @@ class CustomHybridUiTests(unittest.TestCase):
                         "status": "ok",
                         "task_parameter_defaults": {
                             "cost_profile": "balanced",
-                            "extraction_mode": "hybrid_fusion",
+                            "extraction_mode": "bbox_vlm",
                             "mineru": {"effort": "medium", "method": "auto", "lang": "ch"},
                             "generation": {"temperature": 0.0, "seed": 42},
                             "page_sorting": {
@@ -197,6 +197,10 @@ class CustomHybridUiTests(unittest.TestCase):
             self.assertIn('id="costProfileInput"', page.text)
             self.assertIn('id="extractionModeInput"', page.text)
             self.assertIn("OCR + BBox Repair + VLM", page.text)
+            self.assertIn(
+                '<option value="bbox_vlm" selected>',
+                page.text,
+            )
             self.assertNotIn("bbox_vlm_recovery", page.text)
             self.assertIn('id="effortInput"', page.text)
             self.assertIn('id="temperatureInput"', page.text)

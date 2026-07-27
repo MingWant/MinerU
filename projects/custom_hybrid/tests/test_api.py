@@ -215,7 +215,7 @@ class CustomHybridApiTests(unittest.TestCase):
                         archive.read("task_parameters.json").decode("utf-8")
                     )
                     self.assertEqual(task_parameters["cost_profile"], "balanced")
-                    self.assertEqual(task_parameters["extraction_mode"], "hybrid_fusion")
+                    self.assertEqual(task_parameters["extraction_mode"], "bbox_vlm")
                     self.assertEqual(task_parameters["mineru"]["effort"], "medium")
                 report = client.get(f"/tasks/{task_id}/report")
                 self.assertEqual(report.json()["documents"], ["invoice.pdf"])
@@ -329,9 +329,18 @@ class CustomHybridApiTests(unittest.TestCase):
                     self.assertEqual(files_schema["items"]["type"], "string")
                     self.assertEqual(files_schema["items"]["format"], "binary")
                     self.assertIn("one or more", files_schema["description"])
-                    optional_properties = set(
-                        openapi["components"]["schemas"][component_name]["properties"]
-                    ) - {"files", "cost_profile"}
+                    properties = openapi["components"]["schemas"][component_name][
+                        "properties"
+                    ]
+                    self.assertEqual(
+                        properties["extraction_mode"]["default"],
+                        "bbox_vlm",
+                    )
+                    optional_properties = set(properties) - {
+                        "files",
+                        "cost_profile",
+                        "extraction_mode",
+                    }
                     for property_name in optional_properties:
                         property_schema = openapi["components"]["schemas"][
                             component_name
@@ -481,6 +490,7 @@ class CustomHybridApiTests(unittest.TestCase):
                     files={"files": ("invoice.pdf", b"pdf")},
                     data={
                         "cost_profile": "balanced",
+                        "extraction_mode": "hybrid_fusion",
                         "effort": "medium",
                         "method": "ocr",
                         "lang": "en",
@@ -550,7 +560,10 @@ class CustomHybridApiTests(unittest.TestCase):
                 response = client.post(
                     "/tasks",
                     files={"files": ("invoice.pdf", b"pdf")},
-                    data={"cost_profile": "quality"},
+                    data={
+                        "cost_profile": "quality",
+                        "extraction_mode": "hybrid_fusion",
+                    },
                 )
                 self.assertEqual(response.status_code, 202)
                 task_id = response.json()["task_id"]
@@ -660,7 +673,7 @@ class CustomHybridApiTests(unittest.TestCase):
                 health = client.get("/health").json()
                 self.assertEqual(
                     health["task_parameter_defaults"]["extraction_mode"],
-                    "hybrid_fusion",
+                    "bbox_vlm",
                 )
                 response = client.post(
                     "/tasks",
