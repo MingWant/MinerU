@@ -866,11 +866,20 @@ Endpoints:
 - `DELETE /tasks/{task_id}`: remove a completed/failed task and its files;
 - `POST /file_parse`: wait synchronously and return the fused ZIP.
 
+Open `http://<host>:<port>/docs` to use the interactive API. The upload
+endpoints expose `files` as a file picker. Select a PDF/image and use
+`Add string item` to add another file picker for each additional document.
+Leave optional fields empty to use the server-side defaults, then execute the
+request. In OpenAPI, `files` is an array of binary strings, not an array of
+local path strings. Long-running processes must be restarted after upgrading
+for the corrected Swagger file picker to appear.
+
 Example task-level parameter override:
 
 ```bash
 curl -X POST \
   -F "files=@invoice.pdf" \
+  -F "files=@supporting-document.pdf" \
   -F "cost_profile=balanced" \
   -F "extraction_mode=bbox_vlm" \
   -F "recovery_max_tables=3" \

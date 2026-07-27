@@ -306,6 +306,59 @@ class CustomHybridApiTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(response.headers["content-type"], "application/zip")
 
+    def test_openapi_renders_upload_arrays_as_file_pickers(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            app = create_app(
+                self._write_config(root),
+                root / "tasks",
+                runner=self._successful_runner,
+            )
+            with TestClient(app) as client:
+                openapi = client.get("/openapi.json").json()
+                for path in ("/tasks", "/file_parse"):
+                    request_schema = openapi["paths"][path]["post"]["requestBody"][
+                        "content"
+                    ]["multipart/form-data"]["schema"]
+                    component_name = request_schema["$ref"].rsplit("/", 1)[-1]
+                    files_schema = openapi["components"]["schemas"][component_name][
+                        "properties"
+                    ]["files"]
+
+                    self.assertEqual(files_schema["type"], "array")
+                    self.assertEqual(files_schema["items"]["type"], "string")
+                    self.assertEqual(files_schema["items"]["format"], "binary")
+                    self.assertIn("one or more", files_schema["description"])
+                    optional_properties = set(
+                        openapi["components"]["schemas"][component_name]["properties"]
+                    ) - {"files", "cost_profile"}
+                    for property_name in optional_properties:
+                        property_schema = openapi["components"]["schemas"][
+                            component_name
+                        ]["properties"][property_name]
+                        self.assertEqual(property_schema["example"], "")
+
+                response = client.post(
+                    "/tasks",
+                    files={"files": ("invoice.pdf", b"pdf")},
+                    data={
+                        "extraction_mode": "",
+                        "effort": "",
+                        "method": "",
+                        "lang": "",
+                        "temperature": "",
+                        "top_p": "",
+                        "seed": "",
+                        "max_tokens": "",
+                        "repetition_penalty": "",
+                        "recovery_max_tables": "",
+                        "recovery_max_proposals": "",
+                        "recovery_min_confidence": "",
+                        "page_sorting_llm_enabled": "",
+                    },
+                )
+                self.assertEqual(response.status_code, 202)
+
     @unittest.skipUnless(PDF_RENDERING_AVAILABLE, "PDF rendering dependencies missing")
     def test_preview_endpoint_regenerates_missing_span_from_origin_pdf(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -74,6 +74,17 @@ COST_PROFILES = {"balanced", "quality"}
 EXTRACTION_MODES = {"hybrid_fusion", "bbox_vlm"}
 LEGACY_EXTRACTION_MODE_ALIASES = {"bbox_vlm_recovery": "bbox_vlm"}
 DEFAULT_COST_PROFILE = "balanced"
+OPENAPI_MULTIPART_FILES_SCHEMA = {
+    # OpenAPI 3.1 normally describes UploadFile with ``contentMediaType``.
+    # Swagger UI currently needs the established ``format: binary`` hint to
+    # render an array of uploads as a multi-file picker instead of string inputs.
+    "items": {"type": "string", "format": "binary"},
+}
+UPLOAD_FILES_DESCRIPTION = (
+    "Select one or more PDF or image files. Multiple documents are uploaded "
+    "as repeated multipart fields named `files`."
+)
+OPENAPI_EMPTY_OPTIONAL_FORM_VALUE = {"example": ""}
 API_OUTPUT_FUSION_OVERRIDES = {
     # API/UI conversions always expose the deterministic Markdown view. Keep
     # this task-scoped so an older workflow.local.json cannot silently fall
@@ -141,6 +152,14 @@ BBOX_VLM_FUSION_OVERRIDES = {
     },
     "reconciliation": {"enabled": False},
 }
+
+
+def _optional_form() -> Any:
+    """Keep optional Swagger form fields empty until the caller overrides them."""
+    return Form(
+        default=None,
+        json_schema_extra=OPENAPI_EMPTY_OPTIONAL_FORM_VALUE,
+    )
 
 
 def _now() -> str:
@@ -871,7 +890,16 @@ def create_app(
     app = FastAPI(
         title="Custom Hybrid MinerU API",
         version="1",
+        description=(
+            "Upload PDF or image documents for the Custom Hybrid MinerU "
+            "workflow. Use `POST /tasks` for production-style asynchronous "
+            "processing and `POST /file_parse` for a synchronous ZIP response."
+        ),
         lifespan=lifespan,
+        swagger_ui_parameters={
+            "displayRequestDuration": True,
+            "tryItOutEnabled": True,
+        },
     )
     app.state.task_manager = manager
     max_upload_bytes = max_upload_mb * 1024 * 1024
@@ -922,24 +950,37 @@ def create_app(
     async def get_document_output_schema() -> JSONResponse:
         return JSONResponse(content=DocumentOutput.model_json_schema())
 
-    @app.post("/tasks", status_code=202)
+    @app.post(
+        "/tasks",
+        status_code=202,
+        tags=["Parsing"],
+        summary="Submit documents for asynchronous parsing",
+        description=(
+            "Upload one or more PDF/image files as `multipart/form-data`. "
+            "The response contains a task ID and URLs for polling and results."
+        ),
+    )
     async def submit_task(
         request: Request,
-        files: list[UploadFile] = File(...),
+        files: list[UploadFile] = File(
+            ...,
+            description=UPLOAD_FILES_DESCRIPTION,
+            json_schema_extra=OPENAPI_MULTIPART_FILES_SCHEMA,
+        ),
         cost_profile: str = Form(default=DEFAULT_COST_PROFILE),
-        extraction_mode: str | None = Form(default=None),
-        effort: str | None = Form(default=None),
-        method: str | None = Form(default=None),
-        lang: str | None = Form(default=None),
-        temperature: float | None = Form(default=None),
-        top_p: float | None = Form(default=None),
-        seed: int | None = Form(default=None),
-        max_tokens: int | None = Form(default=None),
-        repetition_penalty: float | None = Form(default=None),
-        recovery_max_tables: int | None = Form(default=None),
-        recovery_max_proposals: int | None = Form(default=None),
-        recovery_min_confidence: float | None = Form(default=None),
-        page_sorting_llm_enabled: bool | None = Form(default=None),
+        extraction_mode: str | None = _optional_form(),
+        effort: str | None = _optional_form(),
+        method: str | None = _optional_form(),
+        lang: str | None = _optional_form(),
+        temperature: float | None = _optional_form(),
+        top_p: float | None = _optional_form(),
+        seed: int | None = _optional_form(),
+        max_tokens: int | None = _optional_form(),
+        repetition_penalty: float | None = _optional_form(),
+        recovery_max_tables: int | None = _optional_form(),
+        recovery_max_proposals: int | None = _optional_form(),
+        recovery_min_confidence: float | None = _optional_form(),
+        page_sorting_llm_enabled: bool | None = _optional_form(),
     ) -> dict[str, Any]:
         parameters = _normalize_task_parameters(
             cost_profile=cost_profile,
@@ -1125,23 +1166,36 @@ def create_app(
             content={"documents": _task_sorting_documents(record)}
         )
 
-    @app.post("/file_parse")
+    @app.post(
+        "/file_parse",
+        tags=["Parsing"],
+        summary="Parse documents synchronously",
+        description=(
+            "Upload one or more PDF/image files as `multipart/form-data`, wait "
+            "for processing to finish, and receive the result ZIP directly. "
+            "Use `/tasks` for long-running production requests."
+        ),
+    )
     async def file_parse(
-        files: list[UploadFile] = File(...),
+        files: list[UploadFile] = File(
+            ...,
+            description=UPLOAD_FILES_DESCRIPTION,
+            json_schema_extra=OPENAPI_MULTIPART_FILES_SCHEMA,
+        ),
         cost_profile: str = Form(default=DEFAULT_COST_PROFILE),
-        extraction_mode: str | None = Form(default=None),
-        effort: str | None = Form(default=None),
-        method: str | None = Form(default=None),
-        lang: str | None = Form(default=None),
-        temperature: float | None = Form(default=None),
-        top_p: float | None = Form(default=None),
-        seed: int | None = Form(default=None),
-        max_tokens: int | None = Form(default=None),
-        repetition_penalty: float | None = Form(default=None),
-        recovery_max_tables: int | None = Form(default=None),
-        recovery_max_proposals: int | None = Form(default=None),
-        recovery_min_confidence: float | None = Form(default=None),
-        page_sorting_llm_enabled: bool | None = Form(default=None),
+        extraction_mode: str | None = _optional_form(),
+        effort: str | None = _optional_form(),
+        method: str | None = _optional_form(),
+        lang: str | None = _optional_form(),
+        temperature: float | None = _optional_form(),
+        top_p: float | None = _optional_form(),
+        seed: int | None = _optional_form(),
+        max_tokens: int | None = _optional_form(),
+        repetition_penalty: float | None = _optional_form(),
+        recovery_max_tables: int | None = _optional_form(),
+        recovery_max_proposals: int | None = _optional_form(),
+        recovery_min_confidence: float | None = _optional_form(),
+        page_sorting_llm_enabled: bool | None = _optional_form(),
     ):
         parameters = _normalize_task_parameters(
             cost_profile=cost_profile,
