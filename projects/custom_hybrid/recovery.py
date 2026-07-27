@@ -30,7 +30,7 @@ _TERMINAL_IDENTIFIER_FIELD_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _TERMINAL_SIGNATURE_FIELD_RE = re.compile(
-    r"(?:signature|signed|簽署|签署)",
+    r"(?:signature|signed|簽署|签署|簽名|签名)",
     flags=re.IGNORECASE,
 )
 _CONTROL_CHOICE_PAIR_RE = re.compile(
@@ -1491,6 +1491,9 @@ class OpenAIBBoxRecoveryReviewer:
 
             existing_mask = np.zeros_like(dark_mask, dtype=bool)
             existing_bboxes = []
+            signature_context_bboxes: list[
+                tuple[float, float, float, float]
+            ] = []
             mask_cell_geometry = not bool(table.get("page_region"))
             for cell in cells:
                 if mask_cell_geometry:
@@ -1502,6 +1505,10 @@ class OpenAIBBoxRecoveryReviewer:
                     if bbox is not None:
                         existing_bboxes.append(bbox)
                         mark_bbox(existing_mask, bbox, padding_x, padding_y)
+                        if _TERMINAL_SIGNATURE_FIELD_RE.search(
+                            str(box.get("text", ""))
+                        ):
+                            signature_context_bboxes.append(bbox)
             for box in table.get("page_existing", []):
                 if not isinstance(box, Mapping):
                     continue
@@ -1509,6 +1516,10 @@ class OpenAIBBoxRecoveryReviewer:
                 if bbox is not None:
                     existing_bboxes.append(bbox)
                     mark_bbox(existing_mask, bbox, padding_x, padding_y)
+                    if _TERMINAL_SIGNATURE_FIELD_RE.search(
+                        str(box.get("text", ""))
+                    ):
+                        signature_context_bboxes.append(bbox)
             orphan_exclusions = table.get(
                 "page_orphan_exclusions",
                 table.get("page_exclusions", []),
@@ -1778,6 +1789,47 @@ class OpenAIBBoxRecoveryReviewer:
                 row = cell.get("row_end")
                 return (vertical + horizontal, -float(row or 0))
 
+            signature_context_gap = max(
+                float(
+                    self.config.get(
+                        "page_recovery_signature_context_gap",
+                        72.0,
+                    )
+                ),
+                0.0,
+            )
+
+            def nearby_signature_context(
+                candidate_bbox: Sequence[float],
+            ) -> tuple[float, float, float, float] | None:
+                matches = []
+                for context_bbox in signature_context_bboxes:
+                    horizontal_gap_points = max(
+                        candidate_bbox[0] - context_bbox[2],
+                        context_bbox[0] - candidate_bbox[2],
+                        0.0,
+                    )
+                    vertical_gap_points = max(
+                        candidate_bbox[1] - context_bbox[3],
+                        context_bbox[1] - candidate_bbox[3],
+                        0.0,
+                    )
+                    if (
+                        horizontal_gap_points <= signature_context_gap
+                        and vertical_gap_points <= signature_context_gap
+                        and (candidate_bbox[1] + candidate_bbox[3]) / 2
+                        <= context_bbox[3] + signature_context_gap * 0.25
+                    ):
+                        matches.append(
+                            (
+                                horizontal_gap_points + vertical_gap_points,
+                                context_bbox,
+                            )
+                        )
+                return min(matches, default=(0.0, None), key=lambda item: item[0])[
+                    1
+                ]
+
             for top, bottom in bands:
                 band_mask = orphan_mask[top:bottom, :]
                 active_columns = np.flatnonzero(
@@ -1905,6 +1957,40 @@ class OpenAIBBoxRecoveryReviewer:
                     maximum_gate_height = (
                         raw_height if page_region or is_fringe else height
                     )
+                    signature_context = (
+                        nearby_signature_context(bbox) if page_region else None
+                    )
+                    signature_handwriting = bool(
+                        signature_context is not None
+                        and maximum_gate_height > maximum_height
+                        and maximum_gate_height
+                        <= max(
+                            float(
+                                self.config.get(
+                                    "page_recovery_signature_max_height",
+                                    64.0,
+                                )
+                            ),
+                            maximum_height,
+                        )
+                        and ink_density
+                        <= float(
+                            self.config.get(
+                                "page_recovery_signature_max_ink_density",
+                                0.3,
+                            )
+                        )
+                    )
+                    if signature_handwriting:
+                        maximum_height = max(
+                            maximum_height,
+                            float(
+                                self.config.get(
+                                    "page_recovery_signature_max_height",
+                                    64.0,
+                                )
+                            ),
+                        )
                     if (
                         (page_region or is_fringe)
                         and maximum_gate_height > maximum_height
@@ -2110,6 +2196,39 @@ class OpenAIBBoxRecoveryReviewer:
                         continue
                     if bbox[2] - bbox[0] < minimum_width:
                         continue
+                    if signature_handwriting and signature_context is not None:
+                        horizontal_padding = max(
+                            float(
+                                self.config.get(
+                                    "page_recovery_signature_horizontal_padding",
+                                    18.0,
+                                )
+                            ),
+                            0.0,
+                        )
+                        clipped_signature_bbox = _clip_bbox(
+                            (
+                                max(
+                                    bbox[0],
+                                    signature_context[0] - horizontal_padding,
+                                ),
+                                bbox[1],
+                                min(
+                                    bbox[2],
+                                    signature_context[2] + horizontal_padding,
+                                ),
+                                bbox[3],
+                            ),
+                            search_bbox,
+                        )
+                        if (
+                            clipped_signature_bbox is None
+                            or clipped_signature_bbox[2]
+                            - clipped_signature_bbox[0]
+                            < minimum_width
+                        ):
+                            continue
+                        bbox = clipped_signature_bbox
                     if any(
                         _bbox_overlap_ratio(bbox, existing_bbox) >= 0.5
                         for existing_bbox in existing_bboxes
@@ -2143,12 +2262,16 @@ class OpenAIBBoxRecoveryReviewer:
                                 )
                             ),
                             "recovery_reasons": [
-                                "table_fringe_ink_without_bbox"
+                                "page_signature_handwriting_without_bbox"
+                                if signature_handwriting
+                                else "table_fringe_ink_without_bbox"
                                 if is_fringe
                                 else "table_ink_outside_cells"
                             ],
                             "recovery_source": (
-                                "local_table_fringe_ink"
+                                "local_page_signature_handwriting"
+                                if signature_handwriting
+                                else "local_table_fringe_ink"
                                 if is_fringe
                                 else "local_table_orphan_ink"
                             ),
@@ -2283,6 +2406,18 @@ class OpenAIBBoxRecoveryReviewer:
             return (vertical + horizontal, -float(row or 0))
 
         merged: list[dict[str, Any]] = []
+
+        def is_signature_handwriting(item: Mapping[str, Any]) -> bool:
+            reasons = item.get("recovery_reasons", [])
+            return bool(
+                item.get("recovery_source")
+                == "local_page_signature_handwriting"
+                or (
+                    isinstance(reasons, list)
+                    and "page_signature_handwriting_without_bbox" in reasons
+                )
+            )
+
         for raw_item in sorted(
             proposals,
             key=lambda item: (
@@ -2301,6 +2436,8 @@ class OpenAIBBoxRecoveryReviewer:
                 if (
                     existing.get("action") != item.get("action")
                     or existing.get("table_id") != item.get("table_id")
+                    or is_signature_handwriting(existing)
+                    != is_signature_handwriting(item)
                 ):
                     continue
                 existing_bbox = _valid_bbox(existing.get("bbox"))
@@ -2372,11 +2509,18 @@ class OpenAIBBoxRecoveryReviewer:
             }
             reasons.add("table_orphan_horizontal_fragment_merge")
             existing["recovery_reasons"] = sorted(reasons)
-            existing["recovery_source"] = (
-                "local_table_fringe_fragment_merge"
-                if existing.get("action") == "add_fringe"
-                else "local_table_orphan_fragment_merge"
-            )
+            if is_signature_handwriting(existing):
+                existing["recovery_source"] = (
+                    "local_page_signature_handwriting_fragment_merge"
+                )
+            elif existing.get("action") == "add_fringe":
+                existing["recovery_source"] = (
+                    "local_table_fringe_fragment_merge"
+                )
+            else:
+                existing["recovery_source"] = (
+                    "local_table_orphan_fragment_merge"
+                )
             if cells_with_bbox:
                 nearest_cell, _nearest_bbox = min(
                     cells_with_bbox,
@@ -2437,6 +2581,10 @@ class OpenAIBBoxRecoveryReviewer:
                     )
 
         proposals = self._merge_orphan_line_proposals(table, proposals)
+        proposals = self._merge_page_signature_occluded_text(
+            table,
+            proposals,
+        )
         duplicate_iou = min(
             max(float(self.config.get("duplicate_iou", 0.6)), 0.0),
             1.0,
@@ -2482,11 +2630,195 @@ class OpenAIBBoxRecoveryReviewer:
         fringe_count = sum(
             1 for item in selected if item.get("action") == "add_fringe"
         )
-        self.fringe_boxes_proposed = fringe_boxes_before + fringe_count
-        self.orphan_boxes_proposed = (
-            orphan_boxes_before + len(selected) - fringe_count
+        orphan_count = sum(
+            1 for item in selected if item.get("action") == "add_orphan"
         )
+        self.fringe_boxes_proposed = fringe_boxes_before + fringe_count
+        self.orphan_boxes_proposed = orphan_boxes_before + orphan_count
         return selected
+
+    def _merge_page_signature_occluded_text(
+        self,
+        table: Mapping[str, Any],
+        proposals: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Expand a partial OCR line whose middle is covered by a signature."""
+        if not table.get("page_region"):
+            return [dict(item) for item in proposals]
+        cells = [
+            cell
+            for cell in table.get("cells", [])
+            if isinstance(cell, Mapping)
+        ]
+        if not cells:
+            return [dict(item) for item in proposals]
+        existing_records = [
+            item
+            for cell in cells
+            for item in cell.get("existing", [])
+            if isinstance(item, Mapping)
+            and isinstance(item.get("id"), str)
+            and _valid_bbox(item.get("bbox")) is not None
+            and str(item.get("text", "")).strip()
+            and not _TERMINAL_SIGNATURE_FIELD_RE.search(
+                str(item.get("text", ""))
+            )
+        ]
+        if not existing_records:
+            return [dict(item) for item in proposals]
+        maximum_gap = max(
+            float(
+                self.config.get(
+                    "page_recovery_signature_text_max_gap",
+                    24.0,
+                )
+            ),
+            0.0,
+        )
+        maximum_width = max(
+            float(
+                self.config.get(
+                    "page_recovery_signature_text_max_width",
+                    240.0,
+                )
+            ),
+            0.0,
+        )
+        maximum_height = max(
+            float(self.config.get("page_recovery_max_line_height", 24.0)),
+            1.0,
+        )
+
+        def is_signature(item: Mapping[str, Any]) -> bool:
+            return str(item.get("recovery_source", "")).startswith(
+                "local_page_signature_handwriting"
+            )
+
+        def horizontal_gap(
+            left: Sequence[float],
+            right: Sequence[float],
+        ) -> float:
+            return max(left[0] - right[2], right[0] - left[2], 0.0)
+
+        def vertical_overlap_ratio(
+            left: Sequence[float],
+            right: Sequence[float],
+        ) -> float:
+            overlap = max(
+                0.0,
+                min(left[3], right[3]) - max(left[1], right[1]),
+            )
+            return overlap / max(
+                min(left[3] - left[1], right[3] - right[1]),
+                1e-6,
+            )
+
+        working = [dict(item) for item in proposals]
+        consumed: set[int] = set()
+        additions: list[dict[str, Any]] = []
+        for signature in working:
+            if not is_signature(signature):
+                continue
+            signature_bbox = _valid_bbox(signature.get("bbox"))
+            if signature_bbox is None:
+                continue
+            signature_center = (signature_bbox[0] + signature_bbox[2]) / 2
+            matches = []
+            for existing in existing_records:
+                existing_bbox = _valid_bbox(existing.get("bbox"))
+                if (
+                    existing_bbox is None
+                    or existing_bbox[3] - existing_bbox[1] > maximum_height
+                    or horizontal_gap(signature_bbox, existing_bbox)
+                    > maximum_gap
+                    or vertical_overlap_ratio(signature_bbox, existing_bbox)
+                    < 0.35
+                ):
+                    continue
+                existing_center = (existing_bbox[0] + existing_bbox[2]) / 2
+                for index, fragment in enumerate(working):
+                    fragment_bbox = _valid_bbox(fragment.get("bbox"))
+                    if (
+                        index in consumed
+                        or fragment is signature
+                        or is_signature(fragment)
+                        or fragment.get("action") != "add_orphan"
+                        or fragment_bbox is None
+                        or fragment_bbox[3] - fragment_bbox[1]
+                        > maximum_height
+                        or horizontal_gap(signature_bbox, fragment_bbox)
+                        > maximum_gap
+                        or vertical_overlap_ratio(fragment_bbox, existing_bbox)
+                        < 0.5
+                    ):
+                        continue
+                    fragment_center = (fragment_bbox[0] + fragment_bbox[2]) / 2
+                    if (
+                        (existing_center - signature_center)
+                        * (fragment_center - signature_center)
+                        >= 0.0
+                    ):
+                        continue
+                    union_bbox = (
+                        min(existing_bbox[0], fragment_bbox[0]),
+                        min(existing_bbox[1], fragment_bbox[1]),
+                        max(existing_bbox[2], fragment_bbox[2]),
+                        max(existing_bbox[3], fragment_bbox[3]),
+                    )
+                    if (
+                        union_bbox[2] - union_bbox[0] > maximum_width
+                        or union_bbox[3] - union_bbox[1]
+                        > maximum_height * 1.25
+                        or not union_bbox[0]
+                        <= signature_center
+                        <= union_bbox[2]
+                    ):
+                        continue
+                    matches.append(
+                        (
+                            horizontal_gap(signature_bbox, existing_bbox)
+                            + horizontal_gap(signature_bbox, fragment_bbox),
+                            index,
+                            existing,
+                            union_bbox,
+                            fragment,
+                        )
+                    )
+            if not matches:
+                continue
+            _score, index, existing, union_bbox, fragment = min(
+                matches,
+                key=lambda item: item[0],
+            )
+            consumed.add(index)
+            reasons = {
+                "page_text_occluded_by_signature",
+                *(
+                    fragment.get("recovery_reasons", [])
+                    if isinstance(fragment.get("recovery_reasons"), list)
+                    else []
+                ),
+            }
+            additions.append(
+                {
+                    "action": "adjust",
+                    "table_id": signature.get("table_id"),
+                    "cell_id": signature.get("cell_id"),
+                    "target_id": existing.get("id"),
+                    "bbox": list(union_bbox),
+                    "confidence": min(
+                        float(signature.get("confidence", 0.0)),
+                        float(fragment.get("confidence", 0.0)),
+                    ),
+                    "recovery_reasons": sorted(reasons),
+                    "recovery_source": (
+                        "local_page_signature_occluded_text"
+                    ),
+                }
+            )
+        return [
+            item for index, item in enumerate(working) if index not in consumed
+        ] + additions
 
     def _deduplicate_recovery_additions(
         self,

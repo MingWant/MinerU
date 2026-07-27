@@ -1395,6 +1395,160 @@ class FusionTests(unittest.TestCase):
         self.assertEqual(decisions[0]["region_kind"], "page")
         self.assertTrue(unchanged)
 
+    def test_page_signature_recovery_keeps_semantic_annotation(self):
+        page = middle("Known OCR", bbox=(20, 20, 100, 32))["pdf_info"][0]
+        settings = FusionSettings.from_mapping(
+            {
+                "mode": "bbox_vlm",
+                "recovery": {"page_recovery_enabled": True},
+            }
+        )
+        build_bbox_recovery_manifest(page, 0, settings)
+        stats, _decisions, _batches, _unchanged = (
+            apply_bbox_recovery_proposals(
+                page,
+                0,
+                {
+                    "items": [
+                        {
+                            "action": "add_orphan",
+                            "table_id": "p0-page-recovery",
+                            "cell_id": "p0-page-c0",
+                            "target_id": "",
+                            "bbox": [25, 60, 100, 95],
+                            "confidence": 0.95,
+                            "recovery_source": (
+                                "local_page_signature_handwriting"
+                            ),
+                        }
+                    ]
+                },
+                settings,
+                remaining_document_budget=10,
+            )
+        )
+        recovered = [
+            line
+            for line in collect_text_lines(page, 0)
+            if line.spans[0].get("fusion_recovery_signature")
+        ]
+
+        def recognize(_page, _size, candidates):
+            return {
+                "items": [
+                    {"id": candidates[0]["id"], "text": "集團有限"}
+                ]
+            }
+
+        recognition_stats, recognition_decisions, _recognition_batches = (
+            apply_bbox_recognition(
+                0,
+                [200, 300],
+                recovered,
+                settings,
+                recognize,
+            )
+        )
+
+        self.assertEqual(stats["page_added"], 1)
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0].text, "[Signature]")
+        self.assertEqual(recognition_stats["responses"], 1)
+        self.assertEqual(recognition_decisions[0]["vlm_text"], "集團有限")
+        self.assertEqual(
+            recognition_decisions[0]["normalized_vlm_text"],
+            "[Signature]",
+        )
+        self.assertEqual(
+            recognition_decisions[0]["vlm_text_normalization"],
+            "signature_annotation",
+        )
+
+    def test_page_signature_occluded_text_expands_and_recognizes_full_line(self):
+        page = middle(
+            "公司",
+            score=1.0,
+            bbox=(150, 180, 190, 195),
+        )["pdf_info"][0]
+        settings = FusionSettings.from_mapping(
+            {
+                "mode": "bbox_vlm",
+                "recovery": {"page_recovery_enabled": True},
+            }
+        )
+        manifest = build_bbox_recovery_manifest(page, 0, settings)
+        page_region = next(
+            item for item in manifest if item["kind"] == "page_region"
+        )
+        target = next(
+            item
+            for item in page_region["cells"][0]["existing"]
+            if item["text"] == "公司"
+        )
+
+        stats, decisions, _batches, _unchanged = (
+            apply_bbox_recovery_proposals(
+                page,
+                0,
+                {
+                    "items": [
+                        {
+                            "action": "adjust",
+                            "table_id": "p0-page-recovery",
+                            "cell_id": "p0-page-c0",
+                            "target_id": target["id"],
+                            "bbox": [50, 180, 190, 195],
+                            "confidence": 0.95,
+                            "recovery_source": (
+                                "local_page_signature_occluded_text"
+                            ),
+                        }
+                    ]
+                },
+                settings,
+                remaining_document_budget=10,
+            )
+        )
+        recovered = [
+            line
+            for line in collect_text_lines(page, 0)
+            if line.spans[0].get(
+                "fusion_recovery_signature_occluded_text"
+            )
+        ]
+
+        def recognize(_page, _size, candidates):
+            self.assertEqual(candidates[0]["bbox"], [50.0, 180.0, 190.0, 195.0])
+            return {
+                "items": [
+                    {
+                        "id": candidates[0]["id"],
+                        "text": "互康集团有限公司",
+                    }
+                ]
+            }
+
+        recognition_stats, recognition_decisions, _recognition_batches = (
+            apply_bbox_recognition(
+                0,
+                [200, 300],
+                recovered,
+                settings,
+                recognize,
+            )
+        )
+
+        self.assertEqual(stats["adjusted"], 1)
+        self.assertEqual(decisions[0]["result"], "accepted")
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0].bbox, (50.0, 180.0, 190.0, 195.0))
+        self.assertEqual(recognition_stats["vlm_selected"], 1)
+        self.assertEqual(recovered[0].text, "互康集团有限公司")
+        self.assertEqual(
+            recognition_decisions[0]["reason"],
+            "signature_occluded_text_completion",
+        )
+
     def test_page_recovery_scans_residual_area_alongside_table_and_form(self):
         page = structured_middle(
             "table",

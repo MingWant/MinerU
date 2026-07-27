@@ -121,6 +121,9 @@
         "min_page_input_chars": 500
       }
     },
+    "document_output": {
+      "enabled": true
+    },
     "recognizer": {
       "enabled": false,
       "base_url": null,
@@ -276,6 +279,12 @@
       "page_recovery_graphic_max_component_ratio": 0.72,
       "page_recovery_graphic_min_height": 14.0,
       "page_recovery_max_line_height": 24.0,
+      "page_recovery_signature_context_gap": 72.0,
+      "page_recovery_signature_max_height": 64.0,
+      "page_recovery_signature_max_ink_density": 0.3,
+      "page_recovery_signature_horizontal_padding": 18.0,
+      "page_recovery_signature_text_max_gap": 24.0,
+      "page_recovery_signature_text_max_width": 240.0,
       "page_recovery_rule_min_aspect_ratio": 20.0,
       "page_recovery_rule_min_component_width_ratio": 0.8,
       "table_fringe_recovery_enabled": true,

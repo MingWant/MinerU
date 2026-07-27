@@ -37,6 +37,11 @@ from projects.custom_hybrid.workflow import (
     regenerate_fused_visualizations,
     run_extract,
 )
+from projects.custom_hybrid.document_output import (
+    DOCUMENT_OUTPUT_SCHEMA_VERSION,
+    DOCUMENT_OUTPUT_SUFFIX,
+    DocumentOutput,
+)
 
 
 SUPPORTED_INPUT_SUFFIXES = {
@@ -83,6 +88,7 @@ API_OUTPUT_FUSION_OVERRIDES = {
         "mode": "report_only",
         "include_semantic_diagnostics": True,
     },
+    "document_output": {"enabled": True},
 }
 BALANCED_FUSION_OVERRIDES = {
     "max_verifications_per_document": 0,
@@ -590,6 +596,7 @@ def _task_parameter_defaults(
     fusion_config = effective_config.get("fusion", {})
     semantic_markdown = fusion_config.get("semantic_markdown", {})
     page_sorting = fusion_config.get("page_sorting", {})
+    document_output = fusion_config.get("document_output", {})
     page_sorting_llm = page_sorting.get("llm", {})
     if not isinstance(page_sorting_llm, Mapping):
         page_sorting_llm = {}
@@ -648,6 +655,10 @@ def _task_parameter_defaults(
                 "model": page_sorting_llm.get("model"),
                 "trigger": page_sorting_llm.get("trigger", "unverified"),
             },
+        },
+        "document_output": {
+            "enabled": bool(document_output.get("enabled", False)),
+            "schema_version": DOCUMENT_OUTPUT_SCHEMA_VERSION,
         },
     }
 
@@ -720,6 +731,37 @@ def _task_sorting_documents(record: TaskRecord) -> list[dict[str, Any]]:
             }
         )
     return documents
+
+
+def _task_document_outputs(record: TaskRecord) -> dict[str, Path]:
+    fused_root = record.output_root / "fused"
+    if not fused_root.is_dir():
+        return {}
+    return {
+        path.relative_to(fused_root).as_posix(): path
+        for path in sorted(fused_root.rglob(f"*{DOCUMENT_OUTPUT_SUFFIX}"))
+        if path.is_file()
+    }
+
+
+def _select_task_document_output(
+    record: TaskRecord,
+    document: str | None,
+) -> tuple[str, Path]:
+    documents = _task_document_outputs(record)
+    if not documents:
+        raise HTTPException(
+            status_code=404,
+            detail="No structured document output is available",
+        )
+    selected = document or next(iter(documents))
+    path = documents.get(selected)
+    if path is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Structured document output not found",
+        )
+    return selected, path
 
 
 def _select_task_markdown(record: TaskRecord, document: str | None) -> tuple[str, Path]:
@@ -876,6 +918,10 @@ def create_app(
             "task_parameter_defaults": _task_parameter_defaults(config),
         }
 
+    @app.get("/schemas/document-output", name="get_document_output_schema")
+    async def get_document_output_schema() -> JSONResponse:
+        return JSONResponse(content=DocumentOutput.model_json_schema())
+
     @app.post("/tasks", status_code=202)
     async def submit_task(
         request: Request,
@@ -990,6 +1036,40 @@ def create_app(
                 "name": markdown_path.stem,
                 "markdown": markdown_path.read_text(encoding="utf-8"),
                 "content_list": _content_list_text(markdown_path),
+            }
+        )
+
+    @app.get(
+        "/tasks/{task_id}/structured",
+        name="get_task_structured_output",
+    )
+    async def get_task_structured_output(
+        task_id: str,
+        document: str | None = None,
+    ) -> JSONResponse:
+        record = require_completed_task(task_id)
+        selected, output_path = _select_task_document_output(record, document)
+        documents = _task_document_outputs(record)
+        try:
+            output = DocumentOutput.model_validate_json(
+                output_path.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError) as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Invalid structured document output: {exc}",
+            ) from exc
+        return JSONResponse(
+            content={
+                "documents": [
+                    {
+                        "id": item_id,
+                        "name": path.name[: -len(DOCUMENT_OUTPUT_SUFFIX)],
+                    }
+                    for item_id, path in documents.items()
+                ],
+                "selected": selected,
+                "output": output.model_dump(mode="json", exclude_none=True),
             }
         )
 

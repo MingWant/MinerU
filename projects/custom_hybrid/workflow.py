@@ -266,6 +266,11 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         raise WorkflowConfigError(
             "fusion.page_sorting.include_semantic_diagnostics must be a boolean"
         )
+    document_output = fusion_config.get("document_output", {})
+    if not isinstance(document_output, dict):
+        raise WorkflowConfigError("fusion.document_output must be a JSON object")
+    if not isinstance(document_output.get("enabled", False), bool):
+        raise WorkflowConfigError("fusion.document_output.enabled must be a boolean")
     sorting_llm = page_sorting.get("llm", {})
     if not isinstance(sorting_llm, dict):
         raise WorkflowConfigError("fusion.page_sorting.llm must be a JSON object")
@@ -472,6 +477,7 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         "list_marker_min_vertical_overlap",
         "page_recovery_graphic_min_ink_density",
         "page_recovery_graphic_max_component_ratio",
+        "page_recovery_signature_max_ink_density",
     ):
         field = recovery.get(key)
         if field is not None and (
@@ -623,6 +629,11 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         ("list_marker_max_gap", 24.0, True),
         ("page_recovery_graphic_min_height", 14.0, False),
         ("page_recovery_max_line_height", 24.0, False),
+        ("page_recovery_signature_context_gap", 72.0, True),
+        ("page_recovery_signature_max_height", 64.0, False),
+        ("page_recovery_signature_horizontal_padding", 18.0, True),
+        ("page_recovery_signature_text_max_gap", 24.0, True),
+        ("page_recovery_signature_text_max_width", 240.0, False),
         ("page_recovery_rule_min_aspect_ratio", 20.0, False),
         ("checkbox_embedded_glyph_max_size", 7.5, False),
         ("checkbox_embedded_glyph_max_left_offset", 16.0, True),
@@ -1826,6 +1837,7 @@ def _regenerate_fused_outputs(
     source_document: Path | None = None,
     semantic_markdown_config: Mapping[str, Any] | None = None,
     page_sorting_config: Mapping[str, Any] | None = None,
+    document_output_config: Mapping[str, Any] | None = None,
 ) -> tuple[Path, ...]:
     if str(REPOSITORY_ROOT) not in sys.path:
         sys.path.insert(0, str(REPOSITORY_ROOT))
@@ -1847,6 +1859,13 @@ def _regenerate_fused_outputs(
         )
     )
     generated.extend(
+        _generate_document_output(
+            parse_dir,
+            document_stem,
+            document_output_config or {},
+        )
+    )
+    generated.extend(
         _generate_fused_visualizations(
             parse_dir,
             document_stem,
@@ -1854,6 +1873,44 @@ def _regenerate_fused_outputs(
         )
     )
     return tuple(generated)
+
+
+def _generate_document_output(
+    parse_dir: Path,
+    document_stem: str,
+    config: Mapping[str, Any],
+) -> tuple[Path, ...]:
+    if not config.get("enabled", False):
+        return ()
+    from projects.custom_hybrid.document_output import (
+        DOCUMENT_OUTPUT_SCHEMA_VERSION,
+        write_document_output,
+    )
+
+    middle_path = parse_dir / f"{document_stem}_middle.json"
+    try:
+        output_path = write_document_output(
+            middle_path,
+            raw_metadata={"document_stem": document_stem},
+        )
+        return (output_path,)
+    except Exception as exc:
+        # Keep the native MinerU artifacts usable and make adapter failures visible.
+        error_path = parse_dir / f"{document_stem}_document_error.json"
+        error_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": DOCUMENT_OUTPUT_SCHEMA_VERSION,
+                    "status": "error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return (error_path,)
 
 
 def _generate_page_sorting_outputs(
@@ -2328,6 +2385,7 @@ def fuse_output_trees(
                 vision_document_path,
                 fusion_config.get("semantic_markdown", {}),
                 fusion_config.get("page_sorting", {}),
+                fusion_config.get("document_output", {}),
             )
             document_summary = {
                 "middle_json": str(fused_path),

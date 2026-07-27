@@ -650,6 +650,155 @@ class BBoxRecoveryReviewerTests(unittest.TestCase):
         self.assertEqual(len(orphans), 1)
         self.assertGreater(orphans[0]["bbox"][1], 80.0)
 
+    def test_page_region_recovers_tall_handwriting_near_signature_label(self):
+        from PIL import Image, ImageDraw
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            image = Image.new("RGB", (350, 130), "white")
+            draw = ImageDraw.Draw(image)
+            # A tall handwritten-style stroke is allowed above its semantic
+            # signature label; an equally tall unanchored graphic is not.
+            draw.line(
+                [(80, 70), (88, 28), (98, 68), (108, 30), (120, 70)],
+                fill="black",
+                width=2,
+            )
+            draw.line(
+                [(280, 70), (288, 28), (298, 68), (308, 30), (320, 70)],
+                fill="black",
+                width=2,
+            )
+            draw.text((75, 84), "Authorized Signature(s)", fill="black")
+            image.save(image_path)
+            image.close()
+            reviewer = OpenAIBBoxRecoveryReviewer(
+                "http://vision.test",
+                image_path,
+                {
+                    "model": "mineru-local",
+                    "render_scale": 1.0,
+                    "checkbox_recovery_enabled": False,
+                    "table_diagonal_rule_enabled": False,
+                    "table_orphan_residual_passes": 0,
+                    "page_recovery_max_line_height": 16.0,
+                    "page_recovery_signature_max_height": 64.0,
+                },
+            )
+            signature_label = {
+                "bbox": [70, 80, 205, 100],
+                "text": "Authorized Signature(s)",
+            }
+            try:
+                result = reviewer(
+                    0,
+                    [350, 130],
+                    [
+                        {
+                            "id": "p0-page-recovery",
+                            "kind": "page_region",
+                            "page_region": True,
+                            "bbox": [0, 0, 350, 130],
+                            "cells": [
+                                {
+                                    "id": "p0-page-c0",
+                                    "bbox": [0, 0, 350, 130],
+                                    "existing": [signature_label],
+                                    "reasons": [],
+                                }
+                            ],
+                            "page_existing": [signature_label],
+                            "page_exclusions": [],
+                            "allow_orphan_recovery": True,
+                            "disable_marker_merges": True,
+                        }
+                    ],
+                )
+            finally:
+                reviewer.close()
+
+        orphans = [
+            item for item in result["items"] if item.get("action") == "add_orphan"
+        ]
+        self.assertEqual(len(orphans), 1)
+        self.assertLess(orphans[0]["bbox"][0], 100.0)
+        self.assertLess(orphans[0]["bbox"][2], 150.0)
+        self.assertGreater(orphans[0]["bbox"][3] - orphans[0]["bbox"][1], 16.0)
+        self.assertEqual(
+            orphans[0]["recovery_source"],
+            "local_page_signature_handwriting",
+        )
+
+    def test_page_signature_merges_occluded_printed_line_fragments(self):
+        reviewer = OpenAIBBoxRecoveryReviewer(
+            "http://vision.test",
+            "unused.pdf",
+            {},
+        )
+        try:
+            merged = reviewer._merge_page_signature_occluded_text(
+                {
+                    "page_region": True,
+                    "cells": [
+                        {
+                            "existing": [
+                                {
+                                    "id": "p0-page-c0-b64",
+                                    "bbox": [177, 682, 210, 696],
+                                    "text": "公司",
+                                }
+                            ]
+                        }
+                    ],
+                },
+                [
+                    {
+                        "action": "add_orphan",
+                        "table_id": "p0-page-recovery",
+                        "cell_id": "p0-page-c0",
+                        "bbox": [107, 683, 171, 716],
+                        "confidence": 0.92,
+                        "recovery_source": (
+                            "local_page_signature_handwriting"
+                        ),
+                    },
+                    {
+                        "action": "add_orphan",
+                        "table_id": "p0-page-recovery",
+                        "cell_id": "p0-page-c0",
+                        "bbox": [67, 683, 97, 691],
+                        "confidence": 0.92,
+                        "recovery_reasons": ["table_ink_outside_cells"],
+                        "recovery_source": "local_table_orphan_ink",
+                    },
+                ],
+            )
+        finally:
+            reviewer.close()
+
+        adjustments = [
+            item for item in merged if item.get("action") == "adjust"
+        ]
+        self.assertEqual(len(adjustments), 1)
+        self.assertEqual(
+            adjustments[0]["target_id"],
+            "p0-page-c0-b64",
+        )
+        self.assertEqual(adjustments[0]["bbox"], [67, 682, 210, 696])
+        self.assertEqual(
+            adjustments[0]["recovery_source"],
+            "local_page_signature_occluded_text",
+        )
+        self.assertEqual(
+            sum(
+                str(item.get("recovery_source", "")).startswith(
+                    "local_page_signature_handwriting"
+                )
+                for item in merged
+            ),
+            1,
+        )
+
     def test_page_region_height_guard_uses_unpadded_ink_height(self):
         from PIL import Image, ImageDraw, ImageFont
 

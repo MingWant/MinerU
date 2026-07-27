@@ -2365,6 +2365,123 @@ def _bbox_recovery_lookup(
                 recovery_cell["_fusion_page_table_id"] = table_id
                 cells[cell_id] = recovery_cell
                 page_cell_ids.add(cell_id)
+                page_lines = collect_text_lines(page, page_index)
+                page_span_candidates: list[
+                    tuple[
+                        tuple[float, float, float, float],
+                        str,
+                        dict[str, Any],
+                    ]
+                ] = []
+                seen_page_spans: set[
+                    tuple[int, tuple[float, float, float, float], str]
+                ] = set()
+
+                def add_page_span_candidate(
+                    candidate_bbox: Any,
+                    candidate_text: str,
+                    candidate_span: Any,
+                ) -> None:
+                    valid_candidate_bbox = _valid_bbox(candidate_bbox)
+                    if (
+                        valid_candidate_bbox is None
+                        or not isinstance(candidate_span, dict)
+                    ):
+                        return
+                    key = (
+                        id(candidate_span),
+                        valid_candidate_bbox,
+                        candidate_text,
+                    )
+                    if key in seen_page_spans:
+                        return
+                    seen_page_spans.add(key)
+                    page_span_candidates.append(
+                        (
+                            valid_candidate_bbox,
+                            candidate_text,
+                            candidate_span,
+                        )
+                    )
+
+                for line in page_lines:
+                    editable_spans = [
+                        span for span in line.spans if isinstance(span, dict)
+                    ]
+                    if isinstance(line.source_span, dict):
+                        add_page_span_candidate(
+                            line.bbox,
+                            line.text,
+                            line.source_span,
+                        )
+                    elif len(editable_spans) == 1:
+                        # Normal preproc text lines expose their mutable OCR
+                        # span through ``spans`` rather than ``source_span``.
+                        # The synthetic page manifest IDs still need to map
+                        # back to that object before a guarded adjustment can
+                        # be applied.
+                        add_page_span_candidate(
+                            line.bbox,
+                            line.text,
+                            editable_spans[0],
+                        )
+                    for span in editable_spans:
+                        add_page_span_candidate(
+                            span.get("bbox"),
+                            _content_span_text(span),
+                            span,
+                        )
+                for table in collect_structured_spans(
+                    page,
+                    page_index,
+                    {"table"},
+                ):
+                    raw_cells = table.span.get("table_cells", [])
+                    for table_cell in (
+                        raw_cells if isinstance(raw_cells, list) else []
+                    ):
+                        if not isinstance(table_cell, Mapping):
+                            continue
+                        raw_spans = table_cell.get("content_spans", [])
+                        for span in (
+                            raw_spans if isinstance(raw_spans, list) else []
+                        ):
+                            if not isinstance(span, dict):
+                                continue
+                            add_page_span_candidate(
+                                span.get("bbox"),
+                                _content_span_text(span),
+                                span,
+                            )
+                raw_existing = raw_cell.get("existing", [])
+                for existing in (
+                    raw_existing if isinstance(raw_existing, list) else []
+                ):
+                    if not isinstance(existing, Mapping):
+                        continue
+                    target_id = existing.get("id")
+                    target_bbox = _valid_bbox(existing.get("bbox"))
+                    target_text = str(existing.get("text", ""))
+                    if not isinstance(target_id, str) or target_bbox is None:
+                        continue
+                    matching_span = next(
+                        (
+                            candidate_span
+                            for (
+                                candidate_bbox,
+                                candidate_text,
+                                candidate_span,
+                            ) in page_span_candidates
+                            if _bbox_iou(candidate_bbox, target_bbox) >= 0.999
+                            and candidate_text == target_text
+                        ),
+                        None,
+                    )
+                    if matching_span is not None:
+                        boxes[target_id] = (
+                            matching_span,
+                            "content_span",
+                        )
     return tables, cells, boxes, form_cell_ids, page_cell_ids
 
 
@@ -2680,11 +2797,19 @@ def apply_bbox_recovery_proposals(
             reason = "form_action_guard"
         elif is_page_cell and action not in {
             "add",
+            "adjust",
             "add_orphan",
             "add_fringe",
             "add_checkbox",
         }:
             reason = "page_action_guard"
+        elif (
+            is_page_cell
+            and action == "adjust"
+            and item.get("recovery_source")
+            != "local_page_signature_occluded_text"
+        ):
+            reason = "page_adjust_guard"
         elif cell is None or cell_bbox is None:
             reason = "unknown_cell"
         elif action in table_scoped_actions and (
@@ -3044,6 +3169,25 @@ def apply_bbox_recovery_proposals(
             ),
             "fusion_recovery_cell_bottom_overflow": cell_bottom_overflow,
         }
+        signature_handwriting = bool(
+            is_page_cell
+            and action == "add_orphan"
+            and str(item.get("recovery_source", "")).startswith(
+                "local_page_signature_handwriting"
+            )
+        )
+        if signature_handwriting:
+            recovery_metadata["fusion_recovery_signature"] = True
+        signature_occluded_text = bool(
+            is_page_cell
+            and action == "adjust"
+            and item.get("recovery_source")
+            == "local_page_signature_occluded_text"
+        )
+        if signature_occluded_text:
+            recovery_metadata[
+                "fusion_recovery_signature_occluded_text"
+            ] = True
         if is_form_cell:
             form_source = cell.get("_fusion_form_cell")
             form_text = str(
@@ -3109,7 +3253,9 @@ def apply_bbox_recovery_proposals(
             "add_checkbox",
         }:
             recovery_text = (
-                str(item.get("text", ""))
+                "[Signature]"
+                if signature_handwriting
+                else str(item.get("text", ""))
                 if action == "add_checkbox"
                 else ""
             )
@@ -3182,6 +3328,14 @@ def apply_bbox_recovery_proposals(
                 )
                 raw_target["content_bbox"] = list(bbox)
                 raw_target.update(recovery_metadata)
+            if signature_occluded_text:
+                raw_target["fusion_recovered_bbox"] = True
+                raw_target["fusion_force_recognition"] = True
+                # Normal OCR lines keep a separate line-level bbox. Make
+                # collect_text_lines use this repaired span geometry so the
+                # recognizer receives the complete crop instead of the old
+                # partial line box.
+                raw_target["fusion_bbox_grouped"] = True
             if action == "merge_list_marker":
                 raw_marker, _marker_source = marker
                 marker_text = _content_span_text(raw_marker).strip()
@@ -3744,6 +3898,37 @@ def select_bbox_recognition_candidate(
         return "ocr", "empty_ocr_disabled", "general", similarity, length_ratio
     if normalized_ocr == normalized_vlm:
         return "ocr", "recognition_consensus", field_type, similarity, length_ratio
+    if metadata.get("fusion_recovery_signature_occluded_text"):
+        # This crop was expanded only after residual ink was found on the
+        # opposite side of a nearby signature. The original OCR is therefore
+        # expected to be a short surviving substring (often the right edge)
+        # of the complete line. Permit that bounded completion without
+        # weakening the ordinary recognition length guard.
+        width = max(line.bbox[2] - line.bbox[0], 1.0)
+        height = max(line.bbox[3] - line.bbox[1], 1.0)
+        visible_characters = len(re.sub(r"\s+", "", vlm_text))
+        maximum_characters = max(
+            8,
+            int(
+                width
+                / height
+                * settings.bbox_recognition_empty_max_chars_per_em
+            ),
+        )
+        if (
+            normalized_ocr in normalized_vlm
+            and len(normalized_vlm) > len(normalized_ocr)
+            and visible_characters <= maximum_characters
+            and _recognition_candidate_quality(vlm_text)
+            >= settings.bbox_recognition_vlm_primary_min_quality
+        ):
+            return (
+                "vlm",
+                "signature_occluded_text_completion",
+                field_type,
+                similarity,
+                length_ratio,
+            )
     if settings.bbox_recognition_script_guard_enabled:
         ocr_script = _dominant_recognition_script(ocr_text)
         vlm_script = _dominant_recognition_script(vlm_text)
@@ -4170,6 +4355,14 @@ def apply_bbox_recognition(
         vlm_text = raw_vlm_text
         normalized_recovered_amount = False
         normalized_terminal_date = False
+        normalized_signature_annotation = False
+        signature_annotation = bool(
+            line.spans
+            and line.spans[0].get("fusion_recovery_signature")
+        )
+        if signature_annotation and candidate_id in returned:
+            vlm_text = "[Signature]"
+            normalized_signature_annotation = vlm_text != raw_vlm_text
         if recovery_requires_recognition and not line.text.strip():
             vlm_text = _normalize_recovered_amount_candidate(vlm_text)
             normalized_recovered_amount = vlm_text != raw_vlm_text
@@ -4258,7 +4451,10 @@ def apply_bbox_recognition(
             "similarity": round(similarity, 6),
             "length_ratio": round(length_ratio, 6),
         }
-        if normalized_terminal_date:
+        if normalized_signature_annotation:
+            decision["normalized_vlm_text"] = vlm_text
+            decision["vlm_text_normalization"] = "signature_annotation"
+        elif normalized_terminal_date:
             decision["normalized_vlm_text"] = vlm_text
             decision["vlm_text_normalization"] = "terminal_date_extraction"
         elif normalized_recovered_amount:

@@ -252,6 +252,34 @@ python projects/custom_hybrid/page_sorting.py `
   output/fused/sample/sample_middle.json
 ```
 
+When `fusion.document_output.enabled=true`, the workflow also writes
+`<document>_document.json` as the stable application-facing integration
+contract. Its shape is `documents -> pages -> blocks`, while the native
+`middle.json`, `content_list.json`, and `content_list_v2.json` artifacts remain
+unchanged. Every public bbox is declared as normalized top-left
+`[x, y, width, height]`; this avoids mixing it up with MinerU's internal pixel
+`[x0, y0, x1, y1]` geometry. Text, figures, equations, asset paths, source page
+indexes, and original MinerU block types are retained. Tables are available in
+two views: Cell records are flattened into deterministic block IDs such as
+`p2-t0-r3-c1`, and each page also carries a Table summary with HTML, caption,
+image path, and the related Cell block IDs.
+
+The adapter uses Sorting groups only when they form a complete, non-overlapping
+partition of all source pages. If grouping is absent, unresolved, or invalid,
+it safely emits one document in physical order and records the fallback reason
+under `raw_metadata.document_grouping`; it never silently drops a page. The
+Pydantic models accept additive fields so the supplied reference-style JSON can
+be validated and extended without making MinerU's internal schema public.
+
+Print the cross-language JSON Schema or replay adjacent MinerU artifacts:
+
+```bash
+python projects/custom_hybrid/document_output.py --print-schema
+
+python projects/custom_hybrid/document_output.py \
+  output/fused/sample/sample_middle.json
+```
+
 Replay one or more fused middle JSON files without calling MinerU or vLLM:
 
 ```powershell
@@ -483,6 +511,18 @@ Table Cell.
 Page recovery also rejects a single connected, ultra-wide thin component as a
 separator rule (`page_recovery_rule_*`) instead of sending an empty bbox to the
 recognizer.
+Tall, low-density handwriting next to an OCR `Signature`/`签名` label is handled
+by a separate semantic exception: `page_recovery_signature_max_height` permits
+the signature stroke while `page_recovery_signature_context_gap` and
+`page_recovery_signature_horizontal_padding` keep the recovery bound to its
+label. Unanchored tall graphics and logos retain the normal page line-height
+guard.
+If a signature crosses a printed line and OCR retains only one end of that
+line, the opposite residual fragment and the retained bbox are joined across
+the signature by `page_recovery_signature_text_max_gap`. The original OCR line
+is expanded (rather than adding overlapping fragments), then sent through the
+normal bbox recognizer; `page_recovery_signature_text_max_width` bounds this
+repair.
 
 `checkbox_recovery_enabled=true` runs a separate local contour detector for
 small square form controls. It accepts both empty and tick-connected outlines,
@@ -807,16 +847,19 @@ OCR resources. Completed ZIP files include `task_parameters.json` with the
 effective task-scoped settings and `vllm_requests.jsonl` with per-request
 generation audit data. API/UI tasks always enable Semantic Markdown as the
 primary output, preserve MinerU's original output as `<document>_native.md`, and
-emit report-only page-order diagnostics. These task-level output settings also
-protect deployments whose `workflow.local.json` predates those features.
+emit report-only page-order diagnostics plus the versioned structured document
+output. These task-level output settings also protect deployments whose
+`workflow.local.json` predates those features.
 
 Endpoints:
 
 - `GET /health`: service status;
+- `GET /schemas/document-output`: read the current application-facing JSON Schema;
 - `POST /tasks`: upload PDF/images plus optional task parameters and receive a task id;
 - `GET /tasks/{task_id}`: poll status;
 - `GET /tasks/{task_id}/result`: download the fused ZIP;
 - `GET /tasks/{task_id}/markdown`: read Markdown and content-list output;
+- `GET /tasks/{task_id}/structured`: read and validate `<document>_document.json`;
 - `GET /tasks/{task_id}/asset`: read a validated Markdown image asset;
 - `GET /tasks/{task_id}/report`: read `fusion_summary.json`;
 - `GET /tasks/{task_id}/sorting`: read all detailed page Grouping and Sorting reports;

@@ -46,6 +46,40 @@ class CustomHybridApiTests(unittest.TestCase):
             json.dumps([{"type": "text", "text": "Fused result"}]),
             encoding="utf-8",
         )
+        (fused / "document_document.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "coordinate_system": {
+                        "bbox_format": "xywh",
+                        "unit": "normalized",
+                        "origin": "top_left",
+                    },
+                    "documents": [
+                        {
+                            "document_index": 0,
+                            "page_range": "1",
+                            "pages": [
+                                {
+                                    "page_number": 1,
+                                    "blocks": [
+                                        {
+                                            "block_id": "p1-b1",
+                                            "page_number": 1,
+                                            "text": "Fused result",
+                                            "bbox": [0.1, 0.1, 0.8, 0.1],
+                                            "type": "text",
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                    "raw_metadata": {"source": "test"},
+                }
+            ),
+            encoding="utf-8",
+        )
         (fused / "images").mkdir()
         (fused / "images" / "page.png").write_bytes(b"image-data")
         (fused / "document_span.pdf").write_bytes(b"bbox-pdf")
@@ -171,6 +205,10 @@ class CustomHybridApiTests(unittest.TestCase):
                         "fused/document/document_sorting_report.json",
                         archive.namelist(),
                     )
+                    self.assertIn(
+                        "fused/document/document_document.json",
+                        archive.namelist(),
+                    )
                     self.assertIn("fusion_summary.json", archive.namelist())
                     self.assertIn("task_parameters.json", archive.namelist())
                     task_parameters = json.loads(
@@ -212,6 +250,21 @@ class CustomHybridApiTests(unittest.TestCase):
                 self.assertEqual(markdown.json()["selected"], "document/document.md")
                 self.assertIn("# Fused result", markdown.json()["markdown"])
                 self.assertIn("Fused result", markdown.json()["content_list"])
+                structured = client.get(f"/tasks/{task_id}/structured")
+                self.assertEqual(structured.status_code, 200)
+                self.assertEqual(
+                    structured.json()["selected"],
+                    "document/document_document.json",
+                )
+                self.assertEqual(
+                    structured.json()["output"]["documents"][0]["pages"][0][
+                        "blocks"
+                    ][0]["text"],
+                    "Fused result",
+                )
+                schema = client.get("/schemas/document-output")
+                self.assertEqual(schema.status_code, 200)
+                self.assertIn("documents", schema.json()["properties"])
                 asset = client.get(
                     f"/tasks/{task_id}/asset",
                     params={
@@ -477,12 +530,14 @@ class CustomHybridApiTests(unittest.TestCase):
             config = json.loads(config_path.read_text(encoding="utf-8"))
             config["fusion"].pop("semantic_markdown")
             config["fusion"].pop("page_sorting")
+            config["fusion"].pop("document_output")
             config_path.write_text(json.dumps(config), encoding="utf-8")
             app = create_app(config_path, root / "tasks", runner=capturing_runner)
             with TestClient(app) as client:
                 defaults = client.get("/health").json()["task_parameter_defaults"]
                 self.assertTrue(defaults["semantic_markdown"]["enabled"])
                 self.assertTrue(defaults["page_sorting"]["enabled"])
+                self.assertTrue(defaults["document_output"]["enabled"])
                 response = client.post(
                     "/tasks",
                     files={"files": ("invoice.pdf", b"pdf")},
@@ -520,6 +575,7 @@ class CustomHybridApiTests(unittest.TestCase):
                     "include_semantic_diagnostics": True,
                 },
             )
+            self.assertEqual(fusion["document_output"], {"enabled": True})
             snapshot = json.loads(
                 (
                     root
@@ -531,6 +587,7 @@ class CustomHybridApiTests(unittest.TestCase):
             )
             self.assertTrue(snapshot["semantic_markdown"]["enabled"])
             self.assertTrue(snapshot["page_sorting"]["enabled"])
+            self.assertTrue(snapshot["document_output"]["enabled"])
 
     def test_bbox_vlm_mode_overrides_balanced_profile_after_cost_settings(self):
         captured_configs = []

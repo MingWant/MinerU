@@ -40,6 +40,7 @@ from projects.custom_hybrid.workflow import (
     run_extract,
     run_doctor,
     _optional_bearer_headers,
+    _generate_document_output,
     _generate_page_sorting_outputs,
     _generate_semantic_markdown_outputs,
     _generate_fused_visualizations,
@@ -250,6 +251,58 @@ class WorkflowTests(unittest.TestCase):
             report = json.loads(generated[0].read_text(encoding="utf-8"))
             self.assertEqual(report["status"], "error")
             self.assertFalse(report["can_auto_sort"])
+
+    def test_document_output_merges_adjacent_mineru_artifacts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parse_dir = Path(temp_dir)
+            (parse_dir / "sample_middle.json").write_text(
+                json.dumps(
+                    {
+                        "_backend": "hybrid",
+                        "pdf_info": [
+                            {
+                                "page_idx": 0,
+                                "page_size": [200, 300],
+                                "para_blocks": [],
+                                "discarded_blocks": [],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (parse_dir / "sample_content_list_v2.json").write_text(
+                json.dumps(
+                    [
+                        [
+                            {
+                                "type": "paragraph",
+                                "content": {
+                                    "paragraph_content": [
+                                        {"type": "text", "content": "Receipt"}
+                                    ]
+                                },
+                                "bbox": [100, 100, 900, 200],
+                            }
+                        ]
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            generated = _generate_document_output(
+                parse_dir,
+                "sample",
+                {"enabled": True},
+            )
+
+            self.assertEqual(generated, (parse_dir / "sample_document.json",))
+            output = json.loads(generated[0].read_text(encoding="utf-8"))
+            self.assertEqual(output["schema_version"], "1.0")
+            self.assertEqual(
+                output["documents"][0]["pages"][0]["blocks"][0]["text"],
+                "Receipt",
+            )
 
     def test_bearer_header_requires_explicit_environment_setting(self):
         with mock.patch.dict(
@@ -1606,6 +1659,7 @@ class WorkflowTests(unittest.TestCase):
                 "preserve_native": True,
             },
             config["fusion"]["page_sorting"],
+            config["fusion"]["document_output"],
         )
 
     def test_fuse_output_trees_wires_and_closes_enabled_bbox_recognizer(self):
