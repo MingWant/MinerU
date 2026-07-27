@@ -454,6 +454,16 @@ Cell. Orphan boxes may be attached to the nearest Cell for text/HTML ownership,
 but the original Table and Cell bboxes remain immutable. If the per-Table orphan
 budget is full, more substantial text-line candidates are preferred over thin
 ink fragments; `table_orphan_preferred_line_height` controls that ranking bias.
+After the first orphan scan, `table_orphan_residual_passes=1` masks the newly
+recovered lines and performs one bounded residual scan. This exposes adjacent
+text that was hidden by a larger first-pass component without increasing the
+per-Table proposal limit. Nearby fragments on the same visual line are merged
+only when they satisfy `table_orphan_fragment_max_horizontal_gap`,
+`table_orphan_fragment_min_vertical_overlap`, and
+`table_orphan_fragment_max_union_height_ratio`; this commonly keeps bilingual
+labels in one recognition crop while preserving distinct rows. Duplicate
+Table-fringe and page-residual additions are filtered before document proposal
+budget accounting.
 
 `table_fringe_recovery_enabled=true` extends that masked scan a bounded distance
 below a detected Table and by the small

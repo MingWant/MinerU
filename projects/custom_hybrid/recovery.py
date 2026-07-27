@@ -2200,6 +2200,337 @@ class OpenAIBBoxRecoveryReviewer:
         finally:
             crop.close()
 
+    def _merge_orphan_line_proposals(
+        self,
+        table: Mapping[str, Any],
+        proposals: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Join nearby horizontal orphan fragments that belong to one line.
+
+        Table rules and incorrect Cell geometry can split an English label and
+        its translated label into separate residual components.  Keep this
+        merge deliberately line-shaped: the fragments must overlap strongly
+        on the vertical axis, have only a small horizontal gap, and produce a
+        union no taller than either source line.
+        """
+        maximum_gap = max(
+            float(
+                self.config.get(
+                    "table_orphan_fragment_max_horizontal_gap",
+                    18.0,
+                )
+            ),
+            0.0,
+        )
+        minimum_vertical_overlap = min(
+            max(
+                float(
+                    self.config.get(
+                        "table_orphan_fragment_min_vertical_overlap",
+                        0.5,
+                    )
+                ),
+                0.0,
+            ),
+            1.0,
+        )
+        maximum_union_height_ratio = max(
+            float(
+                self.config.get(
+                    "table_orphan_fragment_max_union_height_ratio",
+                    1.5,
+                )
+            ),
+            1.0,
+        )
+        cells_with_bbox = [
+            (cell, _valid_bbox(cell.get("bbox")))
+            for cell in table.get("cells", [])
+            if isinstance(cell, Mapping)
+            and _valid_bbox(cell.get("bbox")) is not None
+        ]
+
+        def cell_distance(
+            item: tuple[
+                Mapping[str, Any],
+                tuple[float, float, float, float] | None,
+            ],
+            candidate_bbox: Sequence[float],
+        ) -> tuple[float, float]:
+            cell, cell_bbox = item
+            if cell_bbox is None:
+                return (float("inf"), float("inf"))
+            if candidate_bbox[1] >= cell_bbox[3]:
+                vertical = candidate_bbox[1] - cell_bbox[3]
+            elif cell_bbox[1] >= candidate_bbox[3]:
+                vertical = cell_bbox[1] - candidate_bbox[3]
+            else:
+                vertical = 0.0
+            horizontal_overlap = max(
+                0.0,
+                min(candidate_bbox[2], cell_bbox[2])
+                - max(candidate_bbox[0], cell_bbox[0]),
+            )
+            horizontal = (
+                0.0
+                if horizontal_overlap > 0
+                else min(
+                    abs(candidate_bbox[0] - cell_bbox[2]),
+                    abs(cell_bbox[0] - candidate_bbox[2]),
+                )
+            )
+            row = cell.get("row_end")
+            return (vertical + horizontal, -float(row or 0))
+
+        merged: list[dict[str, Any]] = []
+        for raw_item in sorted(
+            proposals,
+            key=lambda item: (
+                int(item.get("_residual_pass", 0)),
+                (_valid_bbox(item.get("bbox")) or (0, 0, 0, 0))[1],
+                (_valid_bbox(item.get("bbox")) or (0, 0, 0, 0))[0],
+            ),
+        ):
+            item = dict(raw_item)
+            bbox = _valid_bbox(item.get("bbox"))
+            if bbox is None:
+                merged.append(item)
+                continue
+            match = None
+            for index, existing in enumerate(merged):
+                if (
+                    existing.get("action") != item.get("action")
+                    or existing.get("table_id") != item.get("table_id")
+                ):
+                    continue
+                existing_bbox = _valid_bbox(existing.get("bbox"))
+                if existing_bbox is None:
+                    continue
+                left_height = bbox[3] - bbox[1]
+                right_height = existing_bbox[3] - existing_bbox[1]
+                vertical_overlap = max(
+                    0.0,
+                    min(bbox[3], existing_bbox[3])
+                    - max(bbox[1], existing_bbox[1]),
+                )
+                vertical_ratio = vertical_overlap / max(
+                    min(left_height, right_height),
+                    1e-6,
+                )
+                horizontal_gap = max(
+                    bbox[0] - existing_bbox[2],
+                    existing_bbox[0] - bbox[2],
+                    0.0,
+                )
+                union_height = max(bbox[3], existing_bbox[3]) - min(
+                    bbox[1],
+                    existing_bbox[1],
+                )
+                if (
+                    horizontal_gap <= maximum_gap
+                    and vertical_ratio >= minimum_vertical_overlap
+                    and union_height
+                    <= max(left_height, right_height)
+                    * maximum_union_height_ratio
+                ):
+                    match = index
+                    break
+            if match is None:
+                merged.append(item)
+                continue
+            existing = merged[match]
+            existing_bbox = _valid_bbox(existing.get("bbox"))
+            if existing_bbox is None:  # pragma: no cover - guarded above
+                continue
+            union_bbox = (
+                min(existing_bbox[0], bbox[0]),
+                min(existing_bbox[1], bbox[1]),
+                max(existing_bbox[2], bbox[2]),
+                max(existing_bbox[3], bbox[3]),
+            )
+            existing["bbox"] = list(union_bbox)
+            existing["confidence"] = min(
+                float(existing.get("confidence", 0.0)),
+                float(item.get("confidence", 0.0)),
+            )
+            existing["_residual_pass"] = min(
+                int(existing.get("_residual_pass", 0)),
+                int(item.get("_residual_pass", 0)),
+            )
+            existing["orphan_fragment_count"] = int(
+                existing.get("orphan_fragment_count", 1)
+            ) + int(item.get("orphan_fragment_count", 1))
+            reasons = {
+                reason
+                for candidate in (existing, item)
+                for reason in (
+                    candidate.get("recovery_reasons", [])
+                    if isinstance(candidate.get("recovery_reasons"), list)
+                    else []
+                )
+                if isinstance(reason, str)
+            }
+            reasons.add("table_orphan_horizontal_fragment_merge")
+            existing["recovery_reasons"] = sorted(reasons)
+            existing["recovery_source"] = (
+                "local_table_fringe_fragment_merge"
+                if existing.get("action") == "add_fringe"
+                else "local_table_orphan_fragment_merge"
+            )
+            if cells_with_bbox:
+                nearest_cell, _nearest_bbox = min(
+                    cells_with_bbox,
+                    key=lambda candidate: cell_distance(candidate, union_bbox),
+                )
+                nearest_cell_id = nearest_cell.get("id")
+                if isinstance(nearest_cell_id, str):
+                    existing["cell_id"] = nearest_cell_id
+        return merged
+
+    def _table_orphan_residual_proposals(
+        self,
+        image,
+        page_size: Sequence[float],
+        table: Mapping[str, Any],
+        max_items: int,
+        diagonal_rules: Sequence[Sequence[float]] = (),
+    ) -> list[dict[str, Any]]:
+        """Run a bounded second residual scan after masking recovered lines."""
+        if max_items <= 0:
+            return []
+        residual_passes = max(
+            int(self.config.get("table_orphan_residual_passes", 1)),
+            0,
+        )
+        orphan_tables_before = self.orphan_tables_analyzed
+        orphan_boxes_before = self.orphan_boxes_proposed
+        fringe_boxes_before = self.fringe_boxes_proposed
+        temporary_table = dict(table)
+        page_existing = [
+            dict(item)
+            for item in table.get("page_existing", [])
+            if isinstance(item, Mapping)
+        ]
+        temporary_table["page_existing"] = page_existing
+        proposals: list[dict[str, Any]] = []
+        for pass_index in range(residual_passes + 1):
+            pass_items = self._table_orphan_proposals(
+                image,
+                page_size,
+                temporary_table,
+                max_items,
+                diagonal_rules,
+            )
+            if not pass_items:
+                break
+            for raw_item in pass_items:
+                item = dict(raw_item)
+                item["_residual_pass"] = pass_index
+                proposals.append(item)
+                bbox = _valid_bbox(item.get("bbox"))
+                if bbox is not None:
+                    page_existing.append(
+                        {
+                            "bbox": list(bbox),
+                            "source": "temporary_table_orphan_recovery",
+                        }
+                    )
+
+        proposals = self._merge_orphan_line_proposals(table, proposals)
+        duplicate_iou = min(
+            max(float(self.config.get("duplicate_iou", 0.6)), 0.0),
+            1.0,
+        )
+        unique: list[dict[str, Any]] = []
+        for item in proposals:
+            bbox = _valid_bbox(item.get("bbox"))
+            if bbox is not None and any(
+                _bbox_iou(bbox, existing_bbox) >= duplicate_iou
+                for existing in unique
+                for existing_bbox in [_valid_bbox(existing.get("bbox"))]
+                if existing_bbox is not None
+            ):
+                continue
+            unique.append(item)
+
+        def retention_priority(item: Mapping[str, Any]) -> tuple[Any, ...]:
+            bbox = _valid_bbox(item.get("bbox")) or (0.0, 0.0, 0.0, 0.0)
+            area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+            return (
+                int(item.get("_residual_pass", 0)),
+                -area,
+                bbox[1],
+                bbox[0],
+            )
+
+        selected = sorted(unique, key=retention_priority)[:max_items]
+        selected.sort(
+            key=lambda item: (
+                (_valid_bbox(item.get("bbox")) or (0, 0, 0, 0))[1],
+                (_valid_bbox(item.get("bbox")) or (0, 0, 0, 0))[0],
+            )
+        )
+        for item in selected:
+            item.pop("_residual_pass", None)
+
+        # _table_orphan_proposals accounts every scan.  Public metrics describe
+        # physical Tables and returned boxes, not internal residual passes.
+        table_was_analyzed = self.orphan_tables_analyzed > orphan_tables_before
+        self.orphan_tables_analyzed = orphan_tables_before + int(
+            table_was_analyzed
+        )
+        fringe_count = sum(
+            1 for item in selected if item.get("action") == "add_fringe"
+        )
+        self.fringe_boxes_proposed = fringe_boxes_before + fringe_count
+        self.orphan_boxes_proposed = (
+            orphan_boxes_before + len(selected) - fringe_count
+        )
+        return selected
+
+    def _deduplicate_recovery_additions(
+        self,
+        existing_items: Sequence[Mapping[str, Any]],
+        candidates: Sequence[Mapping[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Filter response-local duplicate additions before budget accounting."""
+        addition_actions = {
+            "add",
+            "add_orphan",
+            "add_fringe",
+            "add_checkbox",
+        }
+        duplicate_iou = min(
+            max(float(self.config.get("duplicate_iou", 0.6)), 0.0),
+            1.0,
+        )
+        addition_bboxes = [
+            bbox
+            for item in existing_items
+            if item.get("action") in addition_actions
+            for bbox in [_valid_bbox(item.get("bbox"))]
+            if bbox is not None
+        ]
+        kept: list[dict[str, Any]] = []
+        removed: list[dict[str, Any]] = []
+        for raw_item in candidates:
+            item = dict(raw_item)
+            bbox = _valid_bbox(item.get("bbox"))
+            if (
+                item.get("action") in addition_actions
+                and bbox is not None
+                and any(
+                    _bbox_iou(bbox, existing_bbox) >= duplicate_iou
+                    for existing_bbox in addition_bboxes
+                )
+            ):
+                removed.append(item)
+                continue
+            kept.append(item)
+            if item.get("action") in addition_actions and bbox is not None:
+                addition_bboxes.append(bbox)
+        return kept, removed
+
     def _table_checkbox_proposals(
         self,
         image,
@@ -4058,6 +4389,7 @@ class OpenAIBBoxRecoveryReviewer:
         errors = 0
         table_budget_skips = 0
         proposal_budget_skips = 0
+        duplicate_proposals_filtered = 0
         local_proposals = 0
         protocol_failures = 0
         protocol_skips = 0
@@ -4250,7 +4582,7 @@ class OpenAIBBoxRecoveryReviewer:
                         table.get("disable_orphan_recovery")
                         or (is_form_region and not allow_orphan_recovery)
                     )
-                    else self._table_orphan_proposals(
+                    else self._table_orphan_residual_proposals(
                         image,
                         page_size,
                         table,
@@ -4260,13 +4592,52 @@ class OpenAIBBoxRecoveryReviewer:
                 )
             finally:
                 pixel_analysis_seconds += time.monotonic() - pixel_started
-            local_items = (
+            local_items, duplicate_items = self._deduplicate_recovery_additions(
+                items,
                 list_marker_items
                 + ink_marker_items
                 + missing_items
                 + checkbox_items
-                + orphan_items
+                + orphan_items,
             )
+            duplicate_proposals_filtered += len(duplicate_items)
+            for duplicate in duplicate_items:
+                action = duplicate.get("action")
+                if action == "add_orphan":
+                    self.orphan_boxes_proposed = max(
+                        self.orphan_boxes_proposed - 1,
+                        0,
+                    )
+                elif action == "add_fringe":
+                    self.fringe_boxes_proposed = max(
+                        self.fringe_boxes_proposed - 1,
+                        0,
+                    )
+                elif action == "add_checkbox":
+                    self.checkbox_boxes_proposed = max(
+                        self.checkbox_boxes_proposed - 1,
+                        0,
+                    )
+            list_marker_items = [
+                item
+                for item in local_items
+                if item.get("action") == "merge_list_marker"
+            ]
+            ink_marker_items = [
+                item
+                for item in local_items
+                if item.get("action") == "merge_ink_marker"
+            ]
+            checkbox_items = [
+                item
+                for item in local_items
+                if item.get("action") == "add_checkbox"
+            ]
+            orphan_items = [
+                item
+                for item in local_items
+                if item.get("action") in {"add_orphan", "add_fringe"}
+            ]
             fringe_items = [
                 item for item in orphan_items if item.get("action") == "add_fringe"
             ]
@@ -4390,6 +4761,10 @@ class OpenAIBBoxRecoveryReviewer:
                     image,
                     remaining_proposals,
                 )
+                proposals, duplicate_items = (
+                    self._deduplicate_recovery_additions(items, proposals)
+                )
+                duplicate_proposals_filtered += len(duplicate_items)
                 proposals = proposals[:remaining_proposals]
                 self.proposals_returned += len(proposals)
                 self.tables_reviewed += 1
@@ -4422,6 +4797,7 @@ class OpenAIBBoxRecoveryReviewer:
             "errors": errors,
             "table_budget_skips": table_budget_skips,
             "proposal_budget_skips": proposal_budget_skips,
+            "duplicate_proposals_filtered": duplicate_proposals_filtered,
             "local_proposals": local_proposals,
             "protocol_failures": protocol_failures,
             "protocol_skips": protocol_skips,

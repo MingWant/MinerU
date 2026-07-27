@@ -1377,6 +1377,193 @@ class BBoxRecoveryReviewerTests(unittest.TestCase):
         self.assertEqual(result["items"][0]["action"], "add_orphan")
         self.assertGreater(result["items"][0]["bbox"][1], 70)
 
+    def test_table_orphan_residual_pass_masks_first_pass_and_merges_line(self):
+        reviewer = OpenAIBBoxRecoveryReviewer.__new__(
+            OpenAIBBoxRecoveryReviewer
+        )
+        reviewer.config = {
+            "table_orphan_residual_passes": 1,
+            "table_orphan_fragment_max_horizontal_gap": 18.0,
+        }
+        reviewer.orphan_tables_analyzed = 0
+        reviewer.orphan_boxes_proposed = 0
+        reviewer.fringe_boxes_proposed = 0
+        table = {
+            "id": "p0-table-0",
+            "bbox": [0, 0, 180, 100],
+            "page_existing": [],
+            "cells": [
+                {
+                    "id": "p0-t0-c0",
+                    "bbox": [0, 0, 90, 25],
+                    "row_end": 0,
+                },
+                {
+                    "id": "p0-t0-c1",
+                    "bbox": [90, 0, 180, 25],
+                    "row_end": 1,
+                },
+            ],
+        }
+        first_pass = [
+            {
+                "action": "add_orphan",
+                "table_id": "p0-table-0",
+                "cell_id": "p0-t0-c0",
+                "target_id": "",
+                "bbox": [10, 30, 42, 40],
+                "confidence": 0.92,
+                "recovery_reasons": ["table_ink_outside_cells"],
+                "recovery_source": "local_table_orphan_ink",
+            }
+        ]
+        second_pass = [
+            {
+                "action": "add_orphan",
+                "table_id": "p0-table-0",
+                "cell_id": "p0-t0-c0",
+                "target_id": "",
+                "bbox": [50, 50, 105, 60],
+                "confidence": 0.92,
+                "recovery_reasons": ["table_ink_outside_cells"],
+                "recovery_source": "local_table_orphan_ink",
+            },
+            {
+                "action": "add_orphan",
+                "table_id": "p0-table-0",
+                "cell_id": "p0-t0-c1",
+                "target_id": "",
+                "bbox": [116, 51, 150, 60],
+                "confidence": 0.92,
+                "recovery_reasons": ["table_ink_outside_cells"],
+                "recovery_source": "local_table_orphan_ink",
+            },
+            {
+                "action": "add_orphan",
+                "table_id": "p0-table-0",
+                "cell_id": "p0-t0-c1",
+                "target_id": "",
+                "bbox": [50, 70, 150, 88],
+                "confidence": 0.92,
+                "recovery_reasons": ["table_ink_outside_cells"],
+                "recovery_source": "local_table_orphan_ink",
+            },
+        ]
+        with mock.patch.object(
+            reviewer,
+            "_table_orphan_proposals",
+            side_effect=[first_pass, second_pass],
+        ) as scan:
+            proposals = reviewer._table_orphan_residual_proposals(
+                mock.sentinel.image,
+                [180, 100],
+                table,
+                4,
+            )
+
+        self.assertEqual(scan.call_count, 2)
+        second_table = scan.call_args_list[1].args[2]
+        self.assertIn(
+            first_pass[0]["bbox"],
+            [item["bbox"] for item in second_table["page_existing"]],
+        )
+        self.assertEqual(len(proposals), 3)
+        merged = next(
+            item
+            for item in proposals
+            if item.get("orphan_fragment_count") == 2
+        )
+        self.assertEqual(merged["bbox"], [50.0, 50.0, 150.0, 60.0])
+        self.assertIn(
+            "table_orphan_horizontal_fragment_merge",
+            merged["recovery_reasons"],
+        )
+        self.assertNotIn("_residual_pass", merged)
+
+    def test_response_local_deduplication_preserves_proposal_budget(self):
+        provider = mock.Mock()
+        provider.get_page.return_value = mock.sentinel.image
+        reviewer = OpenAIBBoxRecoveryReviewer(
+            "http://vision.test",
+            "unused.pdf",
+            {
+                "model": "mineru-claim-forms",
+                "max_proposals_per_document": 2,
+                "max_proposals_per_table": 2,
+                "review_after_local_recovery": False,
+            },
+            page_provider=provider,
+        )
+        table_item = {
+            "action": "add_fringe",
+            "table_id": "p0-table-0",
+            "cell_id": "p0-t0-c0",
+            "target_id": "",
+            "bbox": [20, 40, 100, 52],
+            "confidence": 0.92,
+        }
+        page_item = {
+            "action": "add_orphan",
+            "table_id": "p0-page-recovery",
+            "cell_id": "p0-page-c0",
+            "target_id": "",
+            "bbox": [20, 40, 100, 52],
+            "confidence": 0.92,
+        }
+        tables = [
+            {
+                "id": "p0-table-0",
+                "bbox": [0, 0, 120, 60],
+                "disable_marker_merges": True,
+                "cells": [
+                    {
+                        "id": "p0-t0-c0",
+                        "bbox": [0, 0, 120, 40],
+                        "text": "",
+                        "existing": [],
+                    }
+                ],
+            },
+            {
+                "id": "p0-page-recovery",
+                "bbox": [0, 0, 120, 60],
+                "page_region": True,
+                "allow_orphan_recovery": True,
+                "disable_marker_merges": True,
+                "cells": [
+                    {
+                        "id": "p0-page-c0",
+                        "bbox": [0, 0, 120, 60],
+                        "text": "",
+                        "existing": [],
+                    }
+                ],
+            },
+        ]
+        with mock.patch.object(
+            reviewer,
+            "_table_diagonal_rules",
+            return_value=[],
+        ), mock.patch.object(
+            reviewer,
+            "_suspicious_cells",
+            return_value=[],
+        ), mock.patch.object(
+            reviewer,
+            "_table_checkbox_proposals",
+            return_value=[],
+        ), mock.patch.object(
+            reviewer,
+            "_table_orphan_residual_proposals",
+            side_effect=[[table_item], [page_item]],
+        ):
+            result = reviewer(0, [120, 60], tables)
+
+        self.assertEqual(len(result["items"]), 1)
+        self.assertEqual(result["local_proposals"], 1)
+        self.assertEqual(result["duplicate_proposals_filtered"], 1)
+        self.assertEqual(reviewer.proposals_returned, 1)
+
     def test_table_fringe_recovery_masks_existing_page_text(self):
         from PIL import Image, ImageDraw
 

@@ -5571,6 +5571,7 @@ def fuse_middle_json(
         "bbox_recovery_tables_reviewed": 0,
         "bbox_recovery_table_budget_skips": 0,
         "bbox_recovery_proposal_budget_skips": 0,
+        "bbox_recovery_duplicate_proposals_filtered": 0,
         "bbox_recovery_local_proposals": 0,
         "bbox_recovery_protocol_failures": 0,
         "bbox_recovery_protocol_skips": 0,
@@ -5729,6 +5730,16 @@ def fuse_middle_json(
                         counts[
                             "bbox_recovery_proposal_budget_skips"
                         ] += proposal_budget_skips
+                    duplicate_proposals_filtered = recovery_response.get(
+                        "duplicate_proposals_filtered"
+                    )
+                    if (
+                        isinstance(duplicate_proposals_filtered, int)
+                        and duplicate_proposals_filtered > 0
+                    ):
+                        counts[
+                            "bbox_recovery_duplicate_proposals_filtered"
+                        ] += duplicate_proposals_filtered
                     requests = recovery_response.get("requests")
                     if isinstance(requests, int) and requests > 0:
                         counts["bbox_recovery_requests"] += requests

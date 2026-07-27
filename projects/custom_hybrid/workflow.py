@@ -531,6 +531,7 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         "max_proposals_per_table",
         "max_requests_per_document",
         "table_orphan_max_boxes_per_table",
+        "table_orphan_residual_passes",
         "checkbox_max_boxes_per_table",
         "list_marker_max_merges_per_table",
     ):
@@ -605,6 +606,8 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         ("table_orphan_min_dark_height", 2.0, False),
         ("table_orphan_min_line_width", 8.0, False),
         ("table_orphan_horizontal_gap", 12.0, False),
+        ("table_orphan_fragment_max_horizontal_gap", 18.0, True),
+        ("table_orphan_fragment_max_union_height_ratio", 1.5, False),
         ("table_orphan_axis_rule_min_length", 18.0, False),
         ("table_orphan_axis_rule_max_gap", 2.0, True),
         ("table_orphan_axis_rule_padding", 1.5, True),
@@ -638,6 +641,7 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         ("same_cell_fragment_min_horizontal_overlap", 0.75),
         ("split_content_min_horizontal_overlap", 0.8),
         ("split_content_min_vertical_overlap", 0.35),
+        ("table_orphan_fragment_min_vertical_overlap", 0.5),
     ):
         field = recovery.get(key, default)
         if (
