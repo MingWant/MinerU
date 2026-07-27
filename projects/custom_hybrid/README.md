@@ -857,6 +857,8 @@ Endpoints:
 - `POST /tasks`: upload PDF/images plus optional task parameters and receive a task id;
 - `GET /tasks/{task_id}`: poll status;
 - `GET /tasks/{task_id}/result`: download the fused ZIP;
+- `GET /tasks/{task_id}/preview?kind=span`: open the generated PDF inline;
+- `GET /tasks/{task_id}/preview?kind=span&download=true`: download the PDF;
 - `GET /tasks/{task_id}/markdown`: read Markdown and content-list output;
 - `GET /tasks/{task_id}/structured`: read and validate `<document>_document.json`;
 - `GET /tasks/{task_id}/asset`: read a validated Markdown image asset;

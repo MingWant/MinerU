@@ -1023,8 +1023,26 @@ def create_app(
     @app.get(
         "/tasks/{task_id}/preview",
         name="get_task_preview",
+        response_class=FileResponse,
+        responses={
+            200: {
+                "description": "Generated PDF preview",
+                "content": {
+                    "application/pdf": {
+                        "schema": {
+                            "type": "string",
+                            "format": "binary",
+                        }
+                    }
+                },
+            }
+        },
     )
-    async def get_task_preview(task_id: str, kind: str = "span"):
+    async def get_task_preview(
+        task_id: str,
+        kind: str = "span",
+        download: bool = False,
+    ) -> FileResponse:
         record = require_completed_task(task_id)
         suffixes = {
             "span": "*_span.pdf",
@@ -1060,7 +1078,7 @@ def create_app(
             previews[0],
             media_type="application/pdf",
             filename=previews[0].name,
-            content_disposition_type="inline",
+            content_disposition_type="attachment" if download else "inline",
         )
 
     @app.get(

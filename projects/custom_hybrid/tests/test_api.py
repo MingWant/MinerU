@@ -237,6 +237,21 @@ class CustomHybridApiTests(unittest.TestCase):
                 self.assertEqual(preview.status_code, 200)
                 self.assertEqual(preview.content, b"bbox-pdf")
                 self.assertEqual(preview.headers["content-type"], "application/pdf")
+                self.assertIn("inline", preview.headers["content-disposition"])
+                downloaded_preview = client.get(
+                    f"/tasks/{task_id}/preview",
+                    params={"download": "true"},
+                )
+                self.assertEqual(downloaded_preview.status_code, 200)
+                self.assertEqual(downloaded_preview.content, b"bbox-pdf")
+                self.assertIn(
+                    "attachment",
+                    downloaded_preview.headers["content-disposition"],
+                )
+                self.assertIn(
+                    'filename="document_span.pdf"',
+                    downloaded_preview.headers["content-disposition"],
+                )
                 form_cells = client.get(
                     f"/tasks/{task_id}/preview",
                     params={"kind": "form_cells"},
@@ -367,6 +382,18 @@ class CustomHybridApiTests(unittest.TestCase):
                     },
                 )
                 self.assertEqual(response.status_code, 202)
+
+                preview_response = openapi["paths"]["/tasks/{task_id}/preview"][
+                    "get"
+                ]["responses"]["200"]
+                self.assertEqual(
+                    set(preview_response["content"]),
+                    {"application/pdf"},
+                )
+                self.assertEqual(
+                    preview_response["content"]["application/pdf"]["schema"],
+                    {"type": "string", "format": "binary"},
+                )
 
     @unittest.skipUnless(PDF_RENDERING_AVAILABLE, "PDF rendering dependencies missing")
     def test_preview_endpoint_regenerates_missing_span_from_origin_pdf(self):
