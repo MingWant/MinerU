@@ -678,6 +678,55 @@ class CustomHybridApiTests(unittest.TestCase):
         self.assertEqual(recovery["fusion"]["recovery"]["temperature"], 0.1)
         self.assertEqual(recovery["fusion"]["recovery"]["seed"], 7)
 
+    def test_task_llm_toggle_preserves_server_side_endpoint_configuration(self):
+        captured_configs = []
+
+        def capturing_runner(config, input_path, output_path):
+            captured_configs.append(copy.deepcopy(config))
+            return self._successful_runner(config, input_path, output_path)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = self._write_config(root)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["fusion"]["page_sorting"]["llm"].update(
+                {
+                    "enabled": False,
+                    "base_url": "https://llm.example.test/v1",
+                    "model": "qwen3-instruct",
+                    "api_key_env": "SORTING_LLM_API_KEY",
+                }
+            )
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            app = create_app(config_path, root / "tasks", runner=capturing_runner)
+            with TestClient(app) as client:
+                defaults = client.get("/health").json()["task_parameter_defaults"]
+                self.assertTrue(defaults["page_sorting"]["llm"]["available"])
+                self.assertFalse(defaults["page_sorting"]["llm"]["enabled"])
+                self.assertEqual(
+                    defaults["page_sorting"]["llm"]["model"],
+                    "qwen3-instruct",
+                )
+                response = client.post(
+                    "/tasks",
+                    files={"files": ("invoice.pdf", b"pdf")},
+                    data={"page_sorting_llm_enabled": "true"},
+                )
+                self.assertEqual(response.status_code, 202)
+                task_id = response.json()["task_id"]
+                for _attempt in range(100):
+                    status = client.get(f"/tasks/{task_id}").json()
+                    if status["status"] in {"completed", "failed"}:
+                        break
+                    time.sleep(0.01)
+
+        self.assertEqual(status["status"], "completed")
+        llm = captured_configs[0]["fusion"]["page_sorting"]["llm"]
+        self.assertTrue(llm["enabled"])
+        self.assertEqual(llm["base_url"], "https://llm.example.test/v1")
+        self.assertEqual(llm["model"], "qwen3-instruct")
+        self.assertEqual(llm["api_key_env"], "SORTING_LLM_API_KEY")
+
     def test_task_parameter_validation_rejects_out_of_range_values(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -756,11 +805,13 @@ class CustomHybridApiTests(unittest.TestCase):
                 "4",
                 "--recovery-min-confidence",
                 "0.9",
+                "--page-sorting-llm",
             ]
         )
         self.assertEqual(bbox_args.extraction_mode, "bbox_vlm")
         self.assertEqual(bbox_args.recovery_max_tables, 4)
         self.assertEqual(bbox_args.recovery_min_confidence, 0.9)
+        self.assertTrue(bbox_args.page_sorting_llm)
 
 
 if __name__ == "__main__":

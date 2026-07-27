@@ -774,6 +774,33 @@ class WorkflowTests(unittest.TestCase):
                 with self.assertRaisesRegex(WorkflowConfigError, message):
                     load_config(config_path)
 
+    def test_config_validates_optional_page_sorting_llm(self):
+        source = Path(__file__).parents[1] / "workflow.example.json"
+        cases = (
+            ({"enabled": "yes"}, "llm.enabled"),
+            ({"base_url": "not-a-url"}, "llm.base_url"),
+            ({"model": ""}, "llm.model"),
+            ({"trigger": "sometimes"}, "llm.trigger"),
+            ({"top_p": 0}, "llm.top_p"),
+            ({"max_tokens": 0}, "llm.max_tokens"),
+            (
+                {
+                    "enabled": True,
+                    "base_url": None,
+                    "model": None,
+                },
+                "requires base_url and model",
+            ),
+        )
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as temp_dir:
+                config = json.loads(source.read_text(encoding="utf-8"))
+                config["fusion"]["page_sorting"]["llm"].update(overrides)
+                config_path = Path(temp_dir) / "invalid.json"
+                config_path.write_text(json.dumps(config), encoding="utf-8")
+                with self.assertRaisesRegex(WorkflowConfigError, message):
+                    load_config(config_path)
+
     def test_config_requires_hybrid_http_client(self):
         config = json.loads(
             (Path(__file__).parents[1] / "workflow.example.json").read_text(encoding="utf-8")
@@ -1578,11 +1605,7 @@ class WorkflowTests(unittest.TestCase):
                 "replace_primary": True,
                 "preserve_native": True,
             },
-            {
-                "enabled": True,
-                "mode": "report_only",
-                "include_semantic_diagnostics": True,
-            },
+            config["fusion"]["page_sorting"],
         )
 
     def test_fuse_output_trees_wires_and_closes_enabled_bbox_recognizer(self):

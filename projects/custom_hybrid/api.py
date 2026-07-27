@@ -337,6 +337,7 @@ def _normalize_task_parameters(
     recovery_max_tables: int | None = None,
     recovery_max_proposals: int | None = None,
     recovery_min_confidence: float | None = None,
+    page_sorting_llm_enabled: bool | None = None,
 ) -> dict[str, Any]:
     mineru: dict[str, Any] = {}
     generation: dict[str, Any] = {}
@@ -509,6 +510,12 @@ def _normalize_task_parameters(
             recovery_overrides["min_confidence"] = float(
                 recovery_min_confidence
             )
+    if page_sorting_llm_enabled is not None:
+        page_sorting_overrides = fusion.setdefault("page_sorting", {})
+        if isinstance(page_sorting_overrides, dict):
+            llm_overrides = page_sorting_overrides.setdefault("llm", {})
+            if isinstance(llm_overrides, dict):
+                llm_overrides["enabled"] = page_sorting_llm_enabled
     parameters: dict[str, Any] = {}
     if cost_profile is not None:
         parameters["cost_profile"] = cost_profile
@@ -521,6 +528,20 @@ def _normalize_task_parameters(
     return parameters
 
 
+def _deep_update(target: dict[str, Any], overrides: Mapping[str, Any]) -> None:
+    for key, value in overrides.items():
+        if isinstance(value, Mapping):
+            nested = target.get(key)
+            if isinstance(nested, dict):
+                _deep_update(nested, value)
+            else:
+                replacement: dict[str, Any] = {}
+                _deep_update(replacement, value)
+                target[key] = replacement
+        else:
+            target[key] = value
+
+
 def _apply_task_parameters(config: dict[str, Any], parameters: Mapping[str, Any]) -> None:
     mineru = parameters.get("mineru", {})
     if isinstance(mineru, Mapping):
@@ -530,15 +551,7 @@ def _apply_task_parameters(config: dict[str, Any], parameters: Mapping[str, Any]
         config["vllm"]["generation"]["task_overrides"] = dict(generation)
     fusion = parameters.get("fusion", {})
     if isinstance(fusion, Mapping):
-        for key, value in fusion.items():
-            if isinstance(value, Mapping):
-                nested = config["fusion"].setdefault(key, {})
-                if isinstance(nested, dict):
-                    nested.update(value)
-                else:
-                    config["fusion"][key] = dict(value)
-            else:
-                config["fusion"][key] = value
+        _deep_update(config["fusion"], fusion)
 
 
 def _task_parameter_defaults(
@@ -577,6 +590,9 @@ def _task_parameter_defaults(
     fusion_config = effective_config.get("fusion", {})
     semantic_markdown = fusion_config.get("semantic_markdown", {})
     page_sorting = fusion_config.get("page_sorting", {})
+    page_sorting_llm = page_sorting.get("llm", {})
+    if not isinstance(page_sorting_llm, Mapping):
+        page_sorting_llm = {}
     return {
         "cost_profile": cost_profile,
         "extraction_mode": extraction_mode,
@@ -621,6 +637,17 @@ def _task_parameter_defaults(
             "include_semantic_diagnostics": bool(
                 page_sorting.get("include_semantic_diagnostics", True)
             ),
+            "llm": {
+                "enabled": bool(page_sorting_llm.get("enabled", False)),
+                "available": bool(
+                    isinstance(page_sorting_llm.get("base_url"), str)
+                    and page_sorting_llm.get("base_url", "").strip()
+                    and isinstance(page_sorting_llm.get("model"), str)
+                    and page_sorting_llm.get("model", "").strip()
+                ),
+                "model": page_sorting_llm.get("model"),
+                "trigger": page_sorting_llm.get("trigger", "unverified"),
+            },
         },
     }
 
@@ -866,6 +893,7 @@ def create_app(
         recovery_max_tables: int | None = Form(default=None),
         recovery_max_proposals: int | None = Form(default=None),
         recovery_min_confidence: float | None = Form(default=None),
+        page_sorting_llm_enabled: bool | None = Form(default=None),
     ) -> dict[str, Any]:
         parameters = _normalize_task_parameters(
             cost_profile=cost_profile,
@@ -881,6 +909,7 @@ def create_app(
             recovery_max_tables=recovery_max_tables,
             recovery_max_proposals=recovery_max_proposals,
             recovery_min_confidence=recovery_min_confidence,
+            page_sorting_llm_enabled=page_sorting_llm_enabled,
         )
         record = await create_uploaded_task(files, parameters)
         return _task_payload(record, request)
@@ -1032,6 +1061,7 @@ def create_app(
         recovery_max_tables: int | None = Form(default=None),
         recovery_max_proposals: int | None = Form(default=None),
         recovery_min_confidence: float | None = Form(default=None),
+        page_sorting_llm_enabled: bool | None = Form(default=None),
     ):
         parameters = _normalize_task_parameters(
             cost_profile=cost_profile,
@@ -1047,6 +1077,7 @@ def create_app(
             recovery_max_tables=recovery_max_tables,
             recovery_max_proposals=recovery_max_proposals,
             recovery_min_confidence=recovery_min_confidence,
+            page_sorting_llm_enabled=page_sorting_llm_enabled,
         )
         record = await create_uploaded_task(files, parameters)
         completed = await asyncio.to_thread(manager.wait, record.task_id)

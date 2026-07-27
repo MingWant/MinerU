@@ -154,6 +154,8 @@
     .advanced-settings { margin-top: 13px; padding-top: 12px; border-top: 1px solid #e5e9ef; }
     .advanced-settings summary { cursor: pointer; color: #344054; font-size: 12px; font-weight: 700; }
     .advanced-settings[open] summary { margin-bottom: 11px; }
+    .advanced-settings.disabled { opacity: 0.58; }
+    .settings-hint { margin-top: 7px; color: var(--muted); font-size: 10px; line-height: 1.45; }
     .actions { display: grid; grid-template-columns: 1fr 0.66fr; gap: 8px; margin-top: 14px; }
     .primary { color: white; border-color: var(--primary); background: var(--primary); }
     .primary:hover:not(:disabled) { background: var(--primary-hover); }
@@ -480,6 +482,20 @@
           </div>
         </details>
 
+        <details id="llmSortingSettings" class="advanced-settings">
+          <summary>LLM Grouping &amp; Sorting</summary>
+          <div class="settings-grid">
+            <div class="field field-wide">
+              <label for="llmAssistInput">Text LLM Assist</label>
+              <select id="llmAssistInput">
+                <option value="false" selected>Off — deterministic rules only</option>
+                <option value="true">On — produce a schema-validated LLM proposal</option>
+              </select>
+            </div>
+          </div>
+          <div id="llmAssistHint" class="settings-hint">Configure a server-side OpenAI-compatible endpoint and model to enable this option.</div>
+        </details>
+
         <div class="actions">
           <button id="submitButton" class="primary" disabled>Convert</button>
           <button id="clearButton" class="secondary" disabled>Clear</button>
@@ -610,6 +626,27 @@
             </div>
           </section>
 
+          <section id="sortingLlmSection" class="sorting-section hidden" aria-labelledby="sortingLlmTitle">
+            <div class="sorting-section-header">
+              <h4 id="sortingLlmTitle" class="sorting-section-title">Text LLM Proposal</h4>
+              <span id="sortingLlmStatus" class="sorting-section-count"></span>
+            </div>
+            <div class="sorting-table-wrap">
+              <table class="sorting-table unresolved-table">
+                <thead>
+                  <tr>
+                    <th>Document</th>
+                    <th>Review</th>
+                    <th>Pages</th>
+                    <th>Proposed order</th>
+                    <th>Agreement</th>
+                  </tr>
+                </thead>
+                <tbody id="sortingLlmBody"></tbody>
+              </table>
+            </div>
+          </section>
+
           <details class="sorting-raw">
             <summary>Raw Sorting report</summary>
             <pre id="sortingRawOutput" class="source-output"></pre>
@@ -691,6 +728,9 @@
   const recoveryMaxTablesInput = document.querySelector('#recoveryMaxTablesInput');
   const recoveryMaxProposalsInput = document.querySelector('#recoveryMaxProposalsInput');
   const recoveryMinConfidenceInput = document.querySelector('#recoveryMinConfidenceInput');
+  const llmSortingSettings = document.querySelector('#llmSortingSettings');
+  const llmAssistInput = document.querySelector('#llmAssistInput');
+  const llmAssistHint = document.querySelector('#llmAssistHint');
   const submitButton = document.querySelector('#submitButton');
   const clearButton = document.querySelector('#clearButton');
   const taskState = document.querySelector('#taskState');
@@ -730,6 +770,9 @@
   const sortingUnresolvedSection = document.querySelector('#sortingUnresolvedSection');
   const sortingUnresolvedCount = document.querySelector('#sortingUnresolvedCount');
   const sortingUnresolvedBody = document.querySelector('#sortingUnresolvedBody');
+  const sortingLlmSection = document.querySelector('#sortingLlmSection');
+  const sortingLlmStatus = document.querySelector('#sortingLlmStatus');
+  const sortingLlmBody = document.querySelector('#sortingLlmBody');
   const sortingRawOutput = document.querySelector('#sortingRawOutput');
 
   let selectedFiles = [];
@@ -739,11 +782,13 @@
   let taskBusy = false;
   let activeTaskId = null;
   let sortingDocuments = [];
+  let llmAssistAvailable = false;
 
   const parameterInputs = [
     extractionModeInput, costProfileInput, effortInput, methodInput, langInput, temperatureInput,
     topPInput, seedInput, maxTokensInput, repetitionPenaltyInput,
     recoveryMaxTablesInput, recoveryMaxProposalsInput, recoveryMinConfidenceInput,
+    llmAssistInput,
   ];
   const recoveryInputs = [
     recoveryMaxTablesInput, recoveryMaxProposalsInput, recoveryMinConfidenceInput,
@@ -780,6 +825,8 @@
     if (!defaults) return;
     const mineru = defaults.mineru || {};
     const generation = defaults.generation || {};
+    const pageSorting = defaults.page_sorting || {};
+    const sortingLlm = pageSorting.llm || {};
     const assignments = [
       [extractionModeInput, defaults.extraction_mode],
       [costProfileInput, defaults.cost_profile],
@@ -795,6 +842,13 @@
     assignments.forEach(([input, value]) => {
       if (value !== null && value !== undefined) input.value = String(value);
     });
+    llmAssistAvailable = Boolean(sortingLlm.available);
+    llmAssistInput.value = String(llmAssistAvailable && Boolean(sortingLlm.enabled));
+    const model = sortingLlm.model ? `Model: ${sortingLlm.model}. ` : '';
+    llmAssistHint.textContent = llmAssistAvailable
+      ? `${model}Trigger: ${humanizeSortingStatus(sortingLlm.trigger || 'unverified')}. The deterministic result remains authoritative.`
+      : 'Configure fusion.page_sorting.llm.base_url and model on the server to enable this option.';
+    syncLlmControls();
   }
 
   function setBusy(busy) {
@@ -803,6 +857,7 @@
     dropZone.classList.toggle('disabled', busy);
     parameterInputs.forEach(input => { input.disabled = busy; });
     syncRecoveryControls();
+    syncLlmControls();
     submitButton.disabled = busy || !selectedFiles.length || !serviceOnline;
     clearButton.disabled = busy || !selectedFiles.length;
     submitButton.textContent = busy
@@ -814,6 +869,12 @@
     const enabled = extractionModeInput.value === 'bbox_vlm';
     recoverySettings.classList.toggle('disabled', !enabled);
     recoveryInputs.forEach(input => { input.disabled = taskBusy || !enabled; });
+  }
+
+  function syncLlmControls() {
+    llmSortingSettings.classList.toggle('disabled', !llmAssistAvailable);
+    llmAssistInput.disabled = taskBusy || !llmAssistAvailable;
+    if (!llmAssistAvailable) llmAssistInput.value = 'false';
   }
 
   extractionModeInput.addEventListener('change', syncRecoveryControls);
@@ -916,6 +977,9 @@
     sortingGroupBody.replaceChildren();
     sortingUnresolvedSection.classList.add('hidden');
     sortingUnresolvedBody.replaceChildren();
+    sortingLlmSection.classList.add('hidden');
+    sortingLlmStatus.textContent = '';
+    sortingLlmBody.replaceChildren();
     sortingRawOutput.textContent = '';
     documentSelect.classList.add('hidden');
     documentSelect.replaceChildren();
@@ -1128,7 +1192,7 @@
       'preserved_packet_order',
       'mixed_internal_and_packet_order',
     ].includes(status)) return 'success';
-    if (status === 'error') return 'danger';
+    if (['error', 'configuration_error'].includes(status)) return 'danger';
     return 'warning';
   }
 
@@ -1309,6 +1373,61 @@
         </tr>
       `;
     }).join('');
+    const llmAssist = report.llm_assist && typeof report.llm_assist === 'object'
+      ? report.llm_assist
+      : null;
+    const llmProposal = llmAssist && llmAssist.proposal && typeof llmAssist.proposal === 'object'
+      ? llmAssist.proposal
+      : null;
+    const llmDocuments = llmProposal && Array.isArray(llmProposal.documents)
+      ? llmProposal.documents
+      : [];
+    sortingLlmSection.classList.toggle('hidden', !llmAssist || !llmAssist.enabled);
+    if (llmAssist && llmAssist.enabled) {
+      const agreement = llmAssist.agreement && typeof llmAssist.agreement === 'object'
+        ? llmAssist.agreement
+        : {};
+      const hardConflicts = Array.isArray(agreement.hard_conflicts)
+        ? agreement.hard_conflicts
+        : [];
+      const llmDisplayStatus = hardConflicts.length
+        ? 'conflict'
+        : llmProposal && llmProposal.needs_review
+          ? 'needs_review'
+          : llmAssist.status || 'unknown';
+      const modelLabel = llmAssist.model ? ` · ${llmAssist.model}` : '';
+      sortingLlmStatus.innerHTML = `${sortingBadge(llmDisplayStatus)} ${escapeHtml(modelLabel)}`;
+      const agreementText = hardConflicts.length
+        ? `${hardConflicts.length} hard conflict${hardConflicts.length === 1 ? '' : 's'}`
+        : agreement.grouping_match
+          ? (agreement.ordering_match ? 'Grouping and order agree' : 'Grouping agrees; order differs')
+          : agreement.deterministic_partition_complete
+            ? 'Differs from deterministic grouping'
+            : 'No complete deterministic baseline';
+      sortingLlmBody.innerHTML = llmDocuments.length
+        ? llmDocuments.map(document => {
+          const item = document && typeof document === 'object' ? document : {};
+          const pageIds = Array.isArray(item.page_ids) ? item.page_ids : [];
+          const reviewState = llmProposal.needs_review ? 'needs_review' : 'model_no_review_flag';
+          return `
+            <tr>
+              <td><strong>${escapeHtml(item.group_id || '-')}</strong></td>
+              <td>${sortingBadge(reviewState)}</td>
+              <td>${escapeHtml(pageIds.length)}</td>
+              <td>${formatSortingTokens(pageIds, true)}</td>
+              <td>${escapeHtml(agreementText)}</td>
+            </tr>
+          `;
+        }).join('')
+        : `
+          <tr>
+            <td colspan="5"><span class="sorting-muted">${escapeHtml(llmAssist.error || humanizeSortingStatus(llmAssist.trigger_reason || llmAssist.status || 'No proposal'))}</span></td>
+          </tr>
+        `;
+    } else {
+      sortingLlmStatus.textContent = '';
+      sortingLlmBody.replaceChildren();
+    }
     sortingRawOutput.textContent = JSON.stringify(report, null, 2);
     sortingEmpty.classList.add('hidden');
     sortingContent.classList.remove('hidden');
@@ -1629,6 +1748,7 @@
       recovery_max_tables: extractionModeInput.value === 'bbox_vlm' ? recoveryMaxTablesInput.value : '',
       recovery_max_proposals: extractionModeInput.value === 'bbox_vlm' ? recoveryMaxProposalsInput.value : '',
       recovery_min_confidence: extractionModeInput.value === 'bbox_vlm' ? recoveryMinConfidenceInput.value : '',
+      page_sorting_llm_enabled: llmAssistInput.value,
     };
     Object.entries(taskParameters).forEach(([name, value]) => {
       if (value !== '') form.append(name, value);

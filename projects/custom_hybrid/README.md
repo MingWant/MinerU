@@ -152,14 +152,17 @@ Policy/Claim/Case IDs are then used to form document groups. Conflicting IDs are
 hard exclusions, and pages with tied or incomplete evidence remain unresolved.
 
 The pass writes `<document>_sorting_manifest.json` and
-`<document>_sorting_report.json`. A report is `complete` and
-`can_auto_sort=true` only when every physical page belongs to exactly one group
-and every group has one unique logical page for the complete `1..N` range.
-Missing pages, duplicate logical pages, conflicting OCR candidates, absent
-page-one anchors, and indistinguishable same-template documents all require
-review. `page_idx` remains the physical input position and is never treated as
-the printed logical page number. Semantic Markdown coverage warnings are copied
-into the manifest as diagnostics, but they do not override page evidence.
+`<document>_sorting_report.json`. A report can be safely emitted when every
+physical page belongs to exactly one group and each group either has one unique
+logical page for the complete `1..N` range or explicitly retains a validated
+packet sequence as `preserved_packet_order`. The two cases remain distinguishable
+through `ordering_status`; retaining packet order is not presented as validated
+internal pagination. Missing pages, duplicate logical pages, conflicting OCR
+candidates, absent page-one anchors, and indistinguishable same-template
+documents require review. `page_idx` remains the physical input position and is
+never treated as the printed logical page number. Semantic Markdown coverage
+warnings are copied into the manifest as diagnostics, but they do not override
+page evidence.
 
 Packets with one continuous full-length sequence, such as `Page X of 17`, use a
 second deterministic path. A matching `1..N` sequence alone is only a packet
@@ -193,9 +196,56 @@ sequence is not forced into the wrapper role, preserving the existing ordinary
 single-document path. This is deliberately not a semantic substitute for an
 LLM when titles, identifiers, and template evidence are all absent.
 
+An optional text-LLM assistance layer can now propose Grouping and Sorting for
+those semantically uncertain cases. It uses the compact, provider-neutral
+protocol from the grouping evaluation POC: only normalized page-level OCR text,
+detected titles/identifiers, pagination evidence, and semantic flags are sent.
+The deterministic answer is withheld by default so the LLM remains an
+independent second opinion; set `include_deterministic_baseline=true` only when
+an especially weak model needs that hint. The raw middle JSON, PDF pages, images, API key,
+and authorization headers are not embedded in the prompt or report. Raw model
+text is also omitted from reports unless `include_raw_output=true`. Input text
+is capped at 60,000 characters per packet and 6,000 per page by default, keeping
+the beginning and ending when truncation is necessary.
+
+The model must return a compact JSON partition in which every `source_page`
+appears exactly once. Missing, duplicate, invented, empty, or non-integer page
+assignments are rejected. One corrective retry is allowed for JSON/schema/page
+coverage errors; endpoint errors or a second invalid response leave the
+deterministic result untouched. Confirmed `packet_wrapper` evidence is explicitly
+marked `merge_evidence=false`. Conflicts with deterministic grouping or validated
+internal pagination are recorded as hard conflicts. The current integration is
+advisory and report-only: it writes `llm_assist.proposal`, annotates manifest pages
+with `llm_document_group_id` and `llm_sequence_position`, and always keeps
+`applied=false` plus `deterministic_result_retained=true`.
+
+Configure the endpoint server-side under `fusion.page_sorting.llm`; the browser
+only sends the on/off choice and never receives the API key:
+
+```json
+{
+  "enabled": true,
+  "base_url": "http://127.0.0.1:30000/v1",
+  "model": "qwen3-instruct",
+  "api_key_env": "SORTING_LLM_API_KEY",
+  "trigger": "unverified",
+  "temperature": 0.0,
+  "max_tokens": 4000,
+  "enable_thinking": false,
+  "include_deterministic_baseline": false,
+  "include_raw_output": false
+}
+```
+
+`trigger=unverified` calls the model for unresolved grouping or any order not
+backed by complete internal pagination, including `preserved_packet_order`.
+`needs_review` calls it only when deterministic processing already requires
+review, while `always` also cross-checks fully validated documents. The endpoint
+must implement the OpenAI-compatible `/v1/chat/completions` contract.
+
 The only supported mode is currently `report_only`: the pass does not rewrite
 the PDF, fused middle JSON, or Markdown. A fused middle JSON can be replayed
-without MinerU or a text-generation LLM:
+without MinerU; the optional LLM is called only when it is enabled in config:
 
 ```powershell
 python projects/custom_hybrid/page_sorting.py `

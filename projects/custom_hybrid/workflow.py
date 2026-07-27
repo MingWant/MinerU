@@ -266,6 +266,109 @@ def _validate_fusion_config(fusion_config: Any) -> None:
         raise WorkflowConfigError(
             "fusion.page_sorting.include_semantic_diagnostics must be a boolean"
         )
+    sorting_llm = page_sorting.get("llm", {})
+    if not isinstance(sorting_llm, dict):
+        raise WorkflowConfigError("fusion.page_sorting.llm must be a JSON object")
+    if not isinstance(sorting_llm.get("enabled", False), bool):
+        raise WorkflowConfigError(
+            "fusion.page_sorting.llm.enabled must be a boolean"
+        )
+    sorting_llm_base_url = sorting_llm.get("base_url")
+    if sorting_llm_base_url is not None and (
+        not isinstance(sorting_llm_base_url, str)
+        or not sorting_llm_base_url.startswith(("http://", "https://"))
+    ):
+        raise WorkflowConfigError(
+            "fusion.page_sorting.llm.base_url must be null or an http(s) URL"
+        )
+    for key in ("model", "api_key_env"):
+        value = sorting_llm.get(key)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise WorkflowConfigError(
+                f"fusion.page_sorting.llm.{key} must be null or a non-empty string"
+            )
+    if sorting_llm.get("enabled", False) and (
+        not isinstance(sorting_llm_base_url, str)
+        or not sorting_llm_base_url.strip()
+        or not isinstance(sorting_llm.get("model"), str)
+        or not sorting_llm["model"].strip()
+    ):
+        raise WorkflowConfigError(
+            "fusion.page_sorting.llm requires base_url and model when enabled"
+        )
+    sorting_llm_trigger = sorting_llm.get("trigger", "unverified")
+    if sorting_llm_trigger not in {"always", "needs_review", "unverified"}:
+        raise WorkflowConfigError(
+            "fusion.page_sorting.llm.trigger must be always, needs_review, or unverified"
+        )
+    for key in (
+        "enable_thinking",
+        "include_raw_output",
+        "include_deterministic_baseline",
+    ):
+        value = sorting_llm.get(key)
+        if value is not None and not isinstance(value, bool):
+            raise WorkflowConfigError(
+                f"fusion.page_sorting.llm.{key} must be null or a boolean"
+            )
+    reasoning_effort = sorting_llm.get("reasoning_effort")
+    if reasoning_effort is not None and reasoning_effort not in {
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+    }:
+        raise WorkflowConfigError(
+            "fusion.page_sorting.llm.reasoning_effort is invalid"
+        )
+    for key, minimum, maximum in (
+        ("temperature", 0.0, 2.0),
+        ("top_p", 0.000001, 1.0),
+        ("timeout_seconds", 0.001, 3600.0),
+    ):
+        value = sorting_llm.get(key)
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not minimum <= float(value) <= maximum
+        ):
+            raise WorkflowConfigError(
+                f"fusion.page_sorting.llm.{key} must be between {minimum} and {maximum}"
+            )
+    for key, maximum in (
+        ("max_tokens", 131072),
+        ("max_total_input_chars", 1_000_000),
+        ("max_page_input_chars", 100_000),
+        ("min_page_input_chars", 100_000),
+    ):
+        value = sorting_llm.get(key)
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 1 <= value <= maximum
+        ):
+            raise WorkflowConfigError(
+                f"fusion.page_sorting.llm.{key} must be an integer between 1 and {maximum}"
+            )
+    if (
+        isinstance(sorting_llm.get("min_page_input_chars"), int)
+        and isinstance(sorting_llm.get("max_page_input_chars"), int)
+        and sorting_llm["min_page_input_chars"] > sorting_llm["max_page_input_chars"]
+    ):
+        raise WorkflowConfigError(
+            "fusion.page_sorting.llm.min_page_input_chars must not exceed max_page_input_chars"
+        )
+    seed = sorting_llm.get("seed")
+    if seed is not None and (
+        isinstance(seed, bool)
+        or not isinstance(seed, int)
+        or not -(2**63) <= seed < 2**63
+    ):
+        raise WorkflowConfigError(
+            "fusion.page_sorting.llm.seed must be a signed 64-bit integer"
+        )
     if not fusion_config.get("enabled", False):
         return
     bounded_values = {
@@ -2243,6 +2346,9 @@ def fuse_output_trees(
                 sorting_summary = json.loads(
                     sorting_report_path.read_text(encoding="utf-8")
                 )
+                llm_assist = sorting_summary.get("llm_assist")
+                if not isinstance(llm_assist, Mapping):
+                    llm_assist = {}
                 document_summary["page_sorting"] = {
                     "status": sorting_summary.get("status"),
                     "can_auto_sort": sorting_summary.get("can_auto_sort", False),
@@ -2265,6 +2371,16 @@ def fuse_output_trees(
                             Mapping,
                         )
                         else None
+                    ),
+                    "llm_status": llm_assist.get("status"),
+                    "llm_model": llm_assist.get("model"),
+                    "llm_safe_for_automatic_use": llm_assist.get(
+                        "safe_for_automatic_use",
+                        False,
+                    ),
+                    "llm_deterministic_result_retained": llm_assist.get(
+                        "deterministic_result_retained",
+                        True,
                     ),
                     "manifest": (
                         str(sorting_manifest_path)

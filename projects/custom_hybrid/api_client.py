@@ -51,6 +51,7 @@ def parse_remote(
     recovery_max_tables: int | None = None,
     recovery_max_proposals: int | None = None,
     recovery_min_confidence: float | None = None,
+    page_sorting_llm_enabled: bool | None = None,
     timeout_seconds: float = 3600,
 ) -> Path:
     # ``api_key`` remains in the callable surface for compatibility. The
@@ -67,6 +68,7 @@ def parse_remote(
             "recovery_max_tables": recovery_max_tables,
             "recovery_max_proposals": recovery_max_proposals,
             "recovery_min_confidence": recovery_min_confidence,
+            "page_sorting_llm_enabled": page_sorting_llm_enabled,
         }.items()
         if value is not None
     }
@@ -120,6 +122,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--recovery-max-tables", type=int)
     parser.add_argument("--recovery-max-proposals", type=int)
     parser.add_argument("--recovery-min-confidence", type=float)
+    parser.add_argument(
+        "--page-sorting-llm",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable or disable the configured text-LLM grouping proposal",
+    )
     parser.add_argument("--timeout-seconds", type=float, default=3600)
     return parser
 
@@ -139,6 +147,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         recovery_max_tables=args.recovery_max_tables,
         recovery_max_proposals=args.recovery_max_proposals,
         recovery_min_confidence=args.recovery_min_confidence,
+        page_sorting_llm_enabled=args.page_sorting_llm,
         timeout_seconds=args.timeout_seconds,
     )
     print(destination)

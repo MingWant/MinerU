@@ -37,6 +37,14 @@ class CustomHybridUiTests(unittest.TestCase):
                             "extraction_mode": "hybrid_fusion",
                             "mineru": {"effort": "medium", "method": "auto", "lang": "ch"},
                             "generation": {"temperature": 0.0, "seed": 42},
+                            "page_sorting": {
+                                "llm": {
+                                    "enabled": False,
+                                    "available": True,
+                                    "model": "qwen3-instruct",
+                                    "trigger": "unverified",
+                                }
+                            },
                         },
                     },
                 )
@@ -54,6 +62,8 @@ class CustomHybridUiTests(unittest.TestCase):
                 self.assertIn(b"medium", body)
                 self.assertIn(b'name="temperature"', body)
                 self.assertIn(b"0.25", body)
+                self.assertIn(b'name="page_sorting_llm_enabled"', body)
+                self.assertIn(b"true", body)
                 return httpx.Response(
                     202,
                     json={"task_id": "abc123", "status": "queued"},
@@ -193,6 +203,9 @@ class CustomHybridUiTests(unittest.TestCase):
             self.assertIn('id="seedInput"', page.text)
             self.assertIn('id="recoveryMaxTablesInput"', page.text)
             self.assertIn("Advanced BBox Recovery Settings", page.text)
+            self.assertIn("LLM Grouping &amp; Sorting", page.text)
+            self.assertIn('id="llmAssistInput"', page.text)
+            self.assertIn("Text LLM Proposal", page.text)
             self.assertNotIn("拖拽", page.text)
             self.assertEqual(client.get("/api/health").json()["status"], "ok")
             submitted = client.post(
@@ -206,6 +219,7 @@ class CustomHybridUiTests(unittest.TestCase):
                     "seed": "123",
                     "recovery_max_tables": "4",
                     "recovery_min_confidence": "0.9",
+                    "page_sorting_llm_enabled": "true",
                 },
             )
             self.assertEqual(submitted.status_code, 202)

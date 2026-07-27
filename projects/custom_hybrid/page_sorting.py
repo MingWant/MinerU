@@ -1934,11 +1934,47 @@ def write_page_sorting_reports(
                 semantic_report = _load_json(candidate)
             except (OSError, json.JSONDecodeError, ValueError):
                 semantic_report = None
+    middle_payload = _load_json(middle_path)
     manifest, report = analyze_middle_json(
-        _load_json(middle_path),
+        middle_payload,
         semantic_report=semantic_report,
         mode=mode,
     )
+    llm_settings = settings.get("llm", {})
+    if isinstance(llm_settings, Mapping):
+        from projects.custom_hybrid.page_sorting_llm import (
+            annotate_manifest_with_proposal,
+            run_llm_assist,
+        )
+
+        llm_result = run_llm_assist(
+            middle_payload,
+            manifest,
+            report,
+            llm_settings,
+        )
+        report["llm_assist"] = llm_result
+        manifest["llm_assist"] = {
+            key: llm_result[key]
+            for key in (
+                "enabled",
+                "status",
+                "prompt_version",
+                "prompt_sha256",
+                "model",
+                "trigger",
+                "trigger_reason",
+                "proposal",
+                "validation",
+                "agreement",
+                "safe_for_automatic_use",
+                "applied",
+                "deterministic_result_retained",
+                "error",
+            )
+            if key in llm_result
+        }
+        annotate_manifest_with_proposal(manifest, llm_result)
     suffix = "_middle.json"
     stem = middle_path.name[: -len(suffix)] if middle_path.name.endswith(suffix) else middle_path.stem
     output_manifest = (
